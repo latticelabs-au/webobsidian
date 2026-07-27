@@ -14,8 +14,11 @@ import {
   isOidcUsable,
   isWithinRoot,
   normalizeOidcList,
+  LOGIN_RATE_LIMIT_BOUNDS,
+  minAttemptsForWindow,
   OIDC_CALLBACK_PATH,
   REDACTED_SECRET,
+  type LoginRateLimit,
   type Settings,
 } from '../services/settings.js';
 import { redactUrlCreds } from '../lib/redact.js';
@@ -32,6 +35,23 @@ function httpError(status: number, message: string): Error & { status: number } 
 interface SettingsPatchBody {
   vault?: Record<string, unknown>;
   git?: Record<string, unknown>;
+  /**
+   * ONLY `auth.rateLimit` is writable here, and the narrowness is the point.
+   *
+   * The rest of the `auth` block is jwtSecret and the two password hashes, i.e.
+   * the credentials that gate this very endpoint. Accepting the block wholesale
+   * would turn one authenticated settings save into "choose the signing key and
+   * the owner password", which is account takeover with a 200 on it. So
+   * `sanitizeAuth` reads exactly one key out of this object and drops everything
+   * else on the floor, silently and on purpose: a 400 naming `auth.jwtSecret`
+   * would be a helpful reply to a probe, and a client with a legitimate reason to
+   * send it does not exist.
+   *
+   * The mutator below assigns onto `d.auth.rateLimit`, never onto `d.auth`. That
+   * is not a stylistic preference: `Object.assign(d.auth, patch)` with any future
+   * widening of sanitizeAuth would reopen exactly the hole described above.
+   */
+  auth?: Record<string, unknown>;
   // Each of these has to be listed here AND handled in the if-chain inside the
   // PUT below. A block that is missing from that chain is silently unwritable
   // through the API and the request still answers 200 with the unchanged
@@ -100,6 +120,20 @@ settingsRouter.put(
         throw httpError(400, 'api.rateLimitPerMin must be a whole number of at least 1');
       }
     }
+    // The login throttle, validated before the lock exactly as the two bounds
+    // above are, and for a sharper version of the same reason. A saved
+    // `loginMaxAttempts` of 0 or less makes `hits.length >= max` true on the
+    // first request, so POST /auth/login answers 429 to everybody forever,
+    // including the operator who now has to reach this endpoint to undo it and
+    // cannot, because it sits behind requireAuth. There is no in-product way back
+    // from that: not the WEBOBSIDIAN_PASSWORD override (the throttle runs before
+    // any credential is checked), only a hand edit of settings.json. See the long
+    // note on MIN_LOGIN_ATTEMPTS in services/settings.ts for why the floor is 3
+    // rather than 1, and why the ceiling on the windows is a lockout guard too.
+    // The schema carries the same bounds with a `.catch()` for hand-edited files;
+    // here it is a loud 400, because silently healing a security parameter means
+    // the operator reads back a number they did not choose.
+    const loginRateLimitPatch = body.auth ? await sanitizeAuth(body.auth) : null;
     // Which backend owns the vault. One value, never a set: see the long note on
     // the `sync` block in services/settings.ts for why two writers over one vault
     // is unrepairable rather than merely untidy. Validated here so an unknown
@@ -189,6 +223,11 @@ settingsRouter.put(
       if (body.search) Object.assign(d.search, body.search);
       if (body.ui) Object.assign(d.ui, body.ui);
       if (typeof rateLimit === 'number') d.api.rateLimitPerMin = rateLimit;
+      // Onto the sub-block, never onto `d.auth` itself. See the note on the
+      // `auth` field of SettingsPatchBody: assigning the parent would make every
+      // credential in that block writable the moment sanitizeAuth ever returns a
+      // field beyond rateLimit.
+      if (loginRateLimitPatch) Object.assign(d.auth.rateLimit, loginRateLimitPatch);
     });
     res.json(redactSettings(updated));
   }),
@@ -271,6 +310,125 @@ function requireVaultRelative(value: unknown, field: string): string {
     );
   }
   return value.trim();
+}
+
+/**
+ * Accept one bound of the login throttle, or reject the whole request.
+ *
+ * Refused rather than clamped, and that is the load-bearing decision. Clamping
+ * would answer 200 while storing a number the operator did not type, so a
+ * settings page that reloads after saving would show the clamped value and the
+ * operator would conclude they had asked for it. For a security parameter that is
+ * the worst outcome available: the throttle they believe is in force and the one
+ * that is are two different numbers, and nothing anywhere says so.
+ *
+ * `typeof === 'number'` alone is not enough, which is why all four tests are
+ * here. It accepts NaN (every comparison against it is false, so a window of NaN
+ * makes the limiter stop firing while still looking installed), Infinity, 0.5
+ * (a fractional budget behaves unpredictably at the boundary) and negatives.
+ */
+function requireLoginLimit(value: unknown, field: keyof LoginRateLimit, min: number, max: number): number {
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < min || value > max) {
+    throw httpError(
+      400,
+      `auth.rateLimit.${field} must be a whole number between ${min} and ${max}`,
+    );
+  }
+  return value;
+}
+
+/**
+ * Narrow an incoming `auth` patch down to the login throttle, and nothing else.
+ *
+ * Returns null when the body carries no `rateLimit` key, so a request that names
+ * `auth` for any other reason (the existing regression test posts
+ * `auth.jwtSecret` to prove it is ignored) changes nothing and still answers 200.
+ * Every other key in the object is dropped without comment; see the note on the
+ * `auth` field of SettingsPatchBody for why silence is right there.
+ *
+ * The floors are the reason this function exists rather than a bare
+ * `typeof === 'number'` check. A `loginMaxAttempts` of 0 is not "unlimited", it is
+ * "nobody, including the operator, can ever log in again", and the door it closes
+ * is the one the fix lives behind. The full argument, and the justification for
+ * the specific numbers, is on MIN_LOGIN_ATTEMPTS in services/settings.ts.
+ */
+async function sanitizeAuth(
+  v: Record<string, unknown>,
+): Promise<Partial<LoginRateLimit> | null> {
+  if (v.rateLimit === undefined) return null;
+  if (!v.rateLimit || typeof v.rateLimit !== 'object' || Array.isArray(v.rateLimit)) {
+    throw httpError(400, 'auth.rateLimit must be an object');
+  }
+  const r = v.rateLimit as Record<string, unknown>;
+  const b = LOGIN_RATE_LIMIT_BOUNDS;
+  const out: Partial<LoginRateLimit> = {};
+  if (r.loginWindowSec !== undefined) {
+    out.loginWindowSec = requireLoginLimit(
+      r.loginWindowSec,
+      'loginWindowSec',
+      b.minWindowSec,
+      b.maxWindowSec,
+    );
+  }
+  if (r.loginMaxAttempts !== undefined) {
+    out.loginMaxAttempts = requireLoginLimit(
+      r.loginMaxAttempts,
+      'loginMaxAttempts',
+      b.minAttempts,
+      b.maxAttempts,
+    );
+  }
+  if (r.loginFailureWindowSec !== undefined) {
+    out.loginFailureWindowSec = requireLoginLimit(
+      r.loginFailureWindowSec,
+      'loginFailureWindowSec',
+      b.minWindowSec,
+      b.maxWindowSec,
+    );
+  }
+  if (r.loginFailureMaxAttempts !== undefined) {
+    out.loginFailureMaxAttempts = requireLoginLimit(
+      r.loginFailureMaxAttempts,
+      'loginFailureMaxAttempts',
+      b.minAttempts,
+      b.maxAttempts,
+    );
+  }
+
+  /*
+   * The pair check. Each field above is legal on its own and the combination is
+   * what locks people out, so validating them independently was not enough:
+   * a window at its ceiling with a count at its floor passed every check here
+   * and produced a lockout lasting the whole window.
+   *
+   * Judged against the MERGED result, not against the request. A body that sets
+   * only the window is a lockout or not depending on the count already stored,
+   * which is the same reasoning as the E2EE pairing check further down this file.
+   *
+   * Refused rather than healed, unlike the schema, which raises the count and
+   * warns. The two are deliberately different: this door has a human on the
+   * other end who can be told what is wrong and choose, while the schema is
+   * repairing a file that arrived by hand edit or restored backup with nobody
+   * watching.
+   */
+  const current = (await getSettings()).auth.rateLimit;
+  const pair = (windowKey: keyof LoginRateLimit, attemptsKey: keyof LoginRateLimit) => {
+    const windowSec = out[windowKey] ?? current[windowKey];
+    const attempts = out[attemptsKey] ?? current[attemptsKey];
+    const floor = minAttemptsForWindow(windowSec);
+    if (attempts < floor) {
+      throw httpError(
+        400,
+        `auth.rateLimit.${attemptsKey} of ${attempts} over a ${windowSec}s window permits one attempt ` +
+          `per ${Math.round(windowSec / attempts)}s, which locks you out for the whole window rather ` +
+          `than throttling. Allow at least ${floor} attempts, or shorten the window.`,
+      );
+    }
+  };
+  pair('loginWindowSec', 'loginMaxAttempts');
+  pair('loginFailureWindowSec', 'loginFailureMaxAttempts');
+
+  return out;
 }
 
 /**

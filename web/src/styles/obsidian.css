@@ -1167,7 +1167,23 @@ body.wo-col-resizing .sidebar, body.wo-col-resizing .right-sidebar { transition:
   .setting-row .control .text-input { width: 100% !important; box-sizing: border-box; }
 
   /* Version history: stack the revision list above the diff preview. */
-  .vh-head { padding-top: calc(12px + env(safe-area-inset-top)); }
+  /* Scoped to .version-history for specificity, NOT for tidiness. The base
+     `.vh-head` rule further down this file (search for "display: flex; gap: 10px")
+     is later in source order and sets the `padding` SHORTHAND, which resets
+     padding-top. Both selectors are (0,1,0) and a media query adds no
+     specificity, so the unscoped form of this rule lost the cascade and the
+     safe-area inset never applied. With viewport-fit=cover in index.html and the
+     dialog promoted to `position: fixed; inset: 0`, that left the close button at
+     y=12..48 on an iPhone, i.e. underneath the status bar, where a tap is eaten
+     by the system scroll-to-top gesture rather than reaching the page. The
+     sibling .vh-foot rule below survived only because it was already scoped. */
+  .version-history .vh-head { padding-top: calc(12px + env(safe-area-inset-top)); }
+  /* Scoped to .version-history because only that dialog is promoted to
+     `height: 100dvh` above: its footer sits flush against the bottom of the
+     screen, where an iOS home indicator overlays it and swallows taps on the
+     "Close" button. TrashView reuses .vh-foot but stays inside the padded
+     backdrop, so it needs no inset and would just look bottom-heavy with one. */
+  .version-history .vh-foot { padding-bottom: calc(12px + env(safe-area-inset-bottom)); }
   .vh-body { flex-direction: column; }
   .vh-list { width: 100%; max-height: 38%; border-right: 0;
     border-bottom: 1px solid var(--bg-modifier-border); }
@@ -1299,13 +1315,26 @@ body.wo-col-resizing .sidebar, body.wo-col-resizing .right-sidebar { transition:
 /* ---- Share dialog + shared-note badge (FR-10) ---- */
 .share-globe { color: var(--interactive-accent); margin-left: 4px; flex-shrink: 0; }
 .share-dialog { width: 480px; max-width: calc(100vw - 32px); padding: 18px 20px; }
-.share-dialog-head { display: flex; gap: 10px; align-items: center; margin-bottom: 10px; color: var(--text-normal); }
+/* Head and foot are pinned, only the middle scrolls. This is not cosmetic: the
+   parent .modal is `overflow: hidden` with `max-height: 70vh`, so without a
+   scroll container everything past that height is clipped and unrecoverable.
+   The share rows stack into two-line columns on mobile and the path wraps over
+   several lines, which on a short phone pushed the footer (and with it the only
+   in-dialog way out of the dialog) permanently off the bottom edge. Keeping the
+   close control in the pinned head means it survives any content height. */
+.share-dialog-head { display: flex; gap: 10px; align-items: center; margin-bottom: 10px; color: var(--text-normal);
+  flex-shrink: 0; }
+/* flex: 1 so the ✕ is pushed to the far edge; min-width: 0 so a long path can
+   shrink and wrap instead of squeezing the ✕ out of the row. */
+.share-dialog-heading { flex: 1; min-width: 0; }
+.share-dialog-head .tool-btn { flex-shrink: 0; align-self: flex-start; }
+.share-dialog-body { flex: 1; min-height: 0; overflow-y: auto; }
 .share-dialog-title { font-weight: 700; font-size: 15px; }
 .share-dialog-path { color: var(--text-muted); font-size: 12px; word-break: break-all; }
 .share-dialog-hint { color: var(--text-muted); font-size: 13px; margin: 6px 0 12px; }
 .share-url { display: flex; gap: 6px; margin: 4px 0 10px; }
 .share-url .text-input { flex: 1; min-width: 0; }
-.share-dialog-foot { display: flex; justify-content: flex-end; margin-top: 12px; }
+.share-dialog-foot { display: flex; justify-content: flex-end; margin-top: 12px; flex-shrink: 0; }
 
 /* ---- Reveal file in navigation: brief highlight of the targeted row ---- */
 .tree-row.reveal-flash { animation: wo-reveal-flash 1.2s ease-out; }
@@ -1320,6 +1349,13 @@ body.wo-col-resizing .sidebar, body.wo-col-resizing .right-sidebar { transition:
   border-bottom: 1px solid var(--bg-modifier-border); color: var(--text-normal); }
 .vh-title { font-weight: 700; font-size: 15px; }
 .vh-path { color: var(--text-muted); font-size: 12px; word-break: break-all; flex: 1; }
+/* The head buttons must never be squeezed out: on mobile .version-history is
+   promoted to `position: fixed; inset: 0` (see the media query below), which
+   covers the .modal-bg backdrop, and the ✕ then becomes one of only two ways
+   out of the dialog. .vh-path is `word-break: break-all` so it can shrink to
+   almost nothing before these do, but pinning them costs nothing and removes
+   the question entirely. */
+.vh-head .tool-btn { flex-shrink: 0; }
 .vh-body { display: flex; flex: 1; min-height: 0; }
 .vh-list { width: 280px; flex-shrink: 0; overflow-y: auto; border-right: 1px solid var(--bg-modifier-border); padding: 6px; }
 .vh-empty { color: var(--text-faint); font-size: 13px; padding: 16px; text-align: center; }

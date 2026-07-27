@@ -197,6 +197,57 @@ export const MIN_PASSWORD_LEN = 6;
 export const MAX_SHARE_PASSWORD_LEN = 1024;
 
 /**
+ * Bounds on the login throttle, mirrored from `LOGIN_RATE_LIMIT_BOUNDS` in
+ * `server/src/services/settings.ts`. Same caveat as the constants above: an
+ * affordance, never the control. `sanitizeAuth` in
+ * `server/src/routes/settings.ts` answers 400 for anything outside these and the
+ * zod schema heals a hand-edited file on top of that.
+ *
+ * Worth stating what the floor on the attempt counts is FOR, because it is the
+ * one bound here that is not tidiness. A limit of 0 or less does not mean
+ * "unlimited": both limiters test `hits.length >= max`, which is true on the
+ * first request when the cap is zero, so `POST /auth/login` would answer 429 to
+ * everybody permanently. That includes whoever has to undo it, and the settings
+ * API they would undo it through sits behind the login they can no longer
+ * complete. Three is the smallest cap that leaves room for one mistyped password
+ * plus one that works plus one competing client (a second tab, the desktop app's
+ * automatic sign-in), all of which share a single bucket on a typical
+ * reverse-proxy deployment.
+ */
+export const LOGIN_RATE_LIMIT_BOUNDS = {
+  minWindowSec: 1,
+  maxWindowSec: 86_400,
+  minAttempts: 3,
+  maxAttempts: 1_000_000,
+} as const;
+
+/**
+ * Validate one login-throttle field the way `PUT /api/settings` does. Returns
+ * null when the value is worth sending, otherwise the sentence to show.
+ *
+ * `label` is the field's name as it appears on screen rather than its JSON key,
+ * because this string is rendered under a Save button next to the box the user
+ * just typed in, and "auth.rateLimit.loginFailureMaxAttempts" tells them nothing
+ * about which of the four boxes to look at.
+ *
+ * NaN is tested explicitly through `Number.isInteger`, and it is the case this
+ * function exists for: an emptied number input yields NaN rather than 0, so
+ * without this the browser would post `{loginMaxAttempts: null}` and meet a
+ * server 400 phrased in JSON keys.
+ */
+export function loginLimitError(
+  label: string,
+  value: number,
+  min: number,
+  max: number,
+): string | null {
+  if (!Number.isInteger(value)) return `${label} must be a whole number`;
+  if (value < min) return `${label} must be at least ${min}`;
+  if (value > max) return `${label} must be at most ${max}`;
+  return null;
+}
+
+/**
  * Validate a share password the way `PATCH /api/shares/:id` does. Returns null
  * when the value is acceptable, otherwise the message to show.
  *

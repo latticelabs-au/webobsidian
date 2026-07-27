@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { useStore } from '../lib/store';
+import { useEscapeToClose } from '../lib/useEscapeToClose';
 import {
   api,
   apiErrorMessage,
@@ -10,6 +11,8 @@ import {
   liveSyncVerdict,
   secretWillBeSet,
   ssoRedirectUri,
+  loginLimitError,
+  LOGIN_RATE_LIMIT_BOUNDS,
   MIN_PASSWORD_LEN,
   REDACTED_SECRET,
   SSO_CALLBACK_PATH,
@@ -56,14 +59,7 @@ export default function Settings() {
    * in line with the command palette and the context menu, which both close on
    * Escape already.
    */
-  useEffect(() => {
-    if (!open) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') setOpen(false);
-    };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [open, setOpen]);
+  useEscapeToClose(open, () => setOpen(false));
 
   if (!open) return null;
 
@@ -1750,6 +1746,181 @@ function AccountSettings({ s, reload }: { s: any; reload: () => void }) {
         the <code>WEBOBSIDIAN_PASSWORD</code> environment variable, as a recovery password (it
         overrides the stored one), then sign in again to set a new one.
       </p>
+      {/*
+        Guarded on the data being present rather than rendered unconditionally.
+        AccountSettings is mounted without the `settings &&` guard its siblings
+        have, so `s` can legitimately be null here, and the child below seeds
+        useState from its props exactly once: mounting it early would freeze four
+        empty boxes that never pick up the loaded values.
+      */}
+      {s?.auth?.rateLimit && <LoginRateLimitSettings s={s} reload={reload} />}
+    </div>
+  );
+}
+
+/**
+ * The login throttle, on the Account panel rather than anywhere else.
+ *
+ * WHY HERE. It governs the password door and only that door: the server mounts
+ * these limiters on `POST /auth/login` alone, and the single sign-on endpoints
+ * carry their own separate budget that is deliberately not exposed. Account is
+ * the panel about the password a person signs in with, so the limit on how often
+ * they may try it is the same subject one paragraph later. The SSO panel would be
+ * actively misleading: an operator reading these numbers there would reasonably
+ * conclude they throttle the SSO button, and they do not.
+ *
+ * WHY IT IS CONFIGURABLE. The shipped numbers are sensible and are still wrong
+ * for somebody. A single-user instance behind a VPN wants them loose; a public
+ * instance wants them tight; an operator running a script that signs in
+ * repeatedly trips the network-keyed layer with nothing to do about it. That was
+ * previously a source edit.
+ *
+ * The two layers are presented as two groups rather than flattened into four
+ * boxes, because the difference between them decides which one an operator
+ * should be reaching for and it is not guessable from the field names. Layer 1
+ * charges EVERY attempt against the caller's network address, which behind a
+ * reverse proxy is usually one shared bucket for the whole instance. Layer 2
+ * charges only FAILED attempts against the account, and a correct password wipes
+ * the counter, which is what stops a stranger's guessing from locking the owner
+ * out.
+ */
+function LoginRateLimitSettings({ s, reload }: { s: any; reload: () => void }) {
+  const stored = s.auth.rateLimit;
+  const [cfg, setCfg] = useState({
+    loginWindowSec: Number(stored.loginWindowSec),
+    loginMaxAttempts: Number(stored.loginMaxAttempts),
+    loginFailureWindowSec: Number(stored.loginFailureWindowSec),
+    loginFailureMaxAttempts: Number(stored.loginFailureMaxAttempts),
+  });
+  const [err, setErr] = useState('');
+  const [msg, setMsg] = useState('');
+  const [busy, setBusy] = useState(false);
+  const set = (k: keyof typeof cfg, v: string) =>
+    // parseInt rather than Number, so that clearing the box gives NaN (which the
+    // validator names as "must be a whole number") instead of Number('') === 0,
+    // which is the one value in this whole panel that would lock the instance and
+    // which would otherwise sail through looking deliberate.
+    setCfg((p) => ({ ...p, [k]: parseInt(v, 10) }));
+
+  const b = LOGIN_RATE_LIMIT_BOUNDS;
+
+  const save = async () => {
+    setErr('');
+    setMsg('');
+    // Every check below is a user-experience affordance and never the control.
+    // `sanitizeAuth` in server/src/routes/settings.ts applies the same four
+    // bounds and is what actually decides; the schema heals a hand-edited file on
+    // top of that. What the local copies buy is a sentence naming the box to fix,
+    // because the server's 400 arrives phrased in JSON keys.
+    const problems = [
+      loginLimitError('Attempt window', cfg.loginWindowSec, b.minWindowSec, b.maxWindowSec),
+      loginLimitError('Attempts allowed', cfg.loginMaxAttempts, b.minAttempts, b.maxAttempts),
+      loginLimitError('Failure window', cfg.loginFailureWindowSec, b.minWindowSec, b.maxWindowSec),
+      loginLimitError(
+        'Failures allowed',
+        cfg.loginFailureMaxAttempts,
+        b.minAttempts,
+        b.maxAttempts,
+      ),
+    ].filter(Boolean);
+    if (problems.length > 0) {
+      setErr(problems[0] as string);
+      return;
+    }
+    setBusy(true);
+    try {
+      await api.putSettings({ auth: { rateLimit: cfg } });
+      setMsg('Saved sign-in limits. They apply to the next attempt: no restart needed.');
+      await reload();
+    } catch (e) {
+      setErr(apiErrorMessage(e, 'Could not save the sign-in limits'));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div style={{ marginTop: 24, borderTop: '1px solid var(--bg-modifier-border)', paddingTop: 16 }}>
+      <h3>Sign-in limits</h3>
+      <p style={{ color: 'var(--text-muted)' }}>
+        How often the password form may be tried before it starts refusing. These govern password
+        sign-in only; single sign-on has its own separate budget.
+      </p>
+      {/*
+        The warning is not decoration. A cap of zero is not "unlimited", it refuses
+        the very first attempt, and the page that undoes it is behind the sign-in
+        it just closed. The server refuses anything under the floor outright, so
+        this explains the refusal the operator is about to meet rather than
+        standing in for it.
+      */}
+      <p style={{ color: '#d29922', fontSize: 12 }}>
+        Setting these too low locks you out of your own vault, and the only way back is editing{' '}
+        <code>data/settings.json</code> on the server by hand: the limit is checked before your
+        password is, so the recovery password does not get you past it. The minimum accepted is{' '}
+        {b.minAttempts} attempts, which leaves room for one typo, one success, and one other client
+        (a second tab, or the desktop app signing itself in).
+      </p>
+      <Row
+        name="Attempts allowed"
+        desc={`Every attempt counts, right or wrong, and behind a reverse proxy this is usually one shared budget for everyone. Default 10, minimum ${b.minAttempts}.`}
+      >
+        <input
+          className="text-input"
+          type="number"
+          min={b.minAttempts}
+          max={b.maxAttempts}
+          style={{ width: 120 }}
+          value={Number.isInteger(cfg.loginMaxAttempts) ? cfg.loginMaxAttempts : ''}
+          onChange={(e) => set('loginMaxAttempts', e.target.value)}
+        />
+      </Row>
+      <Row
+        name="Attempt window (seconds)"
+        desc={`How long an attempt is remembered for. Default 900 (15 minutes), maximum ${b.maxWindowSec} (24 hours): past a day a throttle stops being a pause and becomes an outage.`}
+      >
+        <input
+          className="text-input"
+          type="number"
+          min={b.minWindowSec}
+          max={b.maxWindowSec}
+          style={{ width: 120 }}
+          value={Number.isInteger(cfg.loginWindowSec) ? cfg.loginWindowSec : ''}
+          onChange={(e) => set('loginWindowSec', e.target.value)}
+        />
+      </Row>
+      <Row
+        name="Failures allowed"
+        desc={`Wrong passwords only, counted against this account. A correct password clears the count immediately, so you can always get in even while someone else is guessing. Default 25, minimum ${b.minAttempts}.`}
+      >
+        <input
+          className="text-input"
+          type="number"
+          min={b.minAttempts}
+          max={b.maxAttempts}
+          style={{ width: 120 }}
+          value={Number.isInteger(cfg.loginFailureMaxAttempts) ? cfg.loginFailureMaxAttempts : ''}
+          onChange={(e) => set('loginFailureMaxAttempts', e.target.value)}
+        />
+      </Row>
+      <Row
+        name="Failure window (seconds)"
+        desc={`How long a failed attempt is held against the account. Default 900 (15 minutes).`}
+      >
+        <input
+          className="text-input"
+          type="number"
+          min={b.minWindowSec}
+          max={b.maxWindowSec}
+          style={{ width: 120 }}
+          value={Number.isInteger(cfg.loginFailureWindowSec) ? cfg.loginFailureWindowSec : ''}
+          onChange={(e) => set('loginFailureWindowSec', e.target.value)}
+        />
+      </Row>
+      {err && <div style={{ color: '#e5534b', margin: '6px 0' }}>{err}</div>}
+      {msg && <div style={{ color: 'var(--text-accent, #4caf50)', margin: '6px 0' }}>{msg}</div>}
+      <button className="btn" onClick={save} disabled={busy}>
+        {busy ? 'Saving…' : 'Save sign-in limits'}
+      </button>
     </div>
   );
 }
