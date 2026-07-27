@@ -34,6 +34,24 @@ jobs:
       - name: Build desktop bundle
         run: npm --workspace desktop run build
 
+  test:
+    name: Server unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci || npm install
+
+      - name: Test
+        run: npm --workspace server run test
+
   docker:
     name: Docker image builds
     runs-on: ubuntu-latest

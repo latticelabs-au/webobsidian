@@ -15,6 +15,7 @@
     "build": "npm run build:engine && npm --workspace web run build && npm --workspace server run build",
     "build:engine": "node server/vendor/livesync-engine/build.mjs",
     "start": "npm --workspace server run start",
+    "test": "npm --workspace server run test",
     "typecheck": "npm --workspace server run typecheck && npm --workspace web run typecheck",
     "desktop": "npm run build && npm --workspace desktop run dev",
     "desktop:dist": "npm run build && npm --workspace desktop run dist",
