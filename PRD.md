@@ -1,118 +1,134 @@
-# PRD — WebObsidian
+# PRD: WebObsidian
 
 > Product Requirements Document
-> Phiên bản: 1.5 · Cập nhật: 2026-06-22 · Trạng thái: Draft
-> Changelog 1.5 (FR-13 — Desktop app Electron đa nền tảng, theo yêu cầu người dùng): bổ sung **FR-13** —
-> đóng gói WebObsidian thành **app cài đặt** macOS/Windows/Linux (arm64/x64/ia32). Workspace mới `desktop/`
-> là **Electron shell** spawn đúng server Express hiện có như tiến trình con (qua `ELECTRON_RUN_AS_NODE`,
-> bind `127.0.0.1` + cổng ngẫu nhiên) và load SPA trong `BrowserWindow`. Server được esbuild bundle thành
-> **1 file `.mjs`** (không native module runtime nên cross-arch chỉ là đổi Electron binary). Lần đầu **chọn
-> vault**, dữ liệu vào `userData`, **auto-login** bằng mật khẩu ngẫu nhiên/máy (không bắt đổi pass). Đóng gói
-> bằng **electron-builder** (dmg/zip · nsis/portable · AppImage/deb); CI mới `release.yml` build matrix
-> macOS/Windows/Ubuntu khi push tag `v*` và publish **GitHub Release**. Không đổi server/web code.
-> Changelog 1.4 (FR-2 — Audio/Video embed: phát được như Obsidian, theo yêu cầu người dùng): embed
-> `![[clip.mp4]]` / `![[song.mp3]]` giờ render **trình phát HTML5 thật** (`<video controls>` / `<audio
-> controls>`) ở **cả** Live Preview, Reading view và trang public share — trước đây chỉ hiện link xanh.
-> Mở thẳng file media từ file tree cũng hiện player (như ảnh). Hỗ trợ video: `mp4/webm/ogv/mov/mkv`,
-> audio: `mp3/wav/m4a/3gp/flac/ogg/oga/opus` (khớp bộ extension của Obsidian). Size param `![[clip.mp4|W]]`
-> đặt chiều rộng video. **Quan trọng:** route serve binary (`GET /api/files/content`, raw share) nay
-> **stream + hỗ trợ HTTP Range** (206 Partial Content) nên thanh tua/seek video hoạt động và Safari phát
-> được — thay vì đọc cả file vào RAM. MIME map + bộ extension gom về `server/services/mime.ts` &
-> `web/lib/media.ts`. Không thêm API mới.
-> Changelog 1.3 (FR-1 — File explorer header toolbar parity Obsidian, theo yêu cầu người dùng): header sidebar
-> **Files** bổ sung đủ nút như Obsidian: **New note**, **New canvas**, **New folder**, **Change sort order**
-> (dropdown 6 kiểu: File name A→Z/Z→A, Modified time new↔old, Created time new↔old), **Auto reveal current
-> file** (toggle: tự mở folder cha + cuộn tới file đang xem), **Collapse all / Expand all**. Sort theo thời gian
-> nhanh nhờ **stat cache trong RAM** ở server (`listTree` fill 1 lần, watcher invalidate file đổi → 0 syscall
-> ở steady-state); `TreeNode` thêm `ctime`. Không thêm API mới (tree cũ nay kèm `mtime`/`ctime`). Canvas (FR-12):
-> fix Android Chrome double-tap edit không lưu được text (commit qua doc-level pointerdown + double-tap detect).
-> Changelog 1.2 (FR-2 — Ảnh: resize + zoom, theo yêu cầu người dùng): ảnh nhúng trong note giờ **kéo để
-> resize** (2 thanh handle trái/phải hiện khi hover trong Live Preview) — ghi lại kích thước vào source dưới
-> dạng size param Obsidian: `![[img|W]]` cho wikilink embed, `![alt|W](url)` cho ảnh markdown chuẩn (giữ tỉ lệ,
-> height auto). Size param `|300` / `|300x200` nay áp dụng **cả** ảnh markdown `![](…)` (trước chỉ `![[…]]`),
-> ở cả Live lẫn Reading. **Click ảnh → lightbox toàn màn hình** (cả 2 mode): cuộn chuột/pinch để zoom (theo
-> con trỏ/tâm 2 ngón), kéo/1-ngón để pan, double-click reset, Esc hoặc click nền để đóng. Không thêm API mới.
-> Changelog 1.1 (FR-1 — Trash UI + chế độ xoá, theo yêu cầu người dùng): bổ sung **giao diện Trash** để xem,
-> **khôi phục (Restore)** và **xoá vĩnh viễn** từng file đã xoá, cùng nút **Empty trash**. Mở Trash từ nút 🗑
-> trên header sidebar Files hoặc command palette ("Open trash"). Thêm setting `vault.deleteMode`
-> (`trash` = chuyển vào `.trash` khôi phục được [mặc định] · `permanent` = xoá vĩnh viễn ngay) trong
-> Settings → Vault & Files. API mới: `GET /api/files/trash`, `POST /api/files/trash/restore`,
-> `DELETE /api/files/trash/item`, `DELETE /api/files/trash`. Restore tự né trùng tên (suffix `.restored-<ts>`)
-> và dọn thư mục rỗng trong `.trash`; mọi thao tác trash đều guard path traversal (chỉ tác động trong `.trash`).
-> Changelog 1.0 (FR-12 — Canvas, theo yêu cầu người dùng): clone tính năng **Canvas** của Obsidian. Khung vẽ
-> vô hạn (pan/zoom) chứa các node (text markdown, file embed/link tới note hoặc ảnh, link URL, group) và các
-> edge nối cạnh node có mũi tên + nhãn. Đọc/ghi đúng định dạng mở **JSON Canvas** (`.canvas`, tương thích
-> Obsidian). Tạo/di chuyển/resize/đổi màu/xóa node, nối edge bằng kéo từ chấm cạnh, multi-select + marquee,
-> double-click nền tạo text node, double-click text node để sửa. Autosave debounce như editor (qua store
-> `content`/`save`). Tạo canvas mới: context menu file tree + command palette. Không thêm API mới (dùng
-> `/api/files/content`).
-> Changelog 0.9 (FR-1 — Copy/Cut/Paste trong context menu file tree theo yêu cầu người dùng): menu chuột phải
-> file/folder bổ sung **Copy**, **Cut**, **Paste** (clipboard session-local, không persist/broadcast). Cut dùng
-> `rename` (move) cho cả file lẫn folder; Copy dùng endpoint mới **POST `/api/files/copy`** copy đệ quy file/folder
-> (qua `fs.cp` recursive, reindex các `.md` mới). Paste vào folder đích (folder được click hoặc thư mục cha của file):
-> tự đặt tên không trùng (`… copy`/`… copy N`), chặn dán folder vào chính nó/thư mục con, dán Cut vào đúng chỗ cũ là
-> no-op; row bị Cut làm mờ chờ dán; mục **Paste** chỉ hiện khi clipboard có dữ liệu. Right-click vùng trống
-> file tree cũng ra context menu của app (New note / New folder / Paste vào vault root) thay vì menu native trình duyệt.
-> Changelog 0.8 (FR-2/FR-4 — menu ⋯ parity Obsidian theo yêu cầu người dùng): menu **More options (⋯)**
-> dựng lại theo cấu trúc Obsidian Desktop và bổ sung: **Backlinks in document** + **Open linked view**
-> (Backlinks/Outgoing links/Outline → mở right panel); **Open in new window** (mở deep-link `/note/<path>`
-> ở tab mới); **Add file property** (chèn property rỗng vào frontmatter YAML); **Find…** trong note
-> (`@codemirror/search`, ⌘F/⌘⇧F/⌘G); **Export to PDF…** (Reading view + `window.print()` qua CSS
-> `@media print`); **Reveal file in navigation** (mở folder tổ tiên + scroll/flash row trong file tree);
-> **Open version history** (FR-4): `git log`/`git show` cho từng file qua `/api/git/log|/show`, modal liệt
-> kê commit + preview + Restore version. Bỏ "Reveal in Finder"/"Open in default app" (desktop-only).
-> Changelog 0.7 (FR-10 UX theo phản hồi): menu "Copy public link" → "Share…" mở **Share dialog**
-> per-note (tạo link, copy URL, toggle bật/tắt, đặt/đổi password, xoá link) ở cả context menu file
-> tree lẫn menu ⋯ của pane; note đang share public có **icon globe** (màu accent) cạnh tên trong
-> file tree; danh sách share cache trong store (đồng bộ giữa dialog, Settings → Sharing và badge).
-> Changelog 0.6 (FR-9 deploy hardening cho open-source self-host): tham số deploy chuyển hết sang `.env`
-> (`VAULT_HOST_PATH`/`HTTP_BIND`/`HTTP_PORT`/`WEBOBSIDIAN_WATCH`) nên `docker-compose.yml` không bị clobber
-> khi redeploy; file watcher tự fallback polling khi đụng inotify limit; healthcheck `start_period=90s`.
-> Changelog 0.5: Graph (FR-2) thêm tìm node theo keywords — ô search nổi trên Graph view, gõ keywords
-> hiện danh sách note/tag khả dĩ (match label/path, tag luôn xếp trước, sau đó prefix > label > path + degree), click
-> (hoặc Enter = kết quả đầu) bay camera (fly animation pan+zoom mượt) tới node và highlight node đó
-> (node sáng màu accent, phần không liên kết mờ đi) tới khi di chuột; Esc đóng danh sách.
-> Changelog 0.4: thêm FR-11 (Mobile / responsive UI cho smartphone màn hình cảm ứng) — sidebar trái/phải
-> thành drawer overlay trượt (hamburger + edge-swipe + backdrop), workspace full-width, mobile editing
-> toolbar trên bàn phím (bold/italic/heading/list/checkbox/link/…), touch target ≥44px, safe-area insets.
-> Tham chiếu UX Obsidian Mobile app. Cập nhật NFR khả dụng.
-> Changelog 0.3: mở rộng FR-2 theo phản hồi người dùng — (a) menu "More options" (⋯) trên header mỗi pane
-> (Split right/Split down, Copy screenshot cho Graph, Bookmark, Copy public link, Make a copy, Rename/Move/
-> Copy path/Delete, Close tab/Close others) giống Obsidian; (b) Right sidebar đại tu thành tab strip icon
-> (Backlinks · Outgoing links · Tags · Outline) với Linked mentions + **Unlinked mentions** và **Outgoing
-> links** (resolved/unresolved) — trước đó chỉ có 2 panel cố định.
-> Changelog 0.2: thêm FR-10 (deep-link URL `/note/...` + public share link readonly + trang quản lý share tập trung), API `/api/shares` + `/public/shares`, data model `data/shares.json`.
+> Version: 1.5 · Updated: 2026-06-22 · Status: Draft
+> Changelog 1.5 (FR-13: cross-platform Electron desktop app, requested by the user): adds **FR-13**,
+> packaging WebObsidian into an **installable app** for macOS/Windows/Linux (arm64/x64/ia32). The new
+> `desktop/` workspace is an **Electron shell** that spawns the exact same existing Express server as a child
+> process (via `ELECTRON_RUN_AS_NODE`, bound to `127.0.0.1` + a random port) and loads the SPA in a
+> `BrowserWindow`. The server is bundled by esbuild into **a single `.mjs` file** (no native runtime modules,
+> so going cross-arch is just a matter of swapping the Electron binary). On first run the user **picks a
+> vault**, data goes into `userData`, and **auto-login** uses a random per-machine password (no forced
+> password change). Packaged with **electron-builder** (dmg/zip · nsis/portable · AppImage/deb); the new
+> `release.yml` CI builds a macOS/Windows/Ubuntu matrix on `v*` tag pushes and publishes a **GitHub
+> Release**. No server/web code changes.
+> Changelog 1.4 (FR-2: audio/video embeds, playable like Obsidian, requested by the user): the embeds
+> `![[clip.mp4]]` / `![[song.mp3]]` now render a **real HTML5 player** (`<video controls>` / `<audio
+> controls>`) in **all** of Live Preview, Reading view and the public share page, where previously they only
+> showed a blue link. Opening a media file straight from the file tree shows a player too (just like images).
+> Video support: `mp4/webm/ogv/mov/mkv`, audio: `mp3/wav/m4a/3gp/flac/ogg/oga/opus` (matching Obsidian's own
+> extension set). The size param `![[clip.mp4|W]]` sets the video width. **Important:** the routes that serve
+> binaries (`GET /api/files/content`, raw share) now **stream and support HTTP Range** (206 Partial Content),
+> so the video scrubber works and Safari can play at all, instead of reading the whole file into RAM. The
+> MIME map and the extension sets are consolidated into `server/services/mime.ts` &
+> `web/lib/media.ts`. No new APIs.
+> Changelog 1.3 (FR-1: file explorer header toolbar parity with Obsidian, requested by the user): the
+> **Files** sidebar header gains the full Obsidian button set: **New note**, **New canvas**, **New folder**,
+> **Change sort order** (a dropdown with 6 modes: File name A→Z/Z→A, Modified time new↔old, Created time
+> new↔old), **Auto reveal current file** (toggle: expands the parent folder and scrolls to the file being
+> viewed), **Collapse all / Expand all**. Sorting by time is fast thanks to an **in-RAM stat cache** on the
+> server (`listTree` fills it once, the watcher invalidates changed files → 0 syscalls at steady state);
+> `TreeNode` gains `ctime`. No new APIs (the existing tree now carries `mtime`/`ctime`). Canvas (FR-12):
+> fixed double-tap editing on Android Chrome not saving the text (commit via a doc-level pointerdown +
+> double-tap detection).
+> Changelog 1.2 (FR-2: images, resize + zoom, requested by the user): images embedded in a note can now be
+> **dragged to resize** (two handle bars on the left/right that appear on hover in Live Preview), writing the
+> size back into the source as an Obsidian size param: `![[img|W]]` for wikilink embeds, `![alt|W](url)` for
+> plain markdown images (aspect ratio preserved, height auto). The size param `|300` / `|300x200` now applies
+> to markdown images `![](…)` **as well** (previously only `![[…]]`), in Live as well as Reading.
+> **Click an image → full-screen lightbox** (in both modes): scroll wheel/pinch to zoom (centred on the
+> cursor / the midpoint of the two fingers), drag or one finger to pan, double-click to reset, Esc or a click
+> on the backdrop to close. No new APIs.
+> Changelog 1.1 (FR-1: trash UI + delete mode, requested by the user): adds a **Trash UI** for viewing,
+> **restoring** and **permanently deleting** individual deleted files, plus an **Empty trash** button. Open
+> Trash from the 🗑 button in the Files sidebar header or from the command palette ("Open trash"). Adds the
+> `vault.deleteMode` setting (`trash` = move into `.trash`, restorable [default] · `permanent` = delete
+> permanently right away) under Settings → Vault & Files. New APIs: `GET /api/files/trash`,
+> `POST /api/files/trash/restore`, `DELETE /api/files/trash/item`, `DELETE /api/files/trash`. Restore avoids
+> name collisions on its own (suffix `.restored-<ts>`) and cleans up empty folders inside `.trash`; every
+> trash operation guards against path traversal (it can only touch things inside `.trash`).
+> Changelog 1.0 (FR-12: Canvas, requested by the user): clones Obsidian's **Canvas** feature. An infinite
+> drawing surface (pan/zoom) holding nodes (markdown text, file embeds/links to a note or an image, URL
+> links, groups) and edges connecting node sides with arrows + labels. Reads/writes the open **JSON Canvas**
+> format correctly (`.canvas`, compatible with Obsidian). Create/move/resize/recolour/delete nodes, connect
+> edges by dragging from a side dot, multi-select + marquee, double-click the background to create a text
+> node, double-click a text node to edit it. Debounced autosave like the editor (via the store's
+> `content`/`save`). Create a new canvas from the file tree context menu + the command palette. No new APIs
+> (it uses `/api/files/content`).
+> Changelog 0.9 (FR-1: copy/cut/paste in the file tree context menu, requested by the user): the file/folder
+> right-click menu gains **Copy**, **Cut**, **Paste** (a session-local clipboard, not persisted or broadcast).
+> Cut uses `rename` (move) for files and folders alike; Copy uses the new endpoint **POST `/api/files/copy`**,
+> which copies files/folders recursively (via recursive `fs.cp`, reindexing the new `.md` files). Paste goes
+> into the destination folder (the folder that was clicked, or the parent folder of a file): it picks a
+> non-colliding name automatically (`… copy`/`… copy N`), refuses to paste a folder into itself or one of its
+> own subfolders, and pasting a Cut item back exactly where it already was is a no-op; the row being Cut is
+> dimmed while it waits to be pasted; the **Paste** item only appears when the clipboard has data.
+> Right-clicking empty space in the file tree also brings up the app's context menu (New note / New folder /
+> Paste into the vault root) instead of the browser's native menu.
+> Changelog 0.8 (FR-2/FR-4: ⋯ menu parity with Obsidian, requested by the user): the **More options (⋯)**
+> menu is rebuilt to follow Obsidian Desktop's structure and gains: **Backlinks in document** + **Open linked
+> view** (Backlinks/Outgoing links/Outline → opens the right panel); **Open in new window** (opens the
+> deep-link `/note/<path>` in a new tab); **Add file property** (inserts an empty property into the YAML
+> frontmatter); **Find…** inside a note (`@codemirror/search`, ⌘F/⌘⇧F/⌘G); **Export to PDF…** (Reading view +
+> `window.print()` driven by `@media print` CSS); **Reveal file in navigation** (expands the ancestor folders
+> + scrolls to/flashes the row in the file tree); **Open version history** (FR-4): `git log`/`git show` per
+> file via `/api/git/log|/show`, with a modal listing the commits + a preview + Restore version. Drops
+> "Reveal in Finder"/"Open in default app" (desktop-only).
+> Changelog 0.7 (FR-10 UX, from feedback): the "Copy public link" menu item becomes "Share…", opening a
+> per-note **Share dialog** (create a link, copy the URL, toggle it on/off, set/change the password, delete
+> the link) in both the file tree context menu and the pane's ⋯ menu; a note that is shared publicly gets a
+> **globe icon** (in the accent colour) next to its name in the file tree; the share list is cached in the
+> store (kept in sync between the dialog, Settings → Sharing and the badge).
+> Changelog 0.6 (FR-9 deploy hardening for open-source self-hosting): every deploy parameter moves into
+> `.env` (`VAULT_HOST_PATH`/`HTTP_BIND`/`HTTP_PORT`/`WEBOBSIDIAN_WATCH`), so `docker-compose.yml` is no
+> longer clobbered on redeploy; the file watcher falls back to polling on its own when it hits the inotify
+> limit; healthcheck `start_period=90s`.
+> Changelog 0.5: Graph (FR-2) gains keyword node search: a search box floating over the Graph view, typing
+> keywords shows the list of candidate notes/tags (matching label/path, tags always ranked first, then prefix > label > path + degree), and clicking
+> (or Enter for the first result) flies the camera (a smooth pan+zoom fly animation) to the node and
+> highlights it (the node lights up in the accent colour, everything unconnected dims) until the mouse
+> moves; Esc closes the list.
+> Changelog 0.4: adds FR-11 (mobile / responsive UI for touchscreen smartphones): the left/right sidebars
+> become sliding drawer overlays (hamburger + edge-swipe + backdrop), the workspace goes full-width, a
+> mobile editing toolbar sits above the keyboard (bold/italic/heading/list/checkbox/link/…), touch targets
+> ≥44px, safe-area insets. UX reference: the Obsidian Mobile app. Usability NFR updated.
+> Changelog 0.3: expands FR-2 following user feedback: (a) a "More options" (⋯) menu on each pane header
+> (Split right/Split down, Copy screenshot for Graph, Bookmark, Copy public link, Make a copy, Rename/Move/
+> Copy path/Delete, Close tab/Close others) like Obsidian; (b) the right sidebar is overhauled into an icon
+> tab strip (Backlinks · Outgoing links · Tags · Outline) with Linked mentions + **Unlinked mentions** and
+> **Outgoing links** (resolved/unresolved), where before there were only 2 fixed panels.
+> Changelog 0.2: adds FR-10 (deep-link URL `/note/...` + readonly public share links + a central share management page), the `/api/shares` + `/public/shares` APIs, and the `data/shares.json` data model.
 
 ---
 
-## 1. Tổng quan
+## 1. Overview
 
-**WebObsidian** là một web app self-hosted clone toàn diện chức năng của [Obsidian](https://obsidian.md), chạy trên server (Docker), thao tác trực tiếp trên một thư mục Vault chứa các file Markdown. Mục tiêu là cho phép truy cập và chỉnh sửa "second brain" của người dùng từ bất kỳ trình duyệt nào, đồng thời mở API cho AI Agent tương tác.
+**WebObsidian** is a self-hosted web app that comprehensively clones the functionality of [Obsidian](https://obsidian.md), runs on a server (Docker), and operates directly on a Vault directory containing Markdown files. The goal is to let users reach and edit their "second brain" from any browser, while also exposing an API for AI Agents to interact with.
 
-### 1.1 Mục tiêu (Goals)
-- Trải nghiệm soạn thảo/đọc Markdown tương đương Obsidian desktop (editor, live preview, wikilinks, graph, backlinks).
-- Vault là một thư mục thực trên server — tương thích 100% với vault Obsidian hiện có (kể cả `.obsidian/`).
-- Sync 2 chiều bằng **GitHub repo native** (git), hỗ trợ **Git LFS** cho file lớn (ảnh, pdf, audio…).
-- **Login gate** đơn giản: một mật khẩu duy nhất bảo vệ toàn bộ app.
-- Cấu hình lưu trong **file `.json` thuần** (không cần DB engine).
-- **API Gate** với API key để AI Agent đọc/ghi/tìm kiếm vault qua REST.
-- **QMD search engine** tích hợp sẵn: full-text + fielded search nhanh trên toàn vault.
-- Hỗ trợ cài **Obsidian community plugins** giống app chuẩn (qua plugin loader + Obsidian API shim).
-- Đóng gói **Docker stack** chạy 1 lệnh.
+### 1.1 Goals
+- A Markdown authoring/reading experience on par with Obsidian desktop (editor, live preview, wikilinks, graph, backlinks).
+- The vault is a real directory on the server, 100% compatible with an existing Obsidian vault (including `.obsidian/`).
+- Two-way sync through a **native GitHub repo** (git), with **Git LFS** support for large files (images, pdf, audio, and so on).
+- A simple **login gate**: a single password protects the whole app.
+- Configuration stored in a **plain `.json` file** (no DB engine needed).
+- An **API Gate** with API keys so AI Agents can read/write/search the vault over REST.
+- A built-in **QMD search engine**: fast full-text + fielded search across the whole vault.
+- Support for installing **Obsidian community plugins** the way the real app does (via a plugin loader + an Obsidian API shim).
+- A **Docker stack** that comes up with one command.
 
-### 1.2 Ngoài phạm vi (Non-goals — v1)
-- Realtime multi-user collaborative editing (CRDT). v1 là single-user (1 password).
-- Obsidian Sync/Publish độc quyền (thay bằng Git sync).
-- Mobile native app (chỉ responsive web).
-- 100% tương thích mọi plugin dùng Electron/Node API nội bộ (chỉ hỗ trợ subset Obsidian API phổ biến).
+### 1.2 Out of scope (non-goals, v1)
+- Realtime multi-user collaborative editing (CRDT). v1 is single-user (1 password).
+- Obsidian's proprietary Sync/Publish (replaced by Git sync).
+- A native mobile app (responsive web only).
+- 100% compatibility with every plugin that uses internal Electron/Node APIs (only the common subset of the Obsidian API is supported).
 
-### 1.3 Người dùng mục tiêu
-- Cá nhân tự host knowledge base, muốn truy cập từ mọi thiết bị qua web.
-- Người dùng muốn AI Agent đọc/ghi vault qua API an toàn.
+### 1.3 Target users
+- Individuals self-hosting a knowledge base who want access from any device over the web.
+- Users who want an AI Agent to read/write the vault through a safe API.
 
 ---
 
-## 2. Kiến trúc hệ thống
+## 2. System architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -131,19 +147,19 @@
 ```
 
 ### 2.1 Tech stack
-| Layer | Lựa chọn | Lý do |
+| Layer | Choice | Why |
 |-------|----------|-------|
-| Backend | Node 20+, Express, TypeScript | Đồng nhất ngôn ngữ, hệ sinh thái git/markdown phong phú |
-| Frontend | React + Vite + TypeScript | Build nhanh, SPA |
-| Editor | CodeMirror 6 | Engine soạn thảo của chính Obsidian |
-| Markdown | unified/remark + rehype | Render an toàn, hỗ trợ plugin |
-| Search | QMD (module nội bộ trên nền MiniSearch) | Full-text + fielded, in-process, không cần service ngoài |
-| Sync | simple-git + git-lfs | Native git, hỗ trợ file lớn |
-| Auth | Mật khẩu hash (scrypt) + JWT cookie | Đơn giản, không cần DB |
-| Storage cfg | `data/settings.json` | Yêu cầu "JSON thuần" |
-| Container | Docker + docker-compose | Deploy 1 lệnh |
+| Backend | Node 20+, Express, TypeScript | One language throughout, a rich git/markdown ecosystem |
+| Frontend | React + Vite + TypeScript | Fast builds, SPA |
+| Editor | CodeMirror 6 | Obsidian's own editing engine |
+| Markdown | unified/remark + rehype | Safe rendering, plugin support |
+| Search | QMD (an in-house module on top of MiniSearch) | Full-text + fielded, in-process, no external service needed |
+| Sync | simple-git + git-lfs | Native git, large file support |
+| Auth | Hashed password (scrypt) + JWT cookie | Simple, no DB needed |
+| Storage cfg | `data/settings.json` | The "plain JSON" requirement |
+| Container | Docker + docker-compose | One-command deploy |
 
-### 2.2 Layout thư mục dự án
+### 2.2 Project directory layout
 ```
 webobsidian/
 ├── server/           # API backend
@@ -165,312 +181,313 @@ webobsidian/
 
 ---
 
-## 3. Yêu cầu chức năng (Functional Requirements)
+## 3. Functional requirements
 
 ### FR-1 · Vault management
-- Chọn/đổi thư mục Vault qua Settings (đường dẫn server-side, có folder browser an toàn trong allowed roots).
-- CRUD file & folder: tạo, đọc, ghi, đổi tên, di chuyển, xoá. Chế độ xoá cấu hình qua
-  `vault.deleteMode`: `trash` (→ `.trash`, khôi phục được — mặc định) hoặc `permanent` (xoá hẳn).
-- **Trash**: giao diện xem các file đã xoá, **Restore** về vị trí gốc, **xoá vĩnh viễn** từng file, **Empty
-  trash**. Trash ẩn khỏi file tree (dotfile) và khỏi watcher; mở qua nút 🗑 header Files hoặc command palette.
-- **Copy/Cut/Paste** trên context menu file tree (file & folder): clipboard session-local; Cut = move (`rename`),
-  Copy = copy đệ quy (`POST /api/files/copy`, `fs.cp` recursive); Paste vào folder đích, tự né trùng tên, chặn dán
-  folder vào chính nó/thư mục con.
-- Hỗ trợ attachments (ảnh/pdf/…); upload từ web. Thư mục đích upload resolve **case-insensitive** với folder
-  sẵn có (`vault.resolveDirCaseInsensitive`) — tránh tạo thư mục trùng khác hoa-thường (vd `attachments` cạnh
-  `Attachments` có sẵn) trên filesystem phân biệt hoa-thường (Linux).
-- Watch filesystem (chokidar) để phản ánh thay đổi ngoài (git pull, sửa trực tiếp).
-- Tương thích cấu trúc `.obsidian/` (config, plugins, themes).
+- Pick/change the Vault directory from Settings (a server-side path, with a safe folder browser confined to the allowed roots).
+- File & folder CRUD: create, read, write, rename, move, delete. The delete mode is configured through
+  `vault.deleteMode`: `trash` (→ `.trash`, restorable, the default) or `permanent` (deleted outright).
+- **Trash**: a UI listing the deleted files, **Restore** back to the original location, **permanent delete**
+  per file, and **Empty trash**. Trash is hidden from the file tree (dotfile) and from the watcher; open it from the 🗑 button in the Files header or from the command palette.
+- **Copy/Cut/Paste** in the file tree context menu (files & folders): a session-local clipboard; Cut = move (`rename`),
+  Copy = recursive copy (`POST /api/files/copy`, recursive `fs.cp`); Paste into the destination folder, avoiding name collisions on its own, refusing to paste a
+  folder into itself or one of its own subfolders.
+- Attachment support (images/pdf/…); upload from the web. The upload destination directory resolves
+  **case-insensitively** against existing folders (`vault.resolveDirCaseInsensitive`), which avoids creating a
+  duplicate folder differing only in case (for example `attachments` next to an existing `Attachments`) on a case-sensitive filesystem (Linux).
+- Watch the filesystem (chokidar) to reflect outside changes (git pull, direct edits).
+- Compatible with the `.obsidian/` structure (config, plugins, themes).
 
 ### FR-2 · Editor & rendering
-- CodeMirror 6: syntax highlight Markdown, keybindings cơ bản.
-- Live preview / Reading view chuyển đổi.
+- CodeMirror 6: Markdown syntax highlighting, basic keybindings.
+- Switching between Live preview and Reading view.
 - Wikilinks `[[note]]`, embeds `![[file]]`, tags `#tag`, callouts, tasks `- [ ]`.
-- **Ảnh nhúng — resize & zoom**: kéo handle 2 cạnh (trái/phải) trên ảnh trong Live Preview để đổi rộng,
-  ghi lại vào source dạng size param Obsidian `![[img|W]]` / `![alt|W](url)` (giữ tỉ lệ, height auto).
-  Size param `|W` / `|WxH` áp dụng cho **cả** `![[…]]` và ảnh markdown `![](…)`, ở Live lẫn Reading.
-  Click ảnh → **lightbox toàn màn hình**: wheel/pinch zoom (theo con trỏ/tâm), kéo/1-ngón pan,
-  double-click reset, Esc/click nền đóng (xem §22 mobile: pinch-zoom ảnh trong reading).
-- **Audio/Video nhúng**: `![[clip.mp4]]` → `<video controls>`, `![[song.mp3]]` → `<audio controls>`
+- **Embedded images, resize & zoom**: drag the handles on either side (left/right) of an image in Live Preview to change its width,
+  writing it back into the source as an Obsidian size param `![[img|W]]` / `![alt|W](url)` (aspect ratio preserved, height auto).
+  The size param `|W` / `|WxH` applies to **both** `![[…]]` and markdown images `![](…)`, in Live as well as Reading.
+  Click an image → **full-screen lightbox**: wheel/pinch zoom (centred on the cursor/midpoint), drag or one finger to pan,
+  double-click to reset, Esc or a backdrop click to close (see §22 on mobile: pinch-zoom for images in reading).
+- **Embedded audio/video**: `![[clip.mp4]]` → `<video controls>`, `![[song.mp3]]` → `<audio controls>`
   (Live Preview, Reading, public share). Video: `mp4/webm/ogv/mov/mkv`; audio: `mp3/wav/m4a/3gp/flac/ogg/
-  oga/opus`. `![[clip.mp4|W]]` đặt chiều rộng video. Mở thẳng file media từ file tree → hiện player.
-  Binary serve qua HTTP Range (206) để seek/Safari hoạt động; MIME + extension: `services/mime.ts` /
+  oga/opus`. `![[clip.mp4|W]]` sets the video width. Opening a media file straight from the file tree → shows a player.
+  Binaries are served over HTTP Range (206) so seeking and Safari work; MIME + extensions: `services/mime.ts` /
   `lib/media.ts`.
 - Backlinks panel, outline, tag pane.
-- Right sidebar dạng **tab strip icon** (giống Obsidian): Backlinks · Outgoing links · Tags · Outline.
-  - Backlinks: "Linked mentions" (đếm + danh sách) **và** "Unlinked mentions" (note nhắc tên note hiện tại
-    bằng plain text mà chưa link — tìm qua QMD search, loại trừ note đã link).
-  - Outgoing links: mọi wikilink trong note hiện tại, phân biệt resolved/unresolved, click để mở/tạo.
-- Menu **More options (⋯)** trên header mỗi pane (note lẫn Graph view), dựng theo cấu trúc Obsidian Desktop:
+- The right sidebar is an **icon tab strip** (like Obsidian): Backlinks · Outgoing links · Tags · Outline.
+  - Backlinks: "Linked mentions" (count + list) **and** "Unlinked mentions" (notes that mention the current note's name
+    as plain text without linking it, found via QMD search, excluding notes that already link).
+  - Outgoing links: every wikilink in the current note, split into resolved/unresolved, click to open or create.
+- A **More options (⋯)** menu on each pane header (note panes and the Graph view alike), built to follow Obsidian Desktop's structure:
   - Note: Backlinks in document, Split right / Split down, Open in new window, Rename / Move file to / Make a
     copy, Bookmark, Add file property, Export to PDF…, Find…, Copy path, Open version history, Open linked view
     (Backlinks / Outgoing links / Outline), Reveal file in navigation, Share…, Close tab / Close other tabs, Delete.
-  - Graph view: Copy screenshot (PNG vào clipboard), Close tab.
-  - Split pane hỗ trợ 2 hướng: right (cạnh phải) và down (bên dưới); hướng split persist trong uistate.
-  - **Find/Replace trong note**: tích hợp `@codemirror/search` (panel top, ⌘F mở Find, ⌘⇧F Replace, ⌘G next).
-  - **Reveal file in navigation**: mở rộng folder tổ tiên + cuộn/nháy sáng row trong file tree.
-  - **Add file property**: chèn property rỗng vào frontmatter YAML (tạo block nếu chưa có) → render trong Properties widget.
-  - **Export to PDF**: chuyển Reading view rồi dùng print dialog của trình duyệt (CSS `@media print` chỉ in nội dung note).
-  - **Open in new window**: mở deep-link `/note/<path>` ở tab/cửa sổ trình duyệt mới.
-  - Lưu ý: "Reveal in Finder" / "Open in default app" của Obsidian Desktop không áp dụng cho web app nên không có.
-- Graph view (lực đẩy, từ wikilinks).
-  - Tìm node trên graph: ô search nổi (góc trên-trái), gõ keywords → danh sách node khả dĩ
-    (note/tag/attachment đang hiển thị trên graph); click hoặc Enter → camera bay (pan+zoom mượt)
-    tới node, node được highlight kiểu hover (accent + dim phần không liên kết) tới khi di chuột.
+  - Graph view: Copy screenshot (PNG to the clipboard), Close tab.
+  - Split panes support 2 directions: right (to the right-hand side) and down (below); the split direction persists in uistate.
+  - **Find/Replace inside a note**: `@codemirror/search` integrated (panel at the top, ⌘F opens Find, ⌘⇧F Replace, ⌘G next).
+  - **Reveal file in navigation**: expands the ancestor folders + scrolls to/flashes the row in the file tree.
+  - **Add file property**: inserts an empty property into the YAML frontmatter (creating the block if there is none) → rendered in the Properties widget.
+  - **Export to PDF**: switches to Reading view and then uses the browser's print dialog (`@media print` CSS prints only the note content).
+  - **Open in new window**: opens the deep-link `/note/<path>` in a new browser tab/window.
+  - Note: Obsidian Desktop's "Reveal in Finder" / "Open in default app" do not apply to a web app, so they are absent.
+- Graph view (force-directed, from wikilinks).
+  - Finding a node on the graph: a floating search box (top-left corner), type keywords → a list of candidate nodes
+    (the notes/tags/attachments currently displayed on the graph); click or Enter → the camera flies (smooth pan+zoom)
+    to the node, and the node is highlighted the way hover does it (accent colour + everything unconnected dimmed) until the mouse moves.
 
 ### FR-3 · Login gate
-- **Mật khẩu mặc định khi cài đặt: `123456`** — không cần bước setup, đăng nhập ngay được
-  bằng pass mặc định. settings.json mặc định **không** chứa mật khẩu nào.
-- Người dùng đổi mật khẩu trong Settings → Account (nhập pass hiện tại + pass mới). Hash mới
-  lưu ở `auth.userPasswordHash`. Khi field này rỗng nghĩa là đang dùng pass mặc định `123456`.
-- **Mật khẩu override (khôi phục khi quên pass):** `auth.passwordHash` trong `data/settings.json`
-  (sửa tay, dạng scrypt hash) **hoặc** biến môi trường `WEBOBSIDIAN_PASSWORD` (plaintext). Login
-  chấp nhận pass override **bất kể** người dùng đã đổi pass hay chưa. Mặc định không có override.
-- Đăng nhập 1 password → JWT trong httpOnly cookie.
-- Mọi route web & file API yêu cầu auth (trừ `/login`, healthcheck).
+- **Default password at install time: `123456`**, so there is no setup step, you can log in right away
+  with the default password. By default settings.json contains **no** password at all.
+- The user changes the password in Settings → Account (enter the current password + the new one). The new hash is
+  stored in `auth.userPasswordHash`. An empty field means the default password `123456` is still in use.
+- **Override password (recovery when the password is forgotten):** `auth.passwordHash` in `data/settings.json`
+  (edited by hand, as a scrypt hash) **or** the `WEBOBSIDIAN_PASSWORD` environment variable (plaintext). Login
+  accepts the override password **whether or not** the user has already changed their password. There is no override by default.
+- Log in with one password → a JWT in an httpOnly cookie.
+- Every web route and file API requires auth (except `/login` and the healthcheck).
 
 ### FR-4 · GitHub sync
-- Cấu hình: repo URL, branch, token (PAT) hoặc deploy key, tên/email commit.
-- Thao tác: init/clone, pull, commit-all, push; hiển thị status (ahead/behind/dirty).
-- Auto-sync tuỳ chọn theo interval + on-save debounce.
-- Git LFS: cấu hình `.gitattributes` cho pattern lớn; track/push LFS.
-- **Version history per-file**: `git log` (commit chạm file, newest first) + `git show <hash>:<path>` qua
-  `GET /api/git/log` & `/api/git/show`; UI modal liệt kê version, preview nội dung, "Restore this version"
-  (ghi đè + reload). Rỗng khi vault chưa là git repo / chưa bật Git Sync.
-- Conflict: phát hiện, báo người dùng, chiến lược merge cơ bản (ưu tiên hỏi).
+- Configuration: repo URL, branch, token (PAT) or deploy key, commit name/email.
+- Operations: init/clone, pull, commit-all, push; displays the status (ahead/behind/dirty).
+- Optional auto-sync on an interval + a debounced sync on save.
+- Git LFS: configure `.gitattributes` for the large-file patterns; track/push LFS.
+- **Per-file version history**: `git log` (the commits touching the file, newest first) + `git show <hash>:<path>` via
+  `GET /api/git/log` & `/api/git/show`; a modal UI lists the versions, previews the content, and offers "Restore this version"
+  (overwrite + reload). Empty while the vault is not a git repo yet / Git Sync is not enabled yet.
+- Conflicts: detect them, tell the user, basic merge strategy (prefer asking).
 
 ### FR-5 · Settings (JSON db)
-- Toàn bộ cấu hình trong `data/settings.json` (atomic write, có backup).
-- Nhóm: vault, auth, git, search, api, ui, plugins.
-- UI Settings để xem/sửa; validate bằng schema (zod).
+- All configuration lives in `data/settings.json` (atomic write, with a backup).
+- Groups: vault, auth, git, search, api, ui, plugins.
+- A Settings UI to view/edit it; validated with a schema (zod).
 
 ### FR-6 · API Gate (AI Agent)
-- Quản lý nhiều **API key** (tạo/thu hồi, scope: read / write / search).
-- REST endpoints `/api/v1/*` xác thực bằng header `Authorization: Bearer <key>` hoặc `X-API-Key`.
-- Năng lực: list notes, read note, create/update/delete note, search, get backlinks, append.
-- Rate limit + audit log mỗi key.
+- Manage multiple **API keys** (create/revoke, scopes: read / write / search).
+- REST endpoints under `/api/v1/*` authenticated with the `Authorization: Bearer <key>` header or `X-API-Key`.
+- Capabilities: list notes, read note, create/update/delete note, search, get backlinks, append.
+- Rate limit + audit log per key.
 
 ### FR-7 · QMD Search engine
-- Index toàn bộ `.md`: nội dung, tiêu đề, headings, tags, path, frontmatter.
-- Truy vấn: full-text, prefix, fuzzy, fielded (`tag:`, `path:`, `title:`), boolean.
-- Cập nhật incremental khi file thay đổi (qua watcher).
-- Index lưu/khôi phục trên disk (`data/qmd-index.json`) để khởi động nhanh.
+- Index every `.md`: content, title, headings, tags, path, frontmatter.
+- Queries: full-text, prefix, fuzzy, fielded (`tag:`, `path:`, `title:`), boolean.
+- Incremental updates when a file changes (via the watcher).
+- The index is persisted to and restored from disk (`data/qmd-index.json`) for a fast startup.
 
 ### FR-8 · Community plugins
-- Đọc danh sách plugin từ `.obsidian/plugins/*` (manifest.json, main.js).
-- Plugin loader nạp `main.js` trong sandbox với **Obsidian API shim** (App, Vault, Workspace, Plugin, Notice, Setting…).
-- Browse & cài plugin từ community list (qua GitHub releases) — tải về thư mục plugins.
-- Bật/tắt plugin; lưu trạng thái trong settings.
+- Read the plugin list from `.obsidian/plugins/*` (manifest.json, main.js).
+- The plugin loader runs `main.js` in a sandbox with an **Obsidian API shim** (App, Vault, Workspace, Plugin, Notice, Setting…).
+- Browse & install plugins from the community list (via GitHub releases), downloaded into the plugins directory.
+- Enable/disable plugins; the state is stored in settings.
 
 ### FR-9 · Docker
-- `Dockerfile` multi-stage (build web + server → image gọn).
-- `docker-compose.yml`: mount vault volume, data volume, env cho password/secret.
-- Healthcheck (`start_period` đủ dài cho index vault lớn lần đầu), restart policy.
-- **Self-deploy không sửa file tracked**: mọi tham số deploy đặt qua `.env` (git-ignored) —
+- A multi-stage `Dockerfile` (build web + server → a compact image).
+- `docker-compose.yml`: mounts the vault volume and the data volume, env for the password/secret.
+- Healthcheck (`start_period` long enough to index a large vault the first time), restart policy.
+- **Self-deploy without editing tracked files**: every deploy parameter is set through `.env` (git-ignored):
   `VAULT_HOST_PATH` (host vault → `/vault`), `HTTP_BIND`/`HTTP_PORT` (publish), `WEBOBSIDIAN_PASSWORD`,
-  `WEBOBSIDIAN_WATCH`, `TRUST_PROXY` (mặc định `true` — tin hop kề để `X-Forwarded-Proto` hoạt động khi
-  đứng sau reverse proxy; đặt `false` khi phơi trực tiếp không proxy, hoặc danh sách subnet/số hop để siết).
-  `docker-compose.yml` chỉ tham chiếu `${VAR:-default}` nên `git pull`/redeploy
-  không clobber cấu hình của người tự host. `cp .env.example .env && docker compose up -d --build`.
-- **File watcher chịu lỗi inotify**: VPS sạch thường có `fs.inotify.max_user_watches` thấp →
-  native watch lỗi `ENOSPC/EMFILE`. Watcher tự degrade sang **polling** (`WEBOBSIDIAN_WATCH=auto`),
-  log hướng dẫn nâng `sysctl` để giữ native (CPU thấp hơn).
+  `WEBOBSIDIAN_WATCH`, `TRUST_PROXY` (default `true`: trust the adjacent hop so `X-Forwarded-Proto` works when
+  sitting behind a reverse proxy; set it to `false` when exposed directly with no proxy, or to a subnet list/hop count to tighten it).
+  `docker-compose.yml` only references `${VAR:-default}`, so a `git pull`/redeploy
+  does not clobber a self-hoster's configuration. `cp .env.example .env && docker compose up -d --build`.
+- **A file watcher that tolerates inotify limits**: a fresh VPS usually has a low `fs.inotify.max_user_watches`, so
+  native watching fails with `ENOSPC/EMFILE`. The watcher degrades to **polling** on its own (`WEBOBSIDIAN_WATCH=auto`),
+  logging how to raise the `sysctl` in order to keep native watching (lower CPU).
 
 ### FR-10 · Deep-link URL & Public share
-- **Deep-link**: URL trình duyệt phản ánh note đang mở — `/note/<vault-relative-path>`
-  (URL-encode từng segment); Graph view = `/graph`. Mở URL trực tiếp (sau login) sẽ mở đúng
-  note; back/forward của trình duyệt hoạt động (popstate ↔ history stack của app).
-- **Public share (readonly, không cần login)**:
-  - Tạo share link cho một note `.md` **hoặc canvas `.canvas`** → token ngẫu nhiên (16 bytes, base64url),
-    URL dạng `/share/<token>`.
-  - **Canvas share**: `.canvas` được server render thành **HTML tĩnh** (snapshot): node đặt tuyệt đối theo
-    toạ độ, edges vẽ SSR bằng SVG Bézier (cùng hình học với editor), text/embedded-note render qua pipeline
-    markdown; trang full-width (bỏ cột markdown hẹp). Allowlist file public lấy từ ảnh trong file-node canvas
-    (`rendercanvas.canvasEmbedTargets`). Non-interactive (không pan/zoom) ở v1.
-  - Trang public render Reading view (markdown → HTML sanitize), **không** sidebar/editor,
-    không yêu cầu auth. Wikilink trong note hiển thị như text tĩnh (không điều hướng).
-  - **SEO / SSR**: `GET /share/{id}` được **server render thành HTML hoàn chỉnh** (không cần JS
-    để đọc nội dung → Google indexable). Head gồm: `<title>` (tên note), meta description
-    (~160 ký tự đầu của body, đã strip markdown), canonical, Open Graph
-    (`og:title/description/type=article/url/site_name/image` — ảnh đầu tiên note nhúng hoặc URL
-    ảnh web đầu tiên), Twitter card (`summary_large_image`/`summary`), `robots: index,follow`.
-    Share có password → SSR trang nhập password (**noindex**, không kèm nội dung note, form unlock
-    bằng inline JS); share disabled/không tồn tại → 404 (noindex). Render markdown phía server
-    dùng cùng pipeline unified/remark/rehype + sanitize (port từ web, kèm CSS inline từ bundle).
-  - File nhúng (ảnh/pdf/video) trong note được serve qua endpoint public **giới hạn đúng các
-    file mà note đó nhúng** (`![[...]]` / `![](...)`) — không cho đọc tuỳ ý vault. Không serve
-    file `.md` qua endpoint này (không transclusion ở trang public).
-  - Share record: `{ id, path, enabled, createdAt, passwordHash? }` lưu ở `data/shares.json`
-    (JSON, atomic write). Mỗi note tối đa 1 share record (tạo lại → trả record cũ + enable).
-  - Disable (giữ token, có thể bật lại) hoặc xoá hẳn. Token bị disable/xoá → trang public trả 404.
-  - **Password tuỳ chọn cho từng share**: đặt/xoá ở trang quản lý (hash scrypt, không bao giờ trả
-    hash về client — chỉ `hasPassword`). Khi share có password: endpoint public trả 401
-    `{passwordRequired: true}`; khách nhập password → `POST /public/shares/{id}/unlock` → JWT
-    (ký bằng `jwtSecret`, TTL 12h, payload gắn share id) đặt trong httpOnly cookie scope đúng
-    `/public/shares/{id}` — ảnh nhúng tự gửi cookie. Đổi/xoá password không vô hiệu cookie đã cấp
-    (TTL ngắn chấp nhận được cho v1).
-- **Share dialog per-note**: menu "Share…" (context menu file tree + menu ⋯ của pane, cho note `.md`
-  **và canvas `.canvas`**) mở popup cài đặt share của note đó: tạo public link, ô URL + nút Copy, toggle
-  bật/tắt link, đặt/đổi/xoá password, xoá link vĩnh viễn.
-- **Badge nhận biết**: note đang share public (enabled) hiện **icon globe** màu accent cạnh tên
-  trong file tree. Danh sách share cache trong store, load sau login và refresh sau mỗi thao tác
-  (dialog lẫn Settings dùng chung) nên badge luôn đúng.
-- **Quản lý tập trung**: Settings → tab "Sharing" liệt kê toàn bộ note đã share, có ô search
-  lọc theo path, toggle enable/disable nhanh, copy link, xoá.
+- **Deep-link**: the browser URL reflects the note that is open: `/note/<vault-relative-path>`
+  (each segment URL-encoded); the Graph view is `/graph`. Opening a URL directly (after login) opens exactly that
+  note; the browser's back/forward work (popstate ↔ the app's history stack).
+- **Public share (readonly, no login needed)**:
+  - Create a share link for a `.md` note **or a `.canvas` canvas** → a random token (16 bytes, base64url),
+    giving a URL of the form `/share/<token>`.
+  - **Canvas share**: the server renders the `.canvas` into **static HTML** (a snapshot): nodes are positioned
+    absolutely by coordinate, edges are drawn SSR as SVG Béziers (the same geometry as the editor), text and
+    embedded notes render through the markdown pipeline; the page is full-width (the narrow markdown column is
+    dropped). The public file allowlist is taken from the images in the canvas's file nodes
+    (`rendercanvas.canvasEmbedTargets`). Non-interactive (no pan/zoom) in v1.
+  - The public page renders Reading view (markdown → sanitized HTML), with **no** sidebar/editor and
+    no auth required. Wikilinks in the note appear as static text (they do not navigate).
+  - **SEO / SSR**: `GET /share/{id}` is **server-rendered into complete HTML** (no JS needed
+    to read the content → Google indexable). The head contains: `<title>` (the note name), a meta description
+    (the first ~160 characters of the body, with markdown stripped), canonical, Open Graph
+    (`og:title/description/type=article/url/site_name/image`, the image being the first image the note
+    embeds or the first web image URL), a Twitter card (`summary_large_image`/`summary`), `robots: index,follow`.
+    A password-protected share → SSRs a password entry page (**noindex**, with none of the note content, and an
+    unlock form driven by inline JS); a disabled/nonexistent share → 404 (noindex). Server-side markdown rendering
+    uses the same unified/remark/rehype + sanitize pipeline (ported from web, with CSS inlined from the bundle).
+  - Files embedded in the note (images/pdf/video) are served through a public endpoint **limited to exactly the
+    files that note embeds** (`![[...]]` / `![](...)`), so the vault cannot be read at will. `.md` files are not
+    served through this endpoint (no transclusion on the public page).
+  - Share record: `{ id, path, enabled, createdAt, passwordHash? }` stored in `data/shares.json`
+    (JSON, atomic write). At most 1 share record per note (creating it again → returns the existing record + enables it).
+  - Disable (keeping the token, so it can be re-enabled) or delete outright. A disabled/deleted token → the public page returns 404.
+  - **Optional password per share**: set/remove it on the management page (scrypt hash, the hash is never returned
+    to the client, only `hasPassword`). When a share has a password: the public endpoint returns 401
+    `{passwordRequired: true}`; the visitor enters the password → `POST /public/shares/{id}/unlock` → a JWT
+    (signed with `jwtSecret`, TTL 12h, the payload carrying the share id) set in an httpOnly cookie scoped exactly to
+    `/public/shares/{id}`, so embedded images send the cookie automatically. Changing/removing the password does not
+    invalidate cookies that were already issued (the short TTL makes that acceptable for v1).
+- **Per-note Share dialog**: the "Share…" menu item (file tree context menu + the pane's ⋯ menu, for `.md` notes
+  **and `.canvas` canvases**) opens a popup with that note's share settings: create the public link, a URL box + a Copy button, a toggle to
+  enable/disable the link, set/change/remove the password, delete the link permanently.
+- **Recognition badge**: a note that is shared publicly (enabled) shows a **globe icon** in the accent colour next to its name
+  in the file tree. The share list is cached in the store, loaded after login and refreshed after every operation
+  (the dialog and Settings share the same one), so the badge is always correct.
+- **Central management**: Settings → the "Sharing" tab lists every shared note, with a search box
+  to filter by path, a quick enable/disable toggle, copy link, and delete.
 
 ---
 
-### FR-11 · Mobile / responsive UI (smartphone cảm ứng)
-Mục tiêu: trải nghiệm **đọc note** và **soạn thảo note** thuận tiện trên điện thoại màn hình cảm ứng,
-tham chiếu UX Obsidian Mobile. Kích hoạt theo breakpoint (`max-width: 768px`) — không phải app riêng,
-cùng một codebase React.
-- **Layout drawer**: ribbon + sidebar trái và right sidebar trở thành **drawer overlay** trượt đè lên
-  nội dung (không đẩy layout). Mặc định đóng → editor chiếm trọn màn hình. Mở bằng: nút hamburger (☰)
-  trên thanh tab, **vuốt từ mép trái/phải** (edge-swipe), hoặc các nút toggle panel. Có **backdrop** mờ;
-  chạm backdrop hoặc chọn note → drawer tự đóng. Drawer trái gồm strip ribbon (chuyển panel Files/Search/
-  Graph/Bookmarks/Tags/Settings) + panel nội dung.
-- **Trạng thái drawer là cục bộ thiết bị** (không persist, không broadcast qua WebSocket) → mở/đóng drawer
-  trên điện thoại không ảnh hưởng trạng thái sidebar của desktop đang đồng bộ chung `uistate`.
-- **Touch targets**: hàng cây thư mục, nút công cụ, tab ≥ 44px; tăng padding chạm; bỏ hover-only affordance
-  (nút close tab luôn hiện trên mobile).
-- **Format toolbar**: thanh công cụ định dạng khi soạn thảo (Live/Source): bold, italic, heading, list,
-  checklist, quote, link, internal link `[[`, code, tag, indent/outdent, undo/redo. Mỗi nút thao tác trực
-  tiếp lên editor đang active. **Mobile**: nổi phía trên bàn phím (neo qua visualViewport) như Obsidian
-  Mobile. **Desktop**: thanh in-flow ngay dưới view-header (theo yêu cầu người dùng).
-- **Viewport & safe-area**: `viewport-fit=cover`; chừa `env(safe-area-inset-*)` cho notch/home-indicator;
-  không cho double-tap zoom (app-like) nhưng giữ pinch-zoom ảnh trong reading.
+### FR-11 · Mobile / responsive UI (touchscreen smartphones)
+Goal: a comfortable **note reading** and **note editing** experience on a touchscreen phone,
+referencing Obsidian Mobile's UX. Activated by breakpoint (`max-width: 768px`), so it is not a separate app,
+just the same React codebase.
+- **Drawer layout**: the ribbon + left sidebar and the right sidebar become **drawer overlays** that slide over
+  the content (they do not push the layout). Closed by default → the editor fills the whole screen. Open them with: the hamburger button (☰)
+  on the tab bar, **a swipe from the left/right edge** (edge-swipe), or the panel toggle buttons. There is a dimmed **backdrop**;
+  touching the backdrop or picking a note → the drawer closes itself. The left drawer holds the ribbon strip (switching between the Files/Search/
+  Graph/Bookmarks/Tags/Settings panels) + the content panel.
+- **Drawer state is per-device** (not persisted, not broadcast over the WebSocket) → opening/closing a drawer
+  on the phone does not affect the sidebar state of a desktop that shares the same `uistate`.
+- **Touch targets**: file tree rows, tool buttons and tabs are ≥ 44px; more touch padding; no hover-only affordances
+  (the close-tab button is always visible on mobile).
+- **Format toolbar**: a formatting toolbar while editing (Live/Source): bold, italic, heading, list,
+  checklist, quote, link, internal link `[[`, code, tag, indent/outdent, undo/redo. Each button acts directly
+  on the currently active editor. **Mobile**: it floats above the keyboard (anchored via visualViewport) like Obsidian
+  Mobile. **Desktop**: an in-flow bar right below the view-header (requested by the user).
+- **Viewport & safe-area**: `viewport-fit=cover`; leave room for `env(safe-area-inset-*)` for the notch/home indicator;
+  disable double-tap zoom (app-like) but keep pinch-zoom for images in reading.
 
-### FR-12 · Canvas (khung vẽ vô hạn — JSON Canvas)
-Mục tiêu: clone tính năng **Canvas** của Obsidian — một mặt phẳng vô hạn để sắp xếp card/note/ảnh/link và nối
-chúng bằng đường có mũi tên, dùng cho brainstorm, moodboard, sơ đồ. Tham chiếu UX Obsidian Canvas.
+### FR-12 · Canvas (infinite drawing surface, JSON Canvas)
+Goal: clone Obsidian's **Canvas** feature, an infinite plane for arranging cards/notes/images/links and connecting
+them with arrowed lines, used for brainstorming, moodboards and diagrams. UX reference: Obsidian Canvas.
 
-- **Định dạng file `.canvas`**: tuân thủ chuẩn mở **JSON Canvas** (jsoncanvas.org) để tương thích hai chiều với
-  Obsidian. File là JSON `{ "nodes": [...], "edges": [...] }`.
-  - **Node** (chung): `id`, `type`, `x`, `y`, `width`, `height`, `color?`. `color` là preset `"1".."6"`
-    (đỏ/cam/vàng/lục/lam/tím) hoặc hex `"#RRGGBB"`.
+- **The `.canvas` file format**: follows the open **JSON Canvas** standard (jsoncanvas.org) for two-way compatibility with
+  Obsidian. The file is JSON `{ "nodes": [...], "edges": [...] }`.
+  - **Node** (common fields): `id`, `type`, `x`, `y`, `width`, `height`, `color?`. `color` is a preset `"1".."6"`
+    (red/orange/yellow/green/blue/purple) or a hex `"#RRGGBB"`.
     - `type:"text"` → `text` (markdown).
-    - `type:"file"` → `file` (đường dẫn vault-relative), `subpath?` (heading/block).
+    - `type:"file"` → `file` (a vault-relative path), `subpath?` (heading/block).
     - `type:"link"` → `url`.
     - `type:"group"` → `label?`, `background?`, `backgroundStyle?`.
   - **Edge**: `id`, `fromNode`, `fromSide?`(top/right/bottom/left), `fromEnd?`(none/arrow), `toNode`,
-    `toSide?`, `toEnd?`(none/arrow, mặc định arrow), `color?`, `label?`.
-- **Tương tác canvas**: **kéo chuột trái trên nền = pan**; **Shift+kéo = marquee chọn nhiều node**; pan cũng
-  qua Space+kéo và kéo nút giữa/phải; cảm ứng 1 ngón pan. Zoom bằng cuộn chuột (con trỏ làm tâm), nút
-  zoom in/out/fit/100%. Lưới chấm nền.
-- **Node**: double-click nền → tạo **text node** và vào chế độ sửa ngay; double-click vào text node để sửa
-  (textarea), Esc/blur để thoát. Kéo node để di chuyển; 8 handle để resize. Drop file note/ảnh từ cây (hoặc
-  nút) → tạo **file node** render embed (note = preview markdown, ảnh = `<img>`). Đổi màu qua palette 6 màu +
-  mặc định. Xóa (Delete/Backspace).
-- **Edge**: hover node hiện 4 chấm cạnh; kéo từ một chấm sang node/cạnh khác → tạo edge. Edge vẽ bằng đường
-  cong Bézier theo hướng cạnh, có mũi tên ở đầu `to`. Double-click giữa edge để thêm/sửa **label**. Chọn edge
-  để đổi màu/xóa.
-- **Select**: click chọn 1 node/edge; kéo marquee trên nền để chọn nhiều; Shift+click thêm/bớt; di chuyển/xóa
-  theo nhóm. Thanh công cụ ngữ cảnh nổi khi có lựa chọn (đổi màu, xóa).
-- **Alignment snap (đường gióng)**: khi kéo node, các cạnh/tâm node tự gióng vào cạnh/tâm các node khác và
-  hiện **đường gióng** (port thuật toán `getSnapping/O3/P3` từ Obsidian: điểm snap = 4 góc + tâm, ngưỡng
-  `ceil(15/scale)` đơn vị canvas). Giữ **Alt** (⌃ trên macOS) để kéo tự do (tắt snap); giữ **Shift** để khoá trục.
-- **Format trong text card**: phím tắt như editor chính (`obsidianKeymap`) — ⌘B đậm, ⌘I nghiêng, ⌘K thêm link,
-  ⌘L task, `⌘/` comment (toggle marker); menu chuột phải mở **đúng tại con trỏ** và tự dịch vào trong màn hình.
-- **Căn lề text** (mở rộng ngoài JSON Canvas spec): `TextNode.textAlign` = `left|center|right`, chọn qua nút trong
-  selection menu (khi chọn text node) hoặc submenu "Align" menu chuột phải; áp cho cả textarea lẫn nội dung render.
-  *Lưu ý: Obsidian thật bỏ qua field này khi mở lại.*
-- **Lưu**: autosave debounce (~900ms) như editor, ghi qua `PUT /api/files/content` (store `content`/`save`,
-  `.canvas` đã nằm trong `TEXT_RE`). Không thêm endpoint mới.
-- **Tạo canvas mới**: context menu cây thư mục ("New canvas") + command palette; tên `Untitled.canvas` không
-  trùng, nội dung khởi tạo `{"nodes":[],"edges":[]}`.
-- **Phạm vi v1 (non-goals)**: không có realtime collaborative cursor; không group auto-resize theo thành viên;
-  không portal/embed canvas-trong-canvas; không liên kết backlink graph từ node file (giữ đơn giản).
+    `toSide?`, `toEnd?`(none/arrow, default arrow), `color?`, `label?`.
+- **Canvas interaction**: **left-dragging on the background = pan**; **Shift+drag = a marquee selecting several nodes**; panning also
+  works with Space+drag and with a middle/right button drag; one-finger touch pans. Zoom with the scroll wheel (the cursor is the centre), plus
+  zoom in/out/fit/100% buttons. Dotted grid background.
+- **Nodes**: double-click the background → creates a **text node** and enters edit mode immediately; double-click a text node to edit it
+  (textarea), Esc/blur to leave. Drag a node to move it; 8 handles to resize. Drop a note/image file from the tree (or
+  the button) → creates a **file node** rendering an embed (a note = a markdown preview, an image = `<img>`). Recolour from a 6-colour palette +
+  default. Delete (Delete/Backspace).
+- **Edges**: hovering a node shows 4 side dots; drag from one dot to another node/side → creates an edge. Edges are drawn as Bézier
+  curves following the side directions, with an arrow at the `to` end. Double-click the middle of an edge to add/edit its **label**. Select an edge
+  to recolour/delete it.
+- **Select**: click to select one node/edge; drag a marquee on the background to select several; Shift+click to add/remove; move/delete
+  as a group. A floating context toolbar appears when there is a selection (recolour, delete).
+- **Alignment snap (guide lines)**: while dragging a node, its edges/centre snap themselves to the edges/centres of the other nodes and
+  **guide lines** appear (a port of Obsidian's `getSnapping/O3/P3` algorithm: the snap points are the 4 corners + the centre, with a threshold of
+  `ceil(15/scale)` canvas units). Hold **Alt** (⌃ on macOS) to drag freely (snapping off); hold **Shift** to lock the axis.
+- **Formatting inside a text card**: the same shortcuts as the main editor (`obsidianKeymap`): ⌘B bold, ⌘I italic, ⌘K insert link,
+  ⌘L task, `⌘/` comment (toggles the marker); the right-click menu opens **exactly at the cursor** and shifts itself back on screen.
+- **Text alignment** (an extension beyond the JSON Canvas spec): `TextNode.textAlign` = `left|center|right`, chosen from a button in the
+  selection menu (when a text node is selected) or from the "Align" submenu of the right-click menu; it applies to the textarea as well as the rendered content.
+  *Note: real Obsidian ignores this field when it reopens the file.*
+- **Saving**: debounced autosave (~900ms) like the editor, written via `PUT /api/files/content` (store `content`/`save`,
+  `.canvas` is already in `TEXT_RE`). No new endpoints.
+- **Creating a new canvas**: the file tree context menu ("New canvas") + the command palette; a non-colliding
+  `Untitled.canvas` name, initialised with `{"nodes":[],"edges":[]}`.
+- **v1 scope (non-goals)**: no realtime collaborative cursors; groups do not auto-resize around their members;
+  no portals/canvas-in-canvas embeds; no backlink graph links from a file node (keeping it simple).
 
 ### FR-13 · Desktop app (Electron, multi-platform)
-Mục tiêu: đóng gói WebObsidian thành **app cài đặt trên máy** (macOS/Windows/Linux) để người dùng tải về dùng
-như app native, không cần tự dựng server hay Docker. Bản chất là một **Electron shell** bọc quanh đúng server
-Express + SPA hiện có (không fork code, không đổi kiến trúc) — nên mọi tính năng web đều chạy y hệt.
+Goal: package WebObsidian into an **app installed on the machine** (macOS/Windows/Linux) so users can download it and use it
+like a native app, with no server or Docker to stand up themselves. It is fundamentally an **Electron shell** wrapped around the exact same
+existing Express server + SPA (no code fork, no architecture change), so every web feature behaves identically.
 
-- **Kiến trúc**: Electron `main` **spawn server hiện có như tiến trình con** qua `ELECTRON_RUN_AS_NODE`
-  (dùng luôn Node nhúng trong Electron, không cần Node cài sẵn trên máy), bind **`127.0.0.1` + cổng trống
-  ngẫu nhiên** (localhost-only, không mở ra mạng), rồi `BrowserWindow` load `http://127.0.0.1:<port>`.
-  Server được **bundle thành 1 file `.mjs` duy nhất** bằng esbuild (toàn bộ deps inline; `fsevents` để
-  external vì optional). SPA build (`server/public`) đi kèm trong `resources/server/public`.
-- **Dữ liệu & vault**: lần chạy đầu hiện hộp thoại **chọn thư mục vault** (mặc định `~/Documents/WebObsidianVault`
-  nếu bỏ qua). `DATA_DIR` (settings.json, index) nằm trong thư mục `userData` per-user của Electron. Menu
-  **File → Switch Vault…** đổi vault (relaunch để re-index), **Open Vault/Data Folder**, **Open Logs**.
-- **Đăng nhập liền mạch**: app tự sinh **mật khẩu ngẫu nhiên/máy** lưu trong `userData`, truyền qua
-  `WEBOBSIDIAN_PASSWORD` (override) → **auto-login** (seed cookie JWT vào session của cửa sổ) và tự đặt
-  password tuỳ chỉnh để **không bắt đổi mật khẩu** lần đầu. Người dùng không phải gõ password; vẫn có thể
-  đổi trong Settings.
-- **Đa nền tảng / đa kiến trúc**: vì server **không có native module runtime**, cross-arch chỉ là đóng gói
-  Electron binary tương ứng. Đóng gói bằng **electron-builder**: macOS `dmg`+`zip` (arm64/x64), Windows
+- **Architecture**: Electron `main` **spawns the existing server as a child process** via `ELECTRON_RUN_AS_NODE`
+  (reusing the Node embedded in Electron, so no Node installation is needed on the machine), bound to **`127.0.0.1` + a random free
+  port** (localhost only, nothing opened to the network), and then `BrowserWindow` loads `http://127.0.0.1:<port>`.
+  The server is **bundled into a single `.mjs` file** by esbuild (all deps inlined; `fsevents` is left
+  external because it is optional). The SPA build (`server/public`) ships alongside it in `resources/server/public`.
+- **Data & vault**: the first run shows a **vault folder picker** dialog (defaulting to `~/Documents/WebObsidianVault`
+  if it is skipped). `DATA_DIR` (settings.json, index) lives in Electron's per-user `userData` directory. The
+  **File → Switch Vault…** menu changes vault (relaunching to re-index), plus **Open Vault/Data Folder** and **Open Logs**.
+- **Seamless login**: the app generates a **random per-machine password** stored in `userData` and passes it via
+  `WEBOBSIDIAN_PASSWORD` (as the override) → **auto-login** (seeding the JWT cookie into the window's session), and marks the
+  password as customised so the user is **not forced to change it** on first run. The user never has to type a password; they can still
+  change it in Settings.
+- **Multi-platform / multi-arch**: because the server **has no native runtime modules**, going cross-arch is only a matter of packaging
+  the corresponding Electron binary. Packaged with **electron-builder**: macOS `dmg`+`zip` (arm64/x64), Windows
   `nsis`(installer)+`portable` (x64/arm64/ia32), Linux `AppImage`+`deb` (x64/arm64).
-- **Phát hành**: GitHub Actions workflow `release.yml` chạy khi push tag `v*` — matrix macOS/Windows/Ubuntu,
-  mỗi runner build native cho HĐH của nó rồi **publish lên GitHub Release** (draft) để người dùng tải.
-- **Phụ thuộc ngoài**: tính năng Git sync cần `git` có trên máy (PATH được bổ sung các vị trí phổ biến); thiếu
-  git thì app vẫn chạy bình thường cho sửa note cục bộ, chỉ tắt sync. App **chưa code-sign/notarize** (sẽ có
-  cảnh báo Gatekeeper/SmartScreen — chấp nhận cho self-hosted free).
-- **Phạm vi (non-goals)**: chưa auto-update (người dùng tải bản mới thủ công); chưa ký số; không nhúng git
-  portable; không chạy nhiều cửa sổ/vault song song trong 1 instance (single-instance lock).
+- **Releasing**: the `release.yml` GitHub Actions workflow runs on `v*` tag pushes: a macOS/Windows/Ubuntu matrix where
+  each runner builds natively for its own OS and then **publishes to a GitHub Release** (draft) for users to download.
+- **External dependencies**: the Git sync feature needs `git` on the machine (PATH is extended with the usual locations); without
+  git the app still runs normally for editing notes locally, it just disables sync. The app is **not code-signed/notarized yet** (expect a
+  Gatekeeper/SmartScreen warning, which is acceptable for a free self-hosted app).
+- **Scope (non-goals)**: no auto-update yet (users download new builds by hand); no code signing yet; no bundled portable
+  git; no running several windows/vaults in parallel within one instance (single-instance lock).
 
 ---
 
-## 4. Yêu cầu phi chức năng (NFR)
-- **Bảo mật**: password hash scrypt, JWT secret tự sinh, API key hash khi lưu, path traversal guard
-  (chặn `..`, segment `.git`, symlink thoát vault), CORS hạn chế, rate limiting (cả `/auth/login`:
-  10 lần/15 phút — **khóa theo địa chỉ socket TCP thật, không theo `req.ip`/`X-Forwarded-For`** nên
-  không thể bypass bằng cách xoay vòng XFF, **bất kể cấu hình `trust proxy`**; vì vậy `trust proxy` để
-  mặc định bật (`true`, qua `TRUST_PROXY`) cho `X-Forwarded-Proto`/Secure-cookie hoạt động sau proxy). Bắt buộc đổi mật khẩu mặc định (`123456`) ngay sau lần đăng nhập đầu
-  (`mustChangePassword`). Security headers qua `helmet` + CSP (script-src 'self'+nonce; không ép HTTPS
-  để giữ self-host HTTP). Token git/PAT được redact khỏi mọi thông báo lỗi trả client + log. WebSocket
-  `/ws` yêu cầu phiên đăng nhập hợp lệ. Plugin `id` được validate trước khi thành path segment; đổi
-  `vault.path` qua API bị giới hạn trong `allowedRoots`.
-- **Hiệu năng**: search < 100ms cho vault ~10k notes; lazy load file tree lớn.
-- **Tin cậy**: atomic writes cho settings & notes; backup trước ghi đè; git ops không mất dữ liệu.
-- **Khả chuyển**: chạy được trên Linux/macOS, ARM & x86.
-- **Khả dụng**: responsive (desktop/tablet/mobile), dark/light theme.
+## 4. Non-functional requirements (NFR)
+- **Security**: scrypt password hash, a self-generated JWT secret, API keys hashed at rest, path traversal guards
+  (blocking `..`, the `.git` segment, and symlinks escaping the vault), restricted CORS, rate limiting (including on `/auth/login`:
+  10 attempts per 15 minutes, **keyed on the real TCP socket address, not on `req.ip`/`X-Forwarded-For`**, so it
+  cannot be bypassed by rotating XFF, **regardless of the `trust proxy` configuration**; that is why `trust proxy` is
+  left enabled by default (`true`, via `TRUST_PROXY`) so `X-Forwarded-Proto`/Secure cookies work behind a proxy). Changing the default password (`123456`) is mandatory right after the first login
+  (`mustChangePassword`). Security headers via `helmet` + CSP (script-src 'self'+nonce; HTTPS is not forced,
+  so HTTP self-hosting stays possible). Git tokens/PATs are redacted from every error message returned to the client and from the logs. The WebSocket
+  `/ws` requires a valid login session. A plugin `id` is validated before it becomes a path segment; changing
+  `vault.path` through the API is confined to `allowedRoots`.
+- **Performance**: search < 100ms on a vault of ~10k notes; lazy loading for large file trees.
+- **Reliability**: atomic writes for settings & notes; a backup before overwriting; git ops never lose data.
+- **Portability**: runs on Linux/macOS, ARM & x86.
+- **Usability**: responsive (desktop/tablet/mobile), dark/light theme.
 
 ---
 
-## 5. API surface (tóm tắt)
+## 5. API surface (summary)
 
 ### Web/session API (cookie auth)
 ```
-POST   /auth/setup            # (legacy) set password lần đầu — vô hiệu khi đã có pass mặc định
+POST   /auth/setup            # (legacy) set the password the first time; disabled once a default pass exists
 POST   /auth/login            # login → cookie
 POST   /auth/logout
-POST   /auth/change-password  # đổi pass: { currentPassword, newPassword } (yêu cầu auth)
+POST   /auth/change-password  # change pass: { currentPassword, newPassword } (auth required)
 GET    /auth/me
-GET    /api/files            # cây thư mục
-GET    /api/files/*path      # đọc file (md/binary)
-PUT    /api/files/*path      # ghi
-POST   /api/files/*path      # tạo / upload
+GET    /api/files            # directory tree
+GET    /api/files/*path      # read a file (md/binary)
+PUT    /api/files/*path      # write
+POST   /api/files/*path      # create / upload
 PATCH  /api/files            # rename/move
-POST   /api/files/copy       # copy đệ quy file/folder {from,to} (Paste sau Copy)
-DELETE /api/files/*path      # xoá → .trash hoặc xoá hẳn (theo vault.deleteMode)
-GET    /api/files/trash      # liệt kê file trong .trash
-POST   /api/files/trash/restore   # khôi phục {path} về vị trí gốc
-DELETE /api/files/trash/item # xoá vĩnh viễn 1 item trong trash
-DELETE /api/files/trash      # empty trash (xoá hẳn toàn bộ)
+POST   /api/files/copy       # recursive file/folder copy {from,to} (Paste after Copy)
+DELETE /api/files/*path      # delete → .trash or outright (per vault.deleteMode)
+GET    /api/files/trash      # list the files in .trash
+POST   /api/files/trash/restore   # restore {path} to its original location
+DELETE /api/files/trash/item # permanently delete 1 item in the trash
+DELETE /api/files/trash      # empty trash (delete everything outright)
 GET    /api/search?q=...
 GET    /api/backlinks?path=...
 GET    /api/git/status | POST /api/git/{pull,commit,push,sync}
 GET/PUT /api/settings
-GET/POST/DELETE /api/keys     # quản lý API key
+GET/POST/DELETE /api/keys     # API key management
 GET    /api/plugins | POST /api/plugins/install | PATCH enable
-GET    /api/shares            # list share (quản lý)
-POST   /api/shares            # tạo share cho 1 note {path} → {id,...}
+GET    /api/shares            # list shares (management)
+POST   /api/shares            # create a share for 1 note {path} → {id,...}
 PATCH  /api/shares/{id}       # enable/disable {enabled}
-DELETE /api/shares/{id}       # xoá share
+DELETE /api/shares/{id}       # delete the share
 ```
 
-### Public share (không auth) — `/public` & `/share`
+### Public share (no auth): `/public` & `/share`
 ```
-GET    /public/shares/{id}        # nội dung note đã share {title, content} (404 nếu disabled,
-                                  # 401 {passwordRequired} nếu có password & chưa unlock)
-POST   /public/shares/{id}/unlock # {password} → set httpOnly cookie unlock (JWT 12h)
-GET    /public/shares/{id}/file?path=  # file nhúng trong note (chỉ file note đó tham chiếu)
-GET    /share/{id}                # trang HTML public — SERVER-RENDERED (SEO meta + OG + nội dung
-                                  # note trong HTML; locked → form password noindex)
+GET    /public/shares/{id}        # content of the shared note {title, content} (404 if disabled,
+                                  # 401 {passwordRequired} if password-protected & not unlocked yet)
+POST   /public/shares/{id}/unlock # {password} → sets the httpOnly unlock cookie (JWT 12h)
+GET    /public/shares/{id}/file?path=  # a file embedded in the note (only files that note references)
+GET    /share/{id}                # public HTML page: SERVER-RENDERED (SEO meta + OG + the note
+                                  # content in the HTML; locked → noindex password form)
 ```
 
-### Agent API (API-key auth) — `/api/v1`
+### Agent API (API-key auth): `/api/v1`
 ```
 GET    /api/v1/notes                 # list (paginate)
 GET    /api/v1/notes/{path}          # read
@@ -484,12 +501,12 @@ GET    /api/v1/tags
 
 ---
 
-## 6. Data model — `settings.json`
+## 6. Data model: `settings.json`
 ```jsonc
 {
   "version": 1,
-  "auth":   { "userPasswordHash": "scrypt$... (pass đã đổi; rỗng = dùng mặc định 123456)",
-              "passwordHash": "scrypt$... (override khôi phục; rỗng = không có)",
+  "auth":   { "userPasswordHash": "scrypt$... (the changed pass; empty = using the default 123456)",
+              "passwordHash": "scrypt$... (recovery override; empty = none)",
               "jwtSecret": "..." },
   "vault":  { "path": "/vault", "allowedRoots": ["/vault"], "trash": ".trash", "deleteMode": "trash" },
   "git":    { "enabled": false, "remote": "", "branch": "main",
@@ -506,30 +523,30 @@ GET    /api/v1/tags
 }
 ```
 
-### `data/shares.json` (public share links — FR-10)
+### `data/shares.json` (public share links, FR-10)
 ```jsonc
 [
   { "id": "base64url-16-bytes", "path": "Folder/Note.md",
     "enabled": true, "createdAt": "2026-06-10T00:00:00.000Z",
-    "passwordHash": "scrypt$...salt...$...hash..." } // optional — share không password thì bỏ field
+    "passwordHash": "scrypt$...salt...$...hash..." } // optional: omit the field for a share with no password
 ]
 ```
 
 ---
 
-## 7. Rủi ro & quyết định
-- **Tương thích plugin**: nhiều plugin dùng API/DOM Electron riêng → chỉ đảm bảo subset. Quyết định: shim API phổ biến, fail mềm với API thiếu, log cảnh báo.
-- **Bảo mật token git/API key**: lưu trong settings.json server-side (chmod 600), khuyến nghị mount qua secret/volume riêng.
-- **File lớn**: bắt buộc Git LFS; cảnh báo khi commit file > ngưỡng mà chưa track LFS.
-- **Đồng bộ xung đột**: v1 ưu tiên thông báo + manual resolve, không auto-merge phá dữ liệu.
+## 7. Risks and decisions
+- **Plugin compatibility**: many plugins use Electron-specific APIs/DOM → only a subset can be guaranteed. Decision: shim the common APIs, fail softly on the missing ones, log a warning.
+- **Git token / API key security**: stored server-side in settings.json (chmod 600); mounting them from a dedicated secret/volume is recommended.
+- **Large files**: Git LFS is mandatory; warn when committing a file over the threshold that is not LFS-tracked.
+- **Sync conflicts**: v1 prefers notifying + manual resolution over an auto-merge that destroys data.
 
 ---
 
-## 8. Tiêu chí hoàn thành (Definition of Done) cho v1
-1. Đăng nhập 1 password, mở vault, xem cây thư mục.
-2. Mở/sửa/tạo/xoá note với editor + live preview + wikilinks/backlinks.
-3. Search trả kết quả từ QMD < 100ms trên vault mẫu.
-4. Cấu hình git, sync (pull/commit/push) thành công kể cả file LFS.
-5. Tạo API key, AI Agent gọi `/api/v1` đọc/ghi/search thành công.
-6. Cài & bật ít nhất 1 community plugin đơn giản.
-7. `docker compose up` chạy toàn bộ stack.
+## 8. Definition of done for v1
+1. Log in with 1 password, open the vault, browse the directory tree.
+2. Open/edit/create/delete notes with the editor + live preview + wikilinks/backlinks.
+3. Search returns QMD results in < 100ms on the sample vault.
+4. Configure git and sync (pull/commit/push) successfully, LFS files included.
+5. Create an API key and have an AI Agent call `/api/v1` to read/write/search successfully.
+6. Install & enable at least 1 simple community plugin.
+7. `docker compose up` runs the whole stack.

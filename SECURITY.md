@@ -28,7 +28,7 @@ safely. Key points:
 - API keys are hashed at rest and scoped (`read` / `write` / `search`) with per-key rate
   limiting.
 - File paths are guarded against traversal; the vault picker is confined to `ALLOWED_ROOTS`.
-- Secrets (git token, API keys) live in `data/settings.json` on the server — mount `/data`
+- Secrets (git token, API keys) live in `data/settings.json` on the server: mount `/data`
   as a private volume and keep it out of version control.
 - Run behind a TLS-terminating reverse proxy (set `HTTP_BIND=127.0.0.1`) for any
   internet-facing deployment. `TRUST_PROXY` defaults to `true` so `X-Forwarded-Proto`

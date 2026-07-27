@@ -1,5 +1,5 @@
 /**
- * Flat line icons (Lucide set — the same icon family Obsidian uses).
+ * Flat line icons (Lucide set, the same icon family Obsidian uses).
  * Stroke-based, 24x24 viewBox, currentColor. Add new glyphs to PATHS as needed.
  */
 import type { CSSProperties } from 'react';
@@ -14,7 +14,7 @@ const PATHS: Record<string, string> = {
   'align-left': '<line x1="21" x2="3" y1="6" y2="6"/><line x1="15" x2="3" y1="12" y2="12"/><line x1="17" x2="3" y1="18" y2="18"/>',
   'align-center': '<line x1="21" x2="3" y1="6" y2="6"/><line x1="17" x2="7" y1="12" y2="12"/><line x1="19" x2="5" y1="18" y2="18"/>',
   'align-right': '<line x1="21" x2="3" y1="6" y2="6"/><line x1="21" x2="9" y1="12" y2="12"/><line x1="21" x2="7" y1="18" y2="18"/>',
-  // Lucide "layout-dashboard" — Obsidian's Canvas icon.
+  // Lucide "layout-dashboard": Obsidian's Canvas icon.
   'layout-dashboard': '<rect width="7" height="9" x="3" y="3" rx="1"/><rect width="7" height="5" x="14" y="3" rx="1"/><rect width="7" height="9" x="14" y="12" rx="1"/><rect width="7" height="5" x="3" y="16" rx="1"/>',
   // File-tree header toolbar (Obsidian Files pane parity).
   'square-pen': '<path d="M12 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.375 2.625a1 1 0 0 1 3 3l-9.013 9.014a2 2 0 0 1-.853.505l-2.873.84a.5.5 0 0 1-.62-.62l.84-2.873a2 2 0 0 1 .506-.852z"/>',

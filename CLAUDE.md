@@ -1,43 +1,45 @@
-# CLAUDE.md — Hướng dẫn làm việc cho Claude Code trên dự án WebObsidian
+# CLAUDE.md: working guide for Claude Code on the WebObsidian project
 
-## Bối cảnh
-WebObsidian là web app self-hosted clone toàn diện Obsidian. Thiết kế chính thức nằm ở
-[PRD.md](PRD.md). Tiến độ phát triển được track ở [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md).
+## Context
+WebObsidian is a self-hosted web app that is a full clone of Obsidian. The official design lives in
+[PRD.md](PRD.md). Development progress is tracked in [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md).
 
-## Nguyên tắc bắt buộc (đọc trước mỗi phiên làm việc)
+## Mandatory rules (read before every working session)
 
-1. **Luôn bám sát PRD.md.** Trước khi code một tính năng, đối chiếu với phần FR/NFR/API/data
-   model tương ứng trong PRD. Không tự ý đổi kiến trúc hay phạm vi. Nếu thấy cần lệch khỏi PRD,
-   **cập nhật PRD.md trước** (ghi rõ lý do, tăng version/changelog) rồi mới code.
+1. **Always stay aligned with PRD.md.** Before coding a feature, check it against the matching
+   FR/NFR/API/data model section in the PRD. Do not change the architecture or the scope on your
+   own. If you decide you need to deviate from the PRD, **update PRD.md first** (state the reason,
+   bump the version/changelog), and only then write code.
 
-2. **Luôn cập nhật IMPLEMENTATION_PLAN.md.** Mỗi khi bắt đầu hoặc hoàn thành một mục:
-   - Đổi checkbox: `[ ]` → `[~]` (đang làm) → `[x]` (xong).
-   - Cập nhật dòng "Cập nhật lần cuối" và thêm dòng vào "Nhật ký tiến độ" (ngày + tóm tắt).
-   - Một mục chỉ đánh `[x]` khi code chạy được/được kiểm chứng, không phải khi mới viết xong.
+2. **Always update IMPLEMENTATION_PLAN.md.** Whenever you start or finish an item:
+   - Flip the checkbox: `[ ]` → `[~]` (in progress) → `[x]` (done).
+   - Update the "Last updated" line and add a line to the "Progress log" (date + summary).
+   - Only mark an item `[x]` when the code actually runs / has been verified, not when you have
+     merely finished writing it.
 
-3. **Đồng bộ với todo list của session.** Todo nội bộ phải phản ánh các mục trong plan.
+3. **Keep in sync with the session todo list.** The internal todos must reflect the items in the plan.
 
-4. **Tài liệu là nguồn sự thật.** Khi phạm vi thay đổi theo yêu cầu người dùng: cập nhật PRD.md
-   (thiết kế) và IMPLEMENTATION_PLAN.md (thêm/sửa mục) trong cùng lần thay đổi.
+4. **The docs are the source of truth.** When the scope changes as requested by the user: update
+   PRD.md (design) and IMPLEMENTATION_PLAN.md (add/edit items) in the same change.
 
-## Quy ước kỹ thuật
-- Ngôn ngữ: TypeScript cho cả server và web. Tránh `any` khi có thể.
-- Cấu hình runtime: chỉ dùng file JSON (`data/settings.json`) — không thêm DB engine.
-- Bảo mật: không log secret/token/API key; hash trước khi lưu; guard path traversal.
-- Commit/push git **chỉ khi người dùng yêu cầu**.
+## Technical conventions
+- Language: TypeScript for both server and web. Avoid `any` where possible.
+- Runtime config: JSON files only (`data/settings.json`); do not add a DB engine.
+- Security: never log secrets/tokens/API keys; hash before storing; guard against path traversal.
+- Git commit/push **only when the user asks for it**.
 
-## Lệnh hữu ích
+## Useful commands
 ```bash
-npm install            # cài deps toàn workspace
-npm run dev            # chạy server + web (dev)
-npm run build          # build web rồi server
-npm run start          # chạy production (server serve web đã build)
-npm run typecheck      # kiểm tra type cả 2 workspace
-docker compose up      # chạy full stack
+npm install            # install deps across the whole workspace
+npm run dev            # run server + web (dev)
+npm run build          # build web, then server
+npm run start          # run production (server serves the built web)
+npm run typecheck      # type-check both workspaces
+docker compose up      # run the full stack
 ```
 
-## Cấu trúc (xem PRD §2.2)
-- `server/` — Express API (routes, services, middleware, plugins shim).
-- `web/` — React SPA (components, lib, styles).
-- `data/` — runtime config & index (gitignored).
-- `docs/` — tài liệu bổ sung.
+## Structure (see PRD §2.2)
+- `server/`: Express API (routes, services, middleware, plugins shim).
+- `web/`: React SPA (components, lib, styles).
+- `data/`: runtime config & index (gitignored).
+- `docs/`: additional documentation.

@@ -13,12 +13,12 @@ import { openLightbox } from './imageLightbox';
 import { VIDEO_EXT_RE, AUDIO_EXT_RE } from './media';
 
 /**
- * Live Preview for CodeMirror 6 — an Obsidian-style WYSIWYG editing mode.
+ * Live Preview for CodeMirror 6: an Obsidian-style WYSIWYG editing mode.
  *
  * Formatting is *rendered* (bold is bold, italic italic, code monospaced, headings
  * sized, links/embeds/checkboxes become widgets) while the raw Markdown syntax is
  * concealed. Syntax for a given span is revealed only when the caret is inside
- * THAT span — not the whole paragraph — so editing one word never dumps raw
+ * THAT span, not the whole paragraph, so editing one word never dumps raw
  * markup across the line. (PRD FR-2)
  */
 
@@ -61,10 +61,10 @@ export function setLivePreviewPropertyTypeSetter(fn: (key: string, type: string)
 
 /**
  * Start Obsidian's "Add file property" flow: focus a new property-key field in
- * the Properties widget and open the key suggester dropdown — the same UI the
+ * the Properties widget and open the key suggester dropdown: the same UI the
  * widget's own "+ Add property" button drives. If the note has no frontmatter
  * yet, an empty block is created first so the widget (and its button) renders.
- * Requires Live Preview, non-readonly — the caller switches to live mode first.
+ * Requires Live Preview, non-readonly: the caller switches to live mode first.
  */
 export function triggerAddProperty(view: EditorView): void {
   const click = (): boolean => {
@@ -153,7 +153,7 @@ class MdLinkWidget extends WidgetType {
     a.onmousedown = (e) => {
       e.preventDefault();
       if (external) window.open(this.href, '_blank', 'noopener');
-      else if (this.href.startsWith('#')) { /* in-note anchor — no-op */ }
+      else if (this.href.startsWith('#')) { /* in-note anchor: no-op */ }
       else openLink(this.href.replace(/\.(md|markdown)$/i, ''));
     };
     return a;
@@ -262,7 +262,7 @@ class ImageWidget extends WidgetType {
     });
     wrap.appendChild(img);
 
-    // Drag-to-resize — left/right edge bars; width is written back as `|W`,
+    // Drag-to-resize: left/right edge bars; width is written back as `|W`,
     // keeping aspect ratio (height auto), like Obsidian's image resize.
     const startResize = (e: MouseEvent | TouchEvent, side: 'left' | 'right') => {
       e.preventDefault();
@@ -344,7 +344,7 @@ class MediaWidget extends WidgetType {
   }
 }
 
-/* ---------------- callouts (§21) — constants shared with Reading view ---------------- */
+/* ---------------- callouts (§21): constants shared with Reading view ---------------- */
 
 /** Icon (+ optional default title + fold chevron) replacing the `> [!type]` marker. */
 class CalloutHeadWidget extends WidgetType {
@@ -448,7 +448,7 @@ class HrWidget extends WidgetType {
 /* ---------------- note embeds (transclusion, like Obsidian ![[note]]) ---------------- */
 
 // Injected from Editor.tsx: resolves a wikilink target and returns rendered,
-// sanitized HTML (api.resolve + renderMarkdown — same pipeline as Reading view).
+// sanitized HTML (api.resolve + renderMarkdown: same pipeline as Reading view).
 let noteEmbedProvider: (target: string) => Promise<{ html: string } | null> = async () => null;
 export function setLivePreviewNoteEmbedProvider(fn: (target: string) => Promise<{ html: string } | null>) {
   noteEmbedProvider = fn;
@@ -624,7 +624,7 @@ export const htmlRenderedState = StateField.define<readonly number[]>({
 
 /** "Render HTML" / "Hide HTML" toggle for a ```html fenced block. Collapsed it
  *  sits above the code (which stays visible); rendered it REPLACES the code block
- *  with a full-width sandboxed iframe (scripts run but isolated — no same-origin,
+ *  with a full-width sandboxed iframe (scripts run but isolated: no same-origin,
  *  so a saved page can't touch the vault/app). */
 class HtmlPreviewWidget extends WidgetType {
   private onResize: (() => void) | null = null;
@@ -693,14 +693,14 @@ function buildHtmlPreview(state: EditorState): DecorationSet {
     const key = line.from;
     const rendered = renderedKeys.includes(key);
     if (rendered) {
-      // Replace the whole block — hides the source code AND shows the iframe.
+      // Replace the whole block: hides the source code AND shows the iframe.
       const code = end > n + 1 ? doc.sliceString(doc.line(n + 1).from, doc.line(end - 1).to) : '';
       const to = doc.line(end).to;
       ranges.push(
         Decoration.replace({ widget: new HtmlPreviewWidget(code, key, true), block: true }).range(line.from, to),
       );
     } else {
-      // Button ABOVE the fence (side:-1) — html blocks can be huge (a whole saved
+      // Button ABOVE the fence (side:-1): html blocks can be huge (a whole saved
       // page), so a button after the block would sit off-screen and be unreachable.
       ranges.push(
         Decoration.widget({ widget: new HtmlPreviewWidget('', key, false), block: true, side: -1 }).range(line.from),
@@ -949,7 +949,7 @@ function serializeTable(header: string[], align: (Align | '')[], rows: string[][
  * Obsidian-style interactive table editor: cells are click-to-edit, hover shows
  * +row / +column buttons, right-click opens a format menu (insert/delete/align).
  * Every mutation re-serializes the model and replaces the table's source range,
- * which makes `tableField` rebuild the widget — so the DOM is always in sync.
+ * which makes `tableField` rebuild the widget, so the DOM is always in sync.
  */
 class TableWidget extends WidgetType {
   /** `ro` = reading mode: render-only, no cell editing / handles / menus. */
@@ -1139,7 +1139,7 @@ class TableWidget extends WidgetType {
     });
     table.appendChild(tbody);
 
-    // Reading mode: no handles / add buttons / menus — table is display-only.
+    // Reading mode: no handles / add buttons / menus, table is display-only.
     if (this.ro) return wrap;
 
     // ---- row / column select handles (hover-highlight + open the format menu) ----
@@ -1287,7 +1287,7 @@ interface Prop {
 
 const stripQuotes = (s: string) => s.replace(/^["'](.*)["']$/, '$1');
 
-// Tags / cssclasses can't contain spaces (invalid in Obsidian) — collapse runs of
+// Tags / cssclasses can't contain spaces (invalid in Obsidian): collapse runs of
 // whitespace to a hyphen and drop a leading '#'. Other list values pass through.
 function sanitizeListValue(key: string, raw: string): string {
   const v = raw.trim();
@@ -1606,7 +1606,7 @@ class FrontmatterWidget extends WidgetType {
       dd.className = 'cm-props-dropdown prop-val-dropdown';
       container.insertBefore(inp, addBtn);
       // Mount inside the theme wrapper (not <body>) so the CSS variables that give
-      // the dropdown its background resolve — otherwise it renders transparent.
+      // the dropdown its background resolve, otherwise it renders transparent.
       const host = (document.querySelector('.theme-light, .theme-dark') as HTMLElement) ?? document.body;
       host.appendChild(dd);
       // Fixed-position just below the input (viewport coords; rect forces reflow).
@@ -1628,7 +1628,7 @@ class FrontmatterWidget extends WidgetType {
         done = true;
         const vv = sanitizeListValue(key, val);
         // Always tear down first: the dropdown is mounted on the theme wrapper
-        // (outside the widget DOM), so mutate()'s rebuild won't remove it — skip
+        // (outside the widget DOM), so mutate()'s rebuild won't remove it: skip
         // this and the suggester stays stuck on screen after picking a value.
         cleanup();
         if (!vv) return;
@@ -1706,7 +1706,7 @@ class FrontmatterWidget extends WidgetType {
       icon.style.cursor = 'pointer';
       // Left-click the icon also opens the menu. Use `click` (not `mousedown`):
       // openPropMenu stops propagation, so the trailing click never reaches the
-      // window close-listener — opening on mousedown let that click slam it shut
+      // window close-listener: opening on mousedown let that click slam it shut
       // again (the "jitter / won't open" on left-click).
       icon.addEventListener('click', openPropMenu);
 
@@ -1916,7 +1916,7 @@ function buildDecorations(view: EditorView): DecorationSet {
   };
 
   // selection overlaps [from,to] (inclusive) → reveal raw syntax for that span.
-  // In reading mode (readonly) nothing is ever revealed — same render, no edit.
+  // In reading mode (readonly) nothing is ever revealed: same render, no edit.
   const readonly = view.state.field(livePreviewReadonly, false) ?? false;
   const touches = (from: number, to: number) => {
     if (readonly) return false;
@@ -1945,7 +1945,7 @@ function buildDecorations(view: EditorView): DecorationSet {
       }
     }
   }
-  // Frontmatter range (rendered by frontmatterField) — the regex passes skip it.
+  // Frontmatter range (rendered by frontmatterField): the regex passes skip it.
   const fmMatch = doc.sliceString(0, Math.min(doc.length, 4000)).match(/^---\r?\n[\s\S]*?\r?\n---[ \t]*(\r?\n|$)/);
   const fmEnd = fmMatch ? fmMatch[0].length : 0;
 
@@ -1963,7 +1963,7 @@ function buildDecorations(view: EditorView): DecorationSet {
   const renderedHtml = (from: number, to: number) =>
     htmlBlocks.some((h) => from >= h.from && to <= h.to && !touches(h.from, h.to));
 
-  // Inline code and code blocks are literal — wikilink/embed/link/tag syntax
+  // Inline code and code blocks are literal: wikilink/embed/link/tag syntax
   // inside them must stay raw (e.g. `![[file]]` in backticks is not an embed).
   const codeRanges: { from: number; to: number }[] = [];
   const inCode = (from: number, to: number) => {
@@ -1985,12 +1985,12 @@ function buildDecorations(view: EditorView): DecorationSet {
           codeRanges.push({ from: node.from, to: node.to });
         }
 
-        // Don't decorate inside a rendered table/HTML block — their fields own it.
+        // Don't decorate inside a rendered table/HTML block: their fields own it.
         if (renderedTable(node.from, node.to) || renderedHtml(node.from, node.to)) return;
 
         // Code block lines: HyperMD-codeblock(-begin/-end) like Obsidian.
         // The ``` fences are concealed while the caret is outside the block.
-        // Indented code (4 spaces): mono font, NO background — just the indent
+        // Indented code (4 spaces): mono font, NO background, just the indent
         // guide on the leading unit, like Obsidian.
         if (name === 'CodeBlock') {
           const first = doc.lineAt(node.from).number;
@@ -2078,7 +2078,7 @@ function buildDecorations(view: EditorView): DecorationSet {
       if (renderedTable(line.from, line.to) || renderedHtml(line.from, line.to)) continue;
       // Skip the frontmatter block (rendered by frontmatterField).
       if (line.to <= fmEnd) continue;
-      // Skip lines fully inside code (fences) — bullets/tags there are literal.
+      // Skip lines fully inside code (fences): bullets/tags there are literal.
       if (codeRanges.some((r) => r.from <= line.from && r.to >= line.to)) continue;
       // Whole-line %% block comment region → grey out, keep raw.
       if (commentLines.has(ln)) {
@@ -2086,7 +2086,7 @@ function buildDecorations(view: EditorView): DecorationSet {
         continue;
       }
 
-      // Inline-HTML paragraph line (e.g. `<u>…</u> và <mark>…`): Lezer only marks
+      // Inline-HTML paragraph line (e.g. `<u>…</u> and <mark>…`): Lezer only marks
       // block-level openers as HTMLBlock, so render whole-line inline HTML here.
       if (/^<[a-zA-Z][^>]*>/.test(text) && !lineActive(line.from)) {
         pushReplace(line.from, line.to, Decoration.replace({ widget: new HtmlBlockWidget(text) }));
@@ -2158,7 +2158,7 @@ function buildDecorations(view: EditorView): DecorationSet {
             pushReplace(line.from, line.from + bodyStart, hidden);
           }
         } else {
-          // Plain quote: depth via background bars (data-quote-depth) — nested
+          // Plain quote: depth via background bars (data-quote-depth), nested
           // `> >` renders one bar per level like Obsidian.
           all.push(
             Decoration.line({
@@ -2172,7 +2172,7 @@ function buildDecorations(view: EditorView): DecorationSet {
         }
       }
 
-      // Task checkbox + bullet — applied to the line body (works in quotes /
+      // Task checkbox + bullet: applied to the line body (works in quotes /
       // callouts too). Per §7 any single char is a valid status and any
       // non-space status counts as checked (no hard-coded custom-state list).
       const body = bodyStart ? text.slice(bodyStart) : text;
@@ -2270,7 +2270,7 @@ function buildDecorations(view: EditorView): DecorationSet {
         }
       }
 
-      // %%Comment%% — greyed out (dropped from reading view, visible faint in editor).
+      // %%Comment%%: greyed out (dropped from reading view, visible faint in editor).
       const cmtRe = /%%(.+?)%%/g;
       while ((m = cmtRe.exec(text))) {
         const s = line.from + m.index;
@@ -2279,7 +2279,7 @@ function buildDecorations(view: EditorView): DecorationSet {
         all.push(Decoration.mark({ class: 'cm-comment' }).range(s, e));
       }
 
-      // $$Display math$$ (single-line) — rendered via KaTeX when the caret is outside.
+      // $$Display math$$ (single-line): rendered via KaTeX when the caret is outside.
       const dmathRe = /\$\$(.+?)\$\$/g;
       while ((m = dmathRe.exec(text))) {
         const s = line.from + m.index;
@@ -2289,7 +2289,7 @@ function buildDecorations(view: EditorView): DecorationSet {
         else all.push(Decoration.mark({ class: 'cm-math' }).range(s, e));
       }
 
-      // Inline $math$ — open not followed by space, close not preceded by space (§7).
+      // Inline $math$: open not followed by space, close not preceded by space (§7).
       const mathRe = /(?<![$\\])\$(?![\s$])((?:\\\$|[^$\n])+?)(?<![\s\\])\$(?!\d|\$)/g;
       while ((m = mathRe.exec(text))) {
         const s = line.from + m.index;
@@ -2333,7 +2333,7 @@ function buildDecorations(view: EditorView): DecorationSet {
         all.push(Decoration.mark({ class: 'cm-url' }).range(s, e));
       }
 
-      // Wikilinks / embeds — alias after the FIRST `|`; default display text
+      // Wikilinks / embeds: alias after the FIRST `|`; default display text
       // `href.split('#').filter(Boolean).join(' > ')`; nested `[[` rejected (§7).
       const wikiRe = /(!?)\[\[(.+?)\]\]/g;
       while ((m = wikiRe.exec(text))) {
@@ -2390,7 +2390,7 @@ function buildDecorations(view: EditorView): DecorationSet {
         }
       }
 
-      // Markdown images ![alt](url) — URL may contain spaces (real-world vaults)
+      // Markdown images ![alt](url): URL may contain spaces (real-world vaults)
       const imgRe = /!\[([^\]]*)\]\(([^)]+)\)/g;
       while ((m = imgRe.exec(text))) {
         const s = line.from + m.index;
@@ -2417,7 +2417,7 @@ function buildDecorations(view: EditorView): DecorationSet {
         pushReplace(s, e, Decoration.replace({ widget: new ImageWidget(src, alt, w, h) }));
       }
 
-      // Markdown links [text](url) — not preceded by ! (those are images)
+      // Markdown links [text](url): not preceded by ! (those are images)
       const linkRe = /(?<!\!)\[([^\]]+?)\]\(([^)]+)\)/g;
       while ((m = linkRe.exec(text))) {
         const s = line.from + m.index;
@@ -2427,7 +2427,7 @@ function buildDecorations(view: EditorView): DecorationSet {
         pushReplace(s, e, Decoration.replace({ widget: new MdLinkWidget(m[1], url) }));
       }
 
-      // Markdown escapes `\.` `\*` … — conceal the backslash like Obsidian LP
+      // Markdown escapes `\.` `\*` …: conceal the backslash like Obsidian LP
       // (e.g. Trilium/turndown exports escape `2\.` to avoid list parsing).
       // MUST run LAST: pushReplace's overlap guard would otherwise block math/
       // link widgets whose range contains an escape (e.g. `\,` inside $$…$$).
@@ -2518,7 +2518,7 @@ function buildInlineTitle(state: EditorState): DecorationSet {
   if (!state.field(livePreviewState, false)) return Decoration.none;
   const title = state.field(noteTitleField, false) ?? '';
   if (!title) return Decoration.none;
-  // Skip when the note already opens with an H1 equal to the title — the Trilium
+  // Skip when the note already opens with an H1 equal to the title: the Trilium
   // export repeats the title as a heading, and Obsidian would otherwise show it twice.
   const head = state.doc.sliceString(0, Math.min(state.doc.length, 2000));
   const noFm = head.replace(/^---\r?\n[\s\S]*?\r?\n---[ \t]*\r?\n?/, '');
@@ -2558,7 +2558,7 @@ function buildTables(state: EditorState): DecorationSet {
   if (!tables.length) return Decoration.none;
   const ro = state.field(livePreviewReadonly, false) ?? false;
   // Like Obsidian, tables are ALWAYS shown as the interactive widget (never as raw
-  // pipes) — editing happens in-cell, so the selection no longer reveals raw.
+  // pipes), editing happens in-cell, so the selection no longer reveals raw.
   const ranges: Range<Decoration>[] = tables.map((t) =>
     Decoration.replace({ widget: new TableWidget(t, ro), block: true }).range(t.from, t.to),
   );
@@ -2644,7 +2644,7 @@ export const editorClickFix = EditorView.domEventHandlers({
     // `precise: false` returns the CLOSEST position and never null, so clicking
     // anywhere on a tall heading line-box (incl. its padding, where the default
     // posAtCoords returns null and CM leaves the caret put) still moves the caret
-    // onto that line — which reveals its concealed markup on the first click.
+    // onto that line, which reveals its concealed markup on the first click.
     const pos = view.posAtCoords({ x: event.clientX, y: event.clientY }, false);
     view.dispatch({ selection: { anchor: pos } });
     return false; // let CodeMirror handle focus/drag normally too
@@ -2705,7 +2705,7 @@ export const livePreviewTheme = EditorView.baseTheme({
   '.cm-embed-image': { maxWidth: '100%', borderRadius: '6px', display: 'block', margin: '6px 0' },
   '.cm-properties': { margin: '4px 0 18px' },
   // Compound `.cm-line.cm-blockquote` selector beats CodeMirror's own `.cm-line`
-  // padding rule (equal specificity, declared later) so the gap actually applies —
+  // padding rule (equal specificity, declared later) so the gap actually applies:
   // otherwise text sits flush against the bar. Blockquote: 2px accent bar +
   // 24px padding (§19). Callout colors live in obsidian.css (--callout-* slots).
   '.cm-line.cm-blockquote': {
@@ -2713,7 +2713,7 @@ export const livePreviewTheme = EditorView.baseTheme({
     paddingLeft: '24px',
     color: 'var(--text-normal)',
   },
-  // Markdown tables — mirror Obsidian's table CSS variables
+  // Markdown tables: mirror Obsidian's table CSS variables
   // (https://docs.obsidian.md/Reference/CSS+variables/Editor/Table): 1px border,
   // left-aligned + top-valigned cells, semibold header with a subtle background.
   '.cm-table': { borderCollapse: 'collapse', margin: '0', width: 'auto' },
@@ -2759,7 +2759,7 @@ export const livePreviewTheme = EditorView.baseTheme({
     background: 'var(--bg-modifier-hover)',
     borderColor: 'var(--interactive-accent)',
   },
-  // Raw embedded HTML (e.g. CKEditor/Trilium tables) — table metrics match the
+  // Raw embedded HTML (e.g. CKEditor/Trilium tables): table metrics match the
   // reading view (4px 10px cells, semibold header) so both modes look alike.
   '.cm-html-block': { margin: '6px 0' },
   '.cm-html-block table': { borderCollapse: 'collapse', margin: '4px 0', width: 'auto' },

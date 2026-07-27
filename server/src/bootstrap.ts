@@ -8,9 +8,10 @@ export async function loadSettings() {
 }
 
 /**
- * WEBOBSIDIAN_PASSWORD không còn ghi vào settings.json; nó được dùng như mật khẩu
- * override (khôi phục khi quên pass), kiểm tra trực tiếp lúc login. Mật khẩu đăng
- * nhập mặc định là 123456. Chỉ log để báo override đang bật.
+ * WEBOBSIDIAN_PASSWORD is no longer written into settings.json; it acts as the
+ * override password (recovery for a forgotten password) and is checked directly
+ * at login. The default login password is 123456. This only logs, to report that
+ * the override is active.
  */
 export async function setPasswordIfInitial(): Promise<void> {
   if (config.initialPassword) {

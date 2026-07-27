@@ -5,7 +5,7 @@
  * default class extending `Plugin`. We provide a compatibility shim exposing a
  * commonly-used subset of the Obsidian API, then evaluate each enabled plugin's
  * main.js against it. Plugins relying on Electron/Node internals will fail
- * softly (their missing-API calls throw and are caught) — logged, not fatal.
+ * softly (their missing-API calls throw and are caught), logged, not fatal.
  */
 import { api } from './api';
 import { useStore } from './store';

@@ -4,7 +4,7 @@ import { api } from '../lib/api';
 import Icon from './Icon';
 
 /**
- * Per-note share settings popup (FR-10) — opened from the file-tree context
+ * Per-note share settings popup (FR-10), opened from the file-tree context
  * menu ("Share…"). Create/copy the public URL, toggle it on/off, manage the
  * password, or delete the link. The centralized list lives in Settings → Sharing.
  */
@@ -85,7 +85,7 @@ export default function ShareDialog() {
             <div className="setting-row">
               <div className="info">
                 <div className="name">Public link</div>
-                <div className="desc">{share.enabled ? 'Anyone with the URL can view this note' : 'Sharing is paused — the URL returns 404'}</div>
+                <div className="desc">{share.enabled ? 'Anyone with the URL can view this note' : 'Sharing is paused: the URL returns 404'}</div>
               </div>
               <button className={`graph-switch ${share.enabled ? 'on' : ''}`} onClick={toggle} aria-label="Toggle public link">
                 <span className="graph-knob" />

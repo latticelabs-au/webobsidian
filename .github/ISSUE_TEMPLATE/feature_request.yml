@@ -5,7 +5,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        WebObsidian is design-driven — see [PRD.md](../blob/main/PRD.md). Substantial
+        WebObsidian is design-driven: see [PRD.md](../blob/main/PRD.md). Substantial
         features usually start as a PRD change. Describe the need and we'll figure out the fit.
   - type: textarea
     id: problem

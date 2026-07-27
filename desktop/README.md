@@ -7,14 +7,14 @@ bound to `127.0.0.1` on a random free port and loads it in a `BrowserWindow`.
 
 Because the server has **no runtime native modules**, the whole server is bundled
 into a single `.mjs` with esbuild, and every CPU arch is produced just by packing
-the matching prebuilt Electron binary — no cross-compilation, no `node-gyp`.
+the matching prebuilt Electron binary: no cross-compilation, no `node-gyp`.
 
 ## How it works
 
 - **First launch** prompts for a vault folder (default `~/Documents/WebObsidianVault`).
 - App data (`settings.json`, search index) lives in Electron's per-user `userData` dir.
 - A random per-install password is generated, passed to the server as
-  `WEBOBSIDIAN_PASSWORD`, and used to **auto-login** — no password prompt.
+  `WEBOBSIDIAN_PASSWORD`, and used to **auto-login**, no password prompt.
 - Menu **File → Switch Vault…** changes the vault (relaunches to re-index);
   **Open Vault/Data Folder** and **Open Logs** help debugging.
 - Git sync needs `git` on the machine; without it the app still works for local editing.

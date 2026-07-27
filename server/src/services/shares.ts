@@ -3,13 +3,13 @@ import path from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { config } from '../config.js';
 
-/** Public share links (FR-10) — persisted as a JSON array in data/shares.json. */
+/** Public share links (FR-10): persisted as a JSON array in data/shares.json. */
 export interface ShareRecord {
   id: string;
   path: string; // vault-relative note path
   enabled: boolean;
   createdAt: string;
-  /** Optional scrypt hash — set when the share is password-protected. */
+  /** Optional scrypt hash, set when the share is password-protected. */
   passwordHash?: string;
 }
 

@@ -6,7 +6,7 @@ import type { Request, Response } from 'express';
  * Serve a binary file with HTTP Range support so embedded `<video>`/`<audio>`
  * can seek: browsers (Safari especially) request `Range: bytes=…` and need a
  * 206 partial response, otherwise the scrubber and playback break. Streams the
- * file instead of buffering it — vault media can be hundreds of MB.
+ * file instead of buffering it: vault media can be hundreds of MB.
  */
 export async function sendFileWithRange(
   req: Request,

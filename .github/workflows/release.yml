@@ -5,7 +5,7 @@ name: Release desktop apps
 # or run manually from the Actions tab.
 #
 # Each runner builds installers for its OWN platform natively (mac on macOS,
-# win on Windows, linux on Ubuntu) — no cross-compilation / wine needed. Because
+# win on Windows, linux on Ubuntu): no cross-compilation / wine needed. Because
 # the bundled server has no native node modules, every CPU arch (x64/arm64/ia32)
 # is produced just by packing the matching prebuilt Electron binary.
 #
@@ -50,6 +50,6 @@ jobs:
         env:
           # electron-builder publishes to GitHub Releases with this token.
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Apps are unsigned (no certificates) — skip macOS code-signing/notarize
+          # Apps are unsigned (no certificates): skip macOS code-signing/notarize
           # so the build doesn't fail looking for an identity.
           CSC_IDENTITY_AUTO_DISCOVERY: false

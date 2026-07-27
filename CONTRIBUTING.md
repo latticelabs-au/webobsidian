@@ -1,7 +1,7 @@
 # Contributing to WebObsidian
 
 Thanks for your interest in improving WebObsidian! This project is self-hosted, single-user,
-and design-driven — please read the few rules below before opening a PR.
+and design-driven: please read the few rules below before opening a PR.
 
 ## Ground rules (from [CLAUDE.md](CLAUDE.md))
 
@@ -17,7 +17,7 @@ and design-driven — please read the few rules below before opening a PR.
 ## Technical conventions
 
 - **TypeScript** for both server and web. Avoid `any` where possible.
-- **Runtime config is JSON only** (`data/settings.json`) — do not add a DB engine.
+- **Runtime config is JSON only** (`data/settings.json`): do not add a DB engine.
 - **Security:** never log secrets/tokens/API keys; hash before storing; guard against path
   traversal.
 - Match the style, naming, and comment density of the surrounding code.
@@ -34,8 +34,8 @@ npm run dev          # server :8787 + web dev server :5173 (proxied)
 Before opening a PR:
 
 ```bash
-npm run typecheck    # must pass — CI runs this
-npm run build        # must succeed — CI runs this
+npm run typecheck    # must pass, CI runs this
+npm run build        # must succeed, CI runs this
 ```
 
 ## Pull requests
@@ -48,7 +48,7 @@ npm run build        # must succeed — CI runs this
 
 ## Reporting bugs & requesting features
 
-Use the GitHub issue templates. For security issues, **do not** open a public issue —
+Use the GitHub issue templates. For security issues, **do not** open a public issue:
 see [SECURITY.md](SECURITY.md).
 
 By contributing, you agree that your contributions are licensed under the

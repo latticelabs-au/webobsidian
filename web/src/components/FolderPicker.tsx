@@ -46,7 +46,7 @@ export default function FolderPicker() {
   const currentDir = single && single.includes('/') ? single.slice(0, single.lastIndexOf('/')) : '';
 
   // Root + every folder, minus targets that would move a folder into itself or a
-  // descendant of any source (and, for a single item, its own folder — a no-op).
+  // descendant of any source (and, for a single item, its own folder: a no-op).
   const folders = useMemo(() => {
     const all = ['', ...collectFolders(tree)];
     return all.filter((f) => {
@@ -62,7 +62,7 @@ export default function FolderPicker() {
     [folders, lc],
   );
 
-  // shift+↵ creates a new folder — offer it when the typed name isn't an exact match.
+  // shift+↵ creates a new folder: offer it when the typed name isn't an exact match.
   const typed = q.trim().replace(/^\/+|\/+$/g, '');
   const canCreate = typed.length > 0 && !folders.some((f) => f.toLowerCase() === typed.toLowerCase());
 

@@ -6,7 +6,7 @@ import { listMarkdownFiles, readFileText } from './vault.js';
 import { parseNote } from './markdown.js';
 
 /**
- * QMD — the WebObsidian search engine.
+ * QMD: the WebObsidian search engine.
  * A thin, opinionated layer over MiniSearch giving fielded, fuzzy, prefix and
  * boolean queries over the vault's markdown, with incremental updates and a
  * persisted on-disk index for fast cold starts. (PRD FR-7)
@@ -34,7 +34,7 @@ export interface SearchHit {
 export interface MatchContext {
   text: string;
   ranges: [number, number][];
-  /** ellipsis flags — context is clipped from the surrounding body. */
+  /** ellipsis flags: context is clipped from the surrounding body. */
   pre: boolean;
   post: boolean;
 }
@@ -334,7 +334,7 @@ class QmdEngine {
         autoVacuum: false,
       });
       // A persisted *empty* index (e.g. a prior build ran while the vault was
-      // briefly unreadable) must not be trusted — restoring it would leave the
+      // briefly unreadable) must not be trusted: restoring it would leave the
       // engine ready=true with zero docs, so every query returns nothing and we
       // never rebuild. Treat it as a cache miss so initSearch() builds fresh.
       if (this.mini.documentCount === 0) return false;

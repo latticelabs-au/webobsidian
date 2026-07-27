@@ -112,7 +112,7 @@ export async function installFromGithub(repo: string): Promise<InstalledPlugin> 
   }
 
   const manifest = JSON.parse(await fetchText(assets['manifest.json'])) as PluginManifest;
-  // id comes from a REMOTE manifest — validate before it becomes a path segment
+  // id comes from a REMOTE manifest: validate before it becomes a path segment
   // (a crafted `../../..` would otherwise write main.js outside the plugins dir).
   const id = assertSafeId(manifest.id || clean.split('/')[1]);
   const dir = await pluginsDir();

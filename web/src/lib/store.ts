@@ -26,7 +26,7 @@ export interface GraphGroup {
   color: string;
 }
 
-/** Persisted Graph view filters/display/forces — mirrors Obsidian's graph panel. */
+/** Persisted Graph view filters/display/forces: mirrors Obsidian's graph panel. */
 export interface GraphSettings {
   // filters
   search: string;
@@ -38,7 +38,7 @@ export interface GraphSettings {
   groups: GraphGroup[];
   // display (Obsidian's native ranges/defaults)
   arrows: boolean;
-  textFade: number; // -3..3, default 0 — higher = labels need more zoom
+  textFade: number; // -3..3, default 0: higher = labels need more zoom
   nodeSize: number; // 0.1..5, default 1
   linkThickness: number; // 0.1..5, default 1
   // forces (Obsidian's native ranges/defaults)
@@ -173,7 +173,7 @@ interface AppState {
   openContextMenu: (m: ContextMenuState) => void;
   closeContextMenu: () => void;
 
-  /** Public share links (FR-10) — cached so the tree can badge shared notes. */
+  /** Public share links (FR-10): cached so the tree can badge shared notes. */
   shares: ShareRecord[];
   loadShares: () => Promise<void>;
   /** Note path whose Share dialog is open (null = closed). */
@@ -231,7 +231,7 @@ function pickPersisted(s: any): Record<string, unknown> {
 /**
  * Merge persisted graph settings over defaults. Settings saved before the move
  * to Obsidian-native slider units (all sliders were normalized 0..1) are detected
- * by linkDistance ≤ 1 — keep the filters/groups but reset display/forces.
+ * by linkDistance ≤ 1: keep the filters/groups but reset display/forces.
  */
 function migrateGraphSettings(gs: unknown): GraphSettings {
   if (!gs || typeof gs !== 'object') return DEFAULT_GRAPH_SETTINGS;
@@ -480,7 +480,7 @@ export const useStore = create<AppState>()(
         if (path === GRAPH_PATH) return get().openGraph();
         if (get().dirty) await get().save();
         // A folder path (e.g. deep-link /note/<folder>) opens a folder content
-        // view — never read it as a note nor pollute Recent with it.
+        // view: never read it as a note nor pollute Recent with it.
         const isFolder = findNode(get().tree, path)?.type === 'folder';
         let content = '';
         if (!isFolder && TEXT_RE.test(path)) {
@@ -500,7 +500,7 @@ export const useStore = create<AppState>()(
           const { path } = await api.resolve(target);
           if (path) await get().openFile(path);
           else {
-            // Only append `.md` when the target has no extension at all — a target
+            // Only append `.md` when the target has no extension at all: a target
             // like `Foo.canvas` must stay `Foo.canvas`, not become `Foo.canvas.md`.
             const hasExt = /\.[^./]+$/.test(target);
             const newPath = hasExt ? target : `${target}.md`;
@@ -563,7 +563,7 @@ export const useStore = create<AppState>()(
 
       newFolder: async (dir) => {
         // Create an "Untitled" folder (unique name) and drop straight into inline
-        // rename — same as Obsidian, no prompt.
+        // rename, same as Obsidian, no prompt.
         const base = (dir ?? '').replace(/\/+$/, '');
         const parent = base ? findNode(get().tree, base) : get().tree;
         const taken = new Set((parent?.children ?? []).map((c) => c.name.toLowerCase()));
@@ -603,7 +603,7 @@ export const useStore = create<AppState>()(
       },
 
       hydrate: async () => {
-        // Active tab + split pane content aren't persisted (only the paths) —
+        // Active tab + split pane content aren't persisted (only the paths):
         // re-read them from the vault after a reload. Drop tabs whose file is gone.
         const { activePath, splitPath, tabs } = get();
         if (activePath && TEXT_RE.test(activePath)) {

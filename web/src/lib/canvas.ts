@@ -1,5 +1,5 @@
 /**
- * JSON Canvas — the open file format Obsidian Canvas uses (jsoncanvas.org).
+ * JSON Canvas: the open file format Obsidian Canvas uses (jsoncanvas.org).
  * A `.canvas` file is `{ "nodes": [...], "edges": [...] }`. We read/write it
  * verbatim so canvases stay round-trip compatible with the Obsidian app.
  */
@@ -147,7 +147,7 @@ export function autoSides(a: Rect, b: Rect): { from: CanvasSide; to: CanvasSide 
   return dy >= 0 ? { from: 'bottom', to: 'top' } : { from: 'top', to: 'bottom' };
 }
 
-/** Unit outward normal for a side — controls the Bézier handle direction. */
+/** Unit outward normal for a side: controls the Bézier handle direction. */
 function sideNormal(side: CanvasSide): { x: number; y: number } {
   switch (side) {
     case 'top': return { x: 0, y: -1 };
@@ -178,7 +178,7 @@ export function edgePath(
   // Tangent at end of a cubic ≈ direction from c2 → end.
   const tipAngle = Math.atan2(to.y - c2.y, to.x - c2.x);
   // Midpoint by ARC LENGTH (not t=0.5) so the label sits visually centered on
-  // the curve — matches Obsidian. Sample the cubic and walk to half its length.
+  // the curve (matches Obsidian). Sample the cubic and walk to half its length.
   const mid = bezierArcMidpoint(from, c1, c2, to);
   return { d, tipAngle, mid };
 }

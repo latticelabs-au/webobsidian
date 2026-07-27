@@ -24,7 +24,7 @@ export function parseNote(rel: string, raw: string): ParsedNote {
     frontmatter = (fm.data ?? {}) as Record<string, unknown>;
     body = fm.content;
   } catch {
-    /* malformed frontmatter — index raw */
+    /* malformed frontmatter: index raw */
   }
 
   const links = new Set<string>();

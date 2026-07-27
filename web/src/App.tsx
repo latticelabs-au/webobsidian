@@ -158,7 +158,7 @@ export default function App() {
   if (mustChangePassword) return <div className={theme}><ForceChangePassword /></div>;
 
   // On mobile the sidebars are overlay drawers (always mounted, slid in/out by
-  // CSS), driven by the device-local `mobileDrawer` state — not the persisted
+  // CSS), driven by the device-local `mobileDrawer` state, not the persisted
   // leftOpen/rightOpen that sync across desktops.
   const showLeft = isMobile || leftOpen;
   const showRight = isMobile || rightOpen;

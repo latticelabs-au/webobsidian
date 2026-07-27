@@ -65,7 +65,7 @@ function sanitizeVault(v: any) {
   return out;
 }
 
-/** The roots a new vault path may live under — mirrors GET /browse. */
+/** The roots a new vault path may live under: mirrors GET /browse. */
 async function effectiveRoots(newAllowed?: unknown): Promise<string[]> {
   const s = await getSettings();
   const fromBody = Array.isArray(newAllowed)

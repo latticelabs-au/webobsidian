@@ -66,7 +66,7 @@ export default function SearchPanel() {
     }
     timer.current = window.setTimeout(async () => {
       try {
-        const r = await api.search(q); // no limit — server returns every match
+        const r = await api.search(q); // no limit: server returns every match
         setHits(r.hits);
       } catch {
         setHits([]);

@@ -85,7 +85,7 @@ searchRouter.get(
     const target = String(req.query.target ?? '');
     // The link graph only indexes markdown notes, so a wikilink that points at a
     // non-markdown file with an explicit extension (e.g. `[[Foo.canvas]]`) misses.
-    // Fall back to the vault-wide file index for those — but only when an explicit
+    // Fall back to the vault-wide file index for those, but only when an explicit
     // non-markdown extension is present, so a bare `[[Foo]]` still resolves to a
     // note (or stays unresolved so the client can offer to create one).
     let resolved = resolveLink(target);

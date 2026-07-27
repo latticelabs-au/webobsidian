@@ -96,7 +96,7 @@ const SCALE_MAX = 8;
 const FADE_DIM = 0.2;
 
 /**
- * Graph view — WebGL-rendered via PixiJS (like Obsidian's PixiJS graph), with the
+ * Graph view: WebGL-rendered via PixiJS (like Obsidian's PixiJS graph), with the
  * d3-force layout running on the main thread. Pan/zoom is a GPU camera transform
  * (no geometry rebuild), so it stays smooth at thousands of nodes. The Filters
  * panel mirrors Obsidian: Tags / Attachments / Existing-only / Orphans, color
@@ -317,7 +317,7 @@ export default function GraphView() {
     p.world.scale.set(k);
     if (fullDirty.current) updatePositions();
     // edges are drawn in world space at a constant DEVICE-pixel thickness; node
-    // sprites follow Obsidian's √zoom law — both need a refresh on layout
+    // sprites follow Obsidian's √zoom law: both need a refresh on layout
     // change, zoom change, or when the hover highlight moves.
     if (fullDirty.current || k !== lastEdgeK.current || edgesDirty.current) {
       drawEdges();
@@ -367,8 +367,8 @@ export default function GraphView() {
     const k = cam.current.k || 1;
     const h = hover.current;
     const g = p.edges;
-    // Obsidian draws edges at lineSizeMult / scale in world space — i.e. a
-    // constant lineSizeMult DEVICE pixels on screen — in a faint theme gray.
+    // Obsidian draws edges at lineSizeMult / scale in world space, i.e. a
+    // constant lineSizeMult DEVICE pixels on screen, in a faint theme gray.
     // When a node is hovered, its edges switch to the highlight color and all
     // others dim like the unrelated nodes do.
     const width = s.linkThickness / devScale(k);
@@ -459,7 +459,7 @@ export default function GraphView() {
     const rs = renderScale(k);
     const dpr = dprNow();
     // Obsidian's global text fade (device scale!): textAlpha =
-    // clamp(log2(scale) + 1 − fade, 0, 1) — all labels share one zoom-driven
+    // clamp(log2(scale) + 1 − fade, 0, 1): all labels share one zoom-driven
     // alpha, further multiplied by each node's hover-fade; hover is always 1.
     const textAlpha = Math.max(0, Math.min(1, Math.log2(e) + 1 - s.textFade));
 
@@ -546,7 +546,7 @@ export default function GraphView() {
   };
 
   // Obsidian's initial viewport: scale 1 in DEVICE pixels (no zoom-to-fit), the
-  // spawn point centered — the graph blooms outward past the edges and the user
+  // spawn point centered: the graph blooms outward past the edges and the user
   // pans/zooms from there. In CSS pixels that's k = 1/devicePixelRatio.
   const resetCamera = () => {
     const wrap = wrapRef.current;
@@ -586,7 +586,7 @@ export default function GraphView() {
       try {
         await import('pixi.js/unsafe-eval');
       } catch {
-        /* older Pixi without the subpath export — ignore */
+        /* older Pixi without the subpath export: ignore */
       }
       if (destroyed) return;
       mod.current = PIXI;
@@ -640,7 +640,7 @@ export default function GraphView() {
   }, []);
 
   // Pane ⋯ menu → "Copy screenshot": extract the Pixi stage to a PNG.
-  // (Reading the WebGL canvas directly would be blank — no preserveDrawingBuffer.)
+  // (Reading the WebGL canvas directly would be blank: no preserveDrawingBuffer.)
   useEffect(() => {
     const onShot = async () => {
       const p = pixi.current;

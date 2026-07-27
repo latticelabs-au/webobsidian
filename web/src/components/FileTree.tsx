@@ -106,7 +106,7 @@ async function moveItemsTo(paths: string[], targetDir: string): Promise<void> {
   if (moved > 1) notify(`Moved ${moved} items`);
 }
 
-/** Visible tree rows in display order — used to resolve a Shift-click range. */
+/** Visible tree rows in display order: used to resolve a Shift-click range. */
 function visibleOrder(): string[] {
   return [...document.querySelectorAll<HTMLElement>('.tree-row[data-path]')]
     .map((el) => el.dataset.path!)
@@ -115,7 +115,7 @@ function visibleOrder(): string[] {
 
 /**
  * Pick a name for `base` inside `targetDir` that doesn't collide with an
- * existing child — appends " copy" / " copy N" before the extension, like Obsidian.
+ * existing child: appends " copy" / " copy N" before the extension, like Obsidian.
  */
 function uniqueChildName(tree: TreeNode | null, targetDir: string, base: string): string {
   const folder = targetDir ? findNode(tree, targetDir) : tree;
@@ -242,7 +242,7 @@ function Node({ node, depth }: { node: TreeNode; depth: number }) {
     const base = clip.path.split('/').pop()!;
     const srcDir = parentDir(clip.path);
     if (clip.mode === 'cut') {
-      if (targetDir === srcDir) { setClipboard(null); return; } // already here — no-op
+      if (targetDir === srcDir) { setClipboard(null); return; } // already here: no-op
       const to = targetDir ? `${targetDir}/${base}` : base;
       try {
         await api.rename(clip.path, to);
@@ -255,7 +255,7 @@ function Node({ node, depth }: { node: TreeNode; depth: number }) {
       }
       return;
     }
-    // copy — recursive server-side copy (works for both files and folders).
+    // copy: recursive server-side copy (works for both files and folders).
     const name = uniqueChildName(useStore.getState().tree, targetDir, base);
     const to = targetDir ? `${targetDir}/${name}` : name;
     try {
@@ -401,7 +401,7 @@ function Node({ node, depth }: { node: TreeNode; depth: number }) {
         onContextMenu={onContext}
         // A file is a valid drop target too: dropping onto it moves the dragged
         // item into the file's parent folder (Obsidian behaviour). Without this,
-        // drops on a file — or anywhere inside an expanded folder's contents —
+        // drops on a file (or anywhere inside an expanded folder's contents)
         // bubble up to the root handler and either no-op or move to the vault root.
         onDragOver={(e) => { e.preventDefault(); setDropping(true); }}
         onDragLeave={() => setDropping(false)}
@@ -528,7 +528,7 @@ export default function FileTree() {
     if (!clip) return;
     const base = clip.path.split('/').pop()!;
     if (clip.mode === 'cut') {
-      if (!clip.path.includes('/')) { setClipboard(null); return; } // already at root — no-op
+      if (!clip.path.includes('/')) { setClipboard(null); return; } // already at root: no-op
       try {
         await api.rename(clip.path, base);
         closeTab(clip.path);

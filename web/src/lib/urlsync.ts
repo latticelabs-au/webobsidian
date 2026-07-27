@@ -23,7 +23,7 @@ export function urlToPath(pathname: string): string | null {
   return null;
 }
 
-/** True while we're applying a popstate — suppresses the pushState echo. */
+/** True while we're applying a popstate: suppresses the pushState echo. */
 let applyingPop = false;
 let started = false;
 
