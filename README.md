@@ -123,6 +123,63 @@ Then `docker compose up -d --build`. Your vault can be a plain folder or a `git 
 Set `HTTP_BIND=127.0.0.1` so the app is only reachable from the host, then terminate TLS
 with nginx / Caddy / Traefik in front of `http://127.0.0.1:8787`.
 
+**Pass the client's `Host` header through.** The `/ws` upgrade compares the handshake's
+`Origin` against what this server believes its own browser-visible authority to be, which is
+what stops another site from opening your live vault stream with your own cookie. It reads
+that authority from `X-Forwarded-Host` / `-Proto` / `-Port` first and falls back to `Host`.
+nginx's *default* is `proxy_set_header Host $proxy_host`, i.e. `127.0.0.1:8787`: an internal
+address no browser could have in its address bar. The server recognises that case and
+**allows** the upgrade rather than breaking live updates, but it cannot tell your own page
+from someone else's any more, so protection drops back to the cookie's `SameSite` attribute
+alone. It says so in the log, once per ten minutes:
+
+```
+[security] WebSocket upgrade from https://notes.example.com allowed even though this
+server sees Host="127.0.0.1:8787", which is an internal address no browser can reach ...
+```
+
+Caddy and Traefik preserve `Host` by default; nginx needs to be told:
+
+```nginx
+location / {
+    proxy_pass         http://127.0.0.1:8787;
+    proxy_set_header   Host              $host;          # required: WS origin check
+    proxy_set_header   X-Forwarded-Proto $scheme;        # required: Secure cookies
+    proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_set_header   X-Real-IP         $remote_addr;
+
+    proxy_http_version 1.1;                              # required: WebSocket
+    proxy_set_header   Upgrade    $http_upgrade;
+    proxy_set_header   Connection "upgrade";
+    proxy_read_timeout 3600s;                            # keep /ws alive when idle
+}
+```
+
+If you cannot change the proxy, set `PUBLIC_ORIGIN` to the origin(s) users type into the
+browser (`PUBLIC_ORIGIN=https://notes.example.com`, comma-separated for several). When it is
+set it becomes the exact allowlist for the upgrade and nothing else is consulted, which
+removes the ambiguity entirely. It grants no cross-site access; it only declares which front
+doors are your own.
+
+**`TRUST_PROXY` and rate limiting: the default is fine, and here is what it costs.** Left at
+`true`, the login / share-unlock / failed-API-key limiters key on the TCP socket address.
+Nothing can be spoofed that way, but behind a proxy that address is the *same* for every
+visitor, so the login limit ("10 attempts per 15 minutes") is one instance-wide budget and a
+stranger's ten failed logins keep you out for the rest of the window. That is an availability
+cost, not a bypass, and it expires on its own: refused attempts are not recorded, so the
+lockout always ends 15 minutes after the tenth accepted attempt.
+
+A **hop count does not help.** `TRUST_PROXY=1` behaves exactly like the default for the
+limiters, because Express only counts hops for that form and never checks who the peer is, so
+its answer is not used. The one form that gives per-client buckets is a **subnet or preset
+list**, which is the only form where Express tests each hop's address, and it comes with a
+precondition: the range must contain your proxies and no real clients. A range broad enough to
+cover the LAN behind the proxy lets those clients inject their own `X-Forwarded-For` and mint a
+bucket per request, which is worse than leaving the default alone. Name the narrowest range you
+can (`10.1.2.3/32` if the proxy has one fixed address; in Docker, the proxy's address on the
+container network, found with `docker network inspect`).
+[`.env.example`](.env.example) and [`SECURITY.md`](SECURITY.md) cover all four forms.
+
 ### Large vaults & file watching
 
 A fresh VPS ships a low `fs.inotify.max_user_watches` (often 8192), which a big vault
@@ -178,6 +235,8 @@ Useful scripts:
 | `VAULT_HOST_PATH` | `./sample-vault` | Host path bind-mounted to `/vault` |
 | `HTTP_BIND` | `0.0.0.0` | Host interface to publish on (`127.0.0.1` = local only) |
 | `HTTP_PORT` | `8787` | Host port mapped to container `8787` |
+| `TRUST_PROXY` | `true` | Proxy topology. Also decides rate-limit keying: see [Behind a reverse proxy](#behind-a-reverse-proxy-tls) |
+| `PUBLIC_ORIGIN` | – | Origin(s) users type into the browser, comma-separated. Exact allowlist for the `/ws` upgrade; set it when the proxy does not forward the original `Host` |
 | `WEBOBSIDIAN_PASSWORD` | – | Seed/override the master password |
 | `WEBOBSIDIAN_WATCH` | `auto` | `auto` (native + polling fallback) or `polling` |
 
@@ -186,11 +245,16 @@ Useful scripts:
 | Var | Default | Description |
 |-----|---------|-------------|
 | `PORT` | `8787` | HTTP port |
+| `HOST` | `0.0.0.0` | Interface to listen on (`127.0.0.1` = only through a local proxy) |
+| `TRUST_PROXY` | `true` | `true`/`false`/hop count/subnet list. Governs `X-Forwarded-*` everywhere, and rate-limit keying (only the subnet form keys per client) |
+| `PUBLIC_ORIGIN` | – | Comma-separated origin(s) users type into the browser. Exact allowlist for the `/ws` upgrade; grants no cross-site API access |
+| `COOKIE_SECURE` | `auto` | `auto` follows `req.secure` (so `X-Forwarded-Proto` behind a proxy); `true`/`false` force the session cookie's `Secure` flag |
 | `VAULT_PATH` | `./sample-vault` | Path to the notes vault |
 | `DATA_DIR` | `./data` | Where `settings.json` + search index live |
 | `ALLOWED_ROOTS` | – | Comma-separated roots the vault picker may browse |
 | `WEBOBSIDIAN_PASSWORD` | – | Seed/override the master password |
 | `WEBOBSIDIAN_WATCH` | `auto` | File-watch mode: `auto` or `polling` |
+| `DEV_CORS_ORIGIN` | – | Dev only: one exact origin allowed to call the API cross-site. Unset = CORS off (`*` and lists are refused). `npm run dev` does not need it, Vite proxies everything |
 | `NODE_OPTIONS` | `--max-old-space-size=4096` | Node heap size, raise for large vaults |
 
 Everything else (git remote/token, API keys, plugins, theme) is configured in the
@@ -306,9 +370,16 @@ See [PRD.md §2](PRD.md) for the full design.
 
 ## 🔒 Security notes
 
-- Master password is scrypt-hashed; the JWT secret is auto-generated.
+- Master password is scrypt-hashed (N=2^17, a 128 MiB working set per hash, at most 2 in
+  flight); the JWT secret is auto-generated. Budget the RAM for it if you set a container
+  memory limit: that allocation is off-heap, so `--max-old-space-size` does not cap it.
 - API keys are hashed at rest and scoped (`read` / `write` / `search`) with per-key rate
   limiting and audit logging.
+- Login, share unlock and failed API-key attempts are rate-limited. **How a client is
+  identified depends on `TRUST_PROXY`**: at the default (and with `false`, and with any hop
+  count) on the unforgeable TCP socket address, which behind a proxy means one bucket shared
+  by every visitor; only a subnet/preset list keys per client. Read
+  [Behind a reverse proxy](#behind-a-reverse-proxy-tls) before deploying.
 - All file paths are guarded against traversal; the vault picker is confined to
   `ALLOWED_ROOTS`.
 - Secrets (git token / API keys) live in `data/settings.json` on the server: mount `/data`

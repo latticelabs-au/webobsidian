@@ -238,7 +238,10 @@ webobsidian/
 - **Default password at install time: `123456`**, so there is no setup step, you can log in right away
   with the default password. By default settings.json contains **no** password at all.
 - The user changes the password in Settings → Account (enter the current password + the new one). The new hash is
-  stored in `auth.userPasswordHash`. An empty field means the default password `123456` is still in use.
+  stored in `auth.userPasswordHash`. An empty field means the default password `123456` is still accepted, but
+  **only while no override is configured either**: setting `auth.passwordHash` or `WEBOBSIDIAN_PASSWORD` retires
+  `123456` immediately, without any UI step. (Before that rule existed, an operator who seeded a strong password
+  through the environment and never opened the UI still had `123456` accepted as a full owner session.)
 - **Override password (recovery when the password is forgotten):** `auth.passwordHash` in `data/settings.json`
   (edited by hand, as a scrypt hash) **or** the `WEBOBSIDIAN_PASSWORD` environment variable (plaintext). Login
   accepts the override password **whether or not** the user has already changed their password. There is no override by default.
@@ -285,7 +288,11 @@ webobsidian/
 - **Self-deploy without editing tracked files**: every deploy parameter is set through `.env` (git-ignored):
   `VAULT_HOST_PATH` (host vault → `/vault`), `HTTP_BIND`/`HTTP_PORT` (publish), `WEBOBSIDIAN_PASSWORD`,
   `WEBOBSIDIAN_WATCH`, `TRUST_PROXY` (default `true`: trust the adjacent hop so `X-Forwarded-Proto` works when
-  sitting behind a reverse proxy; set it to `false` when exposed directly with no proxy, or to a subnet list/hop count to tighten it).
+  sitting behind a reverse proxy; set it to `false` when exposed directly with no proxy. Only the subnet/preset form
+  gives the rate limiters a per-client bucket instead of one shared bucket for everyone arriving from the proxy, and
+  only when the range names proxies exclusively; a hop count does not, see NFR Security), `PUBLIC_ORIGIN` (optional:
+  the origin(s) users type into the browser, used as the exact allowlist for the `/ws` upgrade when the proxy does not
+  forward the original `Host`).
   `docker-compose.yml` only references `${VAR:-default}`, so a `git pull`/redeploy
   does not clobber a self-hoster's configuration. `cp .env.example .env && docker compose up -d --build`.
 - **A file watcher that tolerates inotify limits**: a fresh VPS usually has a low `fs.inotify.max_user_watches`, so
@@ -431,9 +438,22 @@ existing Express server + SPA (no code fork, no architecture change), so every w
 ## 4. Non-functional requirements (NFR)
 - **Security**: scrypt password hash, a self-generated JWT secret, API keys hashed at rest, path traversal guards
   (blocking `..`, the `.git` segment, and symlinks escaping the vault), restricted CORS, rate limiting (including on `/auth/login`:
-  10 attempts per 15 minutes, **keyed on the real TCP socket address, not on `req.ip`/`X-Forwarded-For`**, so it
-  cannot be bypassed by rotating XFF, **regardless of the `trust proxy` configuration**; that is why `trust proxy` is
-  left enabled by default (`true`, via `TRUST_PROXY`) so `X-Forwarded-Proto`/Secure cookies work behind a proxy). The default
+  10 attempts per 15 minutes). **A limiter believes a forwarded address only when Express itself attested it, which is
+  only the subnet/preset form of `trust proxy`**: that is the one form where proxy-addr tests the *address* of each hop
+  and truncates at the first one outside the list, so it is self-validating and an entry the client wrote itself is
+  discarded. Every other form, including the default bare `true`, `false`, and **any hop count**, keys on the **TCP
+  socket address**, which cannot be forged; a hop count buys nothing here, because for that form Express only counts
+  hops and never checks who the peer is, so its answer is not used. The default stays `true` rather than `false` so
+  `X-Forwarded-Proto`/Secure cookies keep working behind a proxy out of the box. **The accepted cost:** a proxied
+  deployment left at the default collapses every visitor into one bucket, so a stranger's ten failed logins keep the
+  owner out for the rest of the 15-minute window. That is availability, not integrity, and it is bounded because
+  refused attempts are never recorded, so a lockout cannot be held open by continued hammering. The subnet form buys
+  per-client buckets back but carries its own precondition, stated in `SECURITY.md` and `.env.example`: the range must
+  contain proxies only, since a range that also covers real clients lets each of them mint a bucket per request.
+  `middleware/ratelimit.ts` additionally ships a second layer, `createFailureLimiter`, keyed on the caller's identity
+  rather than the network and charging only failed attempts with a success clearing the counter, which is the intended
+  remedy for the shared bucket; **it is a primitive with no call site yet**, so no route currently benefits from it.
+  The default
   password (`123456`) is **only accepted when no other credential has been configured**
   (`auth.userPasswordHash`, `auth.passwordHash`, or the `WEBOBSIDIAN_PASSWORD` env var); only then is changing it
   mandatory right after the first login (`mustChangePassword`). That flag is **not** returned by
@@ -453,7 +473,12 @@ existing Express server + SPA (no code fork, no architecture change), so every w
 
 ### Web/session API (cookie auth)
 ```
-POST   /auth/setup            # (legacy) set the password the first time; disabled once a default pass exists
+# (removed) POST /auth/setup  # unauthenticated: it set the owner password and returned a session
+#                             # cookie, guarded only by a function that always returned true. One
+#                             # edit to that guard would have made it a public account takeover, so
+#                             # it was deleted rather than re-guarded. First run is now: log in with
+#                             # the default password (or WEBOBSIDIAN_PASSWORD), then
+#                             # POST /auth/change-password (forced by `mustChangePassword`).
 POST   /auth/login            # login → cookie
 POST   /auth/logout
 POST   /auth/change-password  # change pass: { currentPassword, newPassword } (auth required)
@@ -508,11 +533,23 @@ GET    /api/v1/tags
 ## 6. Data model: `settings.json`
 ```jsonc
 {
-  "version": 1,
-  "auth":   { "userPasswordHash": "scrypt$... (the changed pass; empty = using the default 123456)",
-              "passwordHash": "scrypt$... (recovery override; empty = none)",
+  // Schema version. Current is 2 (`CURRENT_SETTINGS_VERSION` in services/settings.ts); a file with no
+  // `version` key predates the `auth.userPasswordHash` split and is migrated once, then stamped.
+  "version": 2,
+  // Password hashes are `scrypt$N=131072,r=8,p=1$<saltHex>$<hashHex>`: the cost parameters are
+  // stored IN the string, so they can be raised later without invalidating existing hashes. The
+  // old 3-field form `scrypt$<saltHex>$<hashHex>` (implicitly N=16384) still verifies forever.
+  // `userPasswordHash` is upgraded to the current cost on the next successful login, the one
+  // moment the plaintext is in hand; `passwordHash` is deliberately never rewritten, because the
+  // operator hand-edited it and the file must keep matching what they wrote. Either form is
+  // accepted when hand-writing a recovery hash, but produce the 4-field one.
+  // `123456` is accepted only when NONE of userPasswordHash / passwordHash / WEBOBSIDIAN_PASSWORD is
+  // set, so an empty `userPasswordHash` on its own no longer means the default is live.
+  "auth":   { "userPasswordHash": "scrypt$N=131072,r=8,p=1$<saltHex>$<hashHex> (the changed pass; empty = never changed in the UI)",
+              "passwordHash": "scrypt$N=131072,r=8,p=1$<saltHex>$<hashHex> (recovery override; empty = none)",
               "jwtSecret": "..." },
-  "vault":  { "path": "/vault", "allowedRoots": ["/vault"], "trash": ".trash", "deleteMode": "trash" },
+  "vault":  { "path": "/vault", "allowedRoots": ["/vault"], "trash": ".trash", "attachmentDir": "attachments",
+              "deleteMode": "trash" },
   "git":    { "enabled": false, "remote": "", "branch": "main",
               "token": "", "authorName": "", "authorEmail": "",
               "autoSync": false, "intervalSec": 300,
@@ -532,7 +569,10 @@ GET    /api/v1/tags
 [
   { "id": "base64url-16-bytes", "path": "Folder/Note.md",
     "enabled": true, "createdAt": "2026-06-10T00:00:00.000Z",
-    "passwordHash": "scrypt$...salt...$...hash..." } // optional: omit the field for a share with no password
+    "passwordHash": "scrypt$N=131072,r=8,p=1$...salt...$...hash..." } // optional: omit the field for a share with no password
+    // Same format as auth.*. Share hashes are NOT rehashed opportunistically (the unlock path
+    // never rewrites the record), so a share created before the cost bump keeps its old
+    // parameters and stays verifiable through the legacy 3-field branch.
 ]
 ```
 

@@ -4,9 +4,17 @@ services:
     image: webobsidian:latest
     container_name: webobsidian
     restart: unless-stopped
+    # No mem_limit is set on purpose, but size the host accordingly: password and
+    # share-unlock checks use scrypt at N=2^17, which is a 128 MiB working set per
+    # hash, capped at 2 concurrent hashes (~256 MiB peak). That memory is off-heap
+    # OpenSSL allocation, so NODE_OPTIONS=--max-old-space-size does not bound it.
+    # If you do impose a limit, leave at least ~512 MiB of headroom above the
+    # vault index or the OOM killer will land on a login instead of a 401.
     ports:
       # ${HTTP_PORT:-8787} on the host → 8787 in the container.
       # Set HTTP_BIND=127.0.0.1 in .env to expose only to localhost (reverse proxy).
+      # Behind a proxy, do that: it makes the proxy the only path in, so nothing
+      # else on the network can reach the app beside it.
       - "${HTTP_BIND:-0.0.0.0}:${HTTP_PORT:-8787}:8787"
     environment:
       # Set an initial password (otherwise set it on first-run in the UI)
@@ -14,9 +22,23 @@ services:
       # File-watch mode: auto (native + polling fallback) | polling. See .env.example.
       WEBOBSIDIAN_WATCH: ${WEBOBSIDIAN_WATCH:-auto}
       # Proxy trust. Default "true" (trust immediate hop) so X-Forwarded-Proto
-      # HTTPS cookie detection works behind a reverse proxy. Not a rate-limit risk
-      # (limiter keys on the TCP socket addr, not X-Forwarded-For). Set "false" only
-      # for a directly-exposed instance with no proxy. See .env.example.
+      # HTTPS cookie detection works behind a reverse proxy.
+      #
+      # It also decides how the rate limiters identify a client. With "true",
+      # "false", or ANY hop count they key on the TCP socket address, which is
+      # unforgeable, so rotating X-Forwarded-For mints no buckets. A hop count is
+      # not a shortcut here: Express only counts hops for that form and never
+      # checks who the peer is, so the limiters ignore its answer. Behind a proxy
+      # the socket address is the SAME for every visitor, so the login limit is
+      # one instance-wide budget: a stranger's ten failed logins keep the owner
+      # out for the rest of the 15-minute window. That is an availability cost,
+      # not a bypass, and it expires on its own.
+      # Only a subnet/preset list gives per-client buckets, because it is the one
+      # form where Express checks each hop's address. It requires a range that
+      # contains your proxy and no real clients: in docker that is the proxy's
+      # address on the container network (find it with `docker network inspect`),
+      # NOT "loopback" and not a broad range picked at random. Full explanation,
+      # including when it is worth doing at all, in .env.example.
       TRUST_PROXY: ${TRUST_PROXY:-true}
       VAULT_PATH: /vault
       DATA_DIR: /data

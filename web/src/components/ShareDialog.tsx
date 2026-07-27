@@ -1,6 +1,6 @@
 import { useEffect } from 'react';
 import { useStore } from '../lib/store';
-import { api } from '../lib/api';
+import { api, apiErrorMessage, sharePasswordError, MIN_PASSWORD_LEN } from '../lib/api';
 import Icon from './Icon';
 
 /**
@@ -24,14 +24,32 @@ export default function ShareDialog() {
   const share = shares.find((s) => s.path === path) ?? null;
   const url = share ? `${location.origin}/share/${share.id}` : '';
 
+  // Every call below is wrapped, and that is the point rather than tidiness.
+  // `api.req()` throws on any non-OK status and there is no error boundary and no
+  // unhandledrejection handler anywhere in web/src, so a bare `await api.x()`
+  // turns a 400/403/404/500 into literally nothing: the toast never fires, the
+  // share list never reloads, and the button reads as broken. Every one of these
+  // endpoints has a reachable failure (the note was renamed out from under an
+  // open dialog, the session expired, the password was refused), so silence is
+  // the normal case, not the exotic one.
   const create = async () => {
-    await api.createShare(path);
+    try {
+      await api.createShare(path);
+    } catch (e) {
+      notify(apiErrorMessage(e, 'Could not create the public link'));
+      return;
+    }
     await loadShares();
     notify('Public link created');
   };
   const toggle = async () => {
     if (!share) return;
-    await api.setShareEnabled(share.id, !share.enabled);
+    try {
+      await api.setShareEnabled(share.id, !share.enabled);
+    } catch (e) {
+      notify(apiErrorMessage(e, 'Could not change the public link'));
+      return;
+    }
     await loadShares();
   };
   const copy = () => {
@@ -41,19 +59,40 @@ export default function ShareDialog() {
   const password = async () => {
     if (!share) return;
     const pw = prompt(
-      share.hasPassword
+      (share.hasPassword
         ? 'New password for this link (leave empty to REMOVE the password):'
-        : 'Password for this link:',
+        : 'Password for this link:') + `\nAt least ${MIN_PASSWORD_LEN} characters.`,
     );
     if (pw === null) return;
-    await api.setSharePassword(share.id, pw || null);
+    // Client-side length check, stated plainly: this is a UX affordance, NOT the
+    // security boundary. PATCH /api/shares/:id applies the same rule server-side
+    // and is the only thing that decides; this exists so that a password the
+    // server will refuse is refused here, with the reason, instead of vanishing
+    // into an unhandled rejection. The prompt above carries the minimum too, so
+    // reaching this branch should be rare.
+    const invalid = sharePasswordError(pw);
+    if (invalid) {
+      notify(invalid);
+      return;
+    }
+    try {
+      await api.setSharePassword(share.id, pw || null);
+    } catch (e) {
+      notify(apiErrorMessage(e, 'Could not set the password'));
+      return;
+    }
     await loadShares();
     notify(pw ? 'Password set' : 'Password removed');
   };
   const remove = async () => {
     if (!share) return;
     if (!confirm('Delete this public link? The URL stops working permanently.')) return;
-    await api.deleteShare(share.id);
+    try {
+      await api.deleteShare(share.id);
+    } catch (e) {
+      notify(apiErrorMessage(e, 'Could not delete the public link'));
+      return;
+    }
     await loadShares();
     notify('Public link deleted');
   };

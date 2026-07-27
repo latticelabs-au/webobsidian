@@ -69,28 +69,62 @@ export default function App() {
       .catch(() => {});
     useStore.getState().loadShares(); // badge shared notes in the file tree
     loadPlugins().catch(() => {});
-    // websocket live updates
-    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-    const ws = new WebSocket(`${proto}://${location.host}/ws`);
+    // websocket live updates, with reconnect.
+    //
+    // The socket MUST be able to come back on its own. The server now re-checks the
+    // session on open sockets and closes any whose credential is stale (1008), which
+    // fires on the mandatory first-run password change: this effect opens /ws as soon
+    // as `authed` flips, which is before the mustChangePassword gate renders, so the
+    // token held by that socket is invalidated moments later. Without a reconnect the
+    // socket stays dead for the rest of the session and the file tree silently stops
+    // refreshing on external changes (git pull, Obsidian desktop, another device),
+    // with nothing in the UI to say why. That hits every new install.
+    //
+    // Backoff is capped and jittered so a server that is genuinely down does not get
+    // hammered by every open tab in lockstep.
     let treeTimer: number | undefined;
-    ws.onmessage = (ev) => {
-      try {
-        const msg = JSON.parse(ev.data);
-        if (msg.type === 'fs') {
-          // coalesce bursts of fs events into a single tree refresh
-          window.clearTimeout(treeTimer);
-          treeTimer = window.setTimeout(() => loadTree(), 800);
-        } else if (msg.type === 'uistate') {
-          // another tab/device changed the workspace → sync live
-          useStore.getState().applyRemoteState(msg.state, msg.originId);
+    let retryTimer: number | undefined;
+    let ws: WebSocket | null = null;
+    let closed = false;
+    let attempt = 0;
+
+    const connect = () => {
+      if (closed) return;
+      const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+      ws = new WebSocket(`${proto}://${location.host}/ws`);
+      ws.onopen = () => {
+        attempt = 0; // a clean open resets the backoff
+      };
+      ws.onmessage = (ev) => {
+        try {
+          const msg = JSON.parse(ev.data);
+          if (msg.type === 'fs') {
+            // coalesce bursts of fs events into a single tree refresh
+            window.clearTimeout(treeTimer);
+            treeTimer = window.setTimeout(() => loadTree(), 800);
+          } else if (msg.type === 'uistate') {
+            // another tab/device changed the workspace → sync live
+            useStore.getState().applyRemoteState(msg.state, msg.originId);
+          }
+        } catch {
+          /* ignore */
         }
-      } catch {
-        /* ignore */
-      }
+      };
+      ws.onclose = () => {
+        if (closed) return;
+        const backoff = Math.min(30000, 1000 * 2 ** Math.min(attempt++, 5));
+        retryTimer = window.setTimeout(connect, backoff + Math.random() * 1000);
+      };
+      // onerror is always followed by onclose, so reconnection is handled there.
+      ws.onerror = () => {};
     };
+    connect();
+
     return () => {
+      closed = true;
       window.clearTimeout(treeTimer);
-      ws.close();
+      window.clearTimeout(retryTimer);
+      ws?.close();
     };
   }, [authed, loadTree]);
 

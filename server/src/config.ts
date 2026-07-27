@@ -16,9 +16,36 @@ export interface RuntimeConfig {
    * honoured (and thus whether `req.ip`/`req.secure` derive from them). Defaults
    * to `true` (trust the immediate hop) so the common reverse-proxy deployment
    * keeps `X-Forwarded-Proto`-based `Secure` cookies working out of the box.
-   * This is NOT a rate-limit risk: the login limiter keys on the real TCP socket
-   * address, not `req.ip`, so F-03 (XFF spoofing) is closed regardless of this
-   * value. Set `TRUST_PROXY=false` for a directly-exposed instance with no proxy.
+   *
+   * This value also decides how the rate limiters key their buckets
+   * (`middleware/ratelimit.ts`), so it is worth setting accurately. The three
+   * forms are not interchangeable, because only one of them makes Express
+   * validate WHO the peer is:
+   *   - A subnet/preset list ('loopback', '10.0.0.0/8', the proxy's CIDR):
+   *     Express tests each hop's address and stops at the first one outside the
+   *     list, so `req.ip` is genuinely proxy-attested and the limiters use it
+   *     verbatim. This is the exact form and the one to prefer, and it is the
+   *     only form that resolves a multi-proxy chain correctly.
+   *   - A hop count >= 1: Express only counts hops, it never checks the peer's
+   *     address, so `req.ip` is whatever X-Forwarded-For says as soon as anyone
+   *     can reach the port directly. The limiters therefore key on the TCP
+   *     socket address under this form, exactly as they do for bare `true`.
+   *   - Bare `true` (the default) or `false`: `req.ip` would be the leftmost,
+   *     fully client-supplied XFF entry, so it is never used for throttling.
+   *     Both key on the TCP socket address.
+   * So the rule is two-valued: the subnet/preset list is the ONLY form that
+   * yields per-client throttling buckets, and every other form is safe but
+   * coarse. Behind a reverse proxy set `TRUST_PROXY=<proxy CIDR>` (or
+   * `loopback` when the proxy is on the same host) if you want per-client
+   * buckets. A hop count is NOT a shortcut to them: under `TRUST_PROXY=1` all
+   * clients arriving through the proxy share one bucket, because from the
+   * server's side that is a single socket address.
+   *
+   * Sharing a bucket is an availability tradeoff rather than a bypass, and it is
+   * deliberately the direction we fail. `routes/auth.ts` adds a second,
+   * identity-keyed failure limiter on top, which charges only failed attempts and
+   * is cleared by a success, so a shared network bucket cannot lock out an owner
+   * who knows their password. See middleware/ratelimit.ts, which owns both rules.
    */
   trustProxy: boolean | number | string;
 }
@@ -34,9 +61,17 @@ function resolveRoots(): string[] {
 /**
  * Parse the `TRUST_PROXY` env into an Express `trust proxy` value. Default is
  * `true` (trust the immediate hop) so the common reverse-proxy deployment keeps
- * `X-Forwarded-Proto`-based `Secure` cookies working without extra config; the
- * login rate limit is keyed on the TCP socket address so this is not an F-03
- * (XFF spoofing) risk. Accepts:
+ * `X-Forwarded-Proto`-based `Secure` cookies working without extra config.
+ *
+ * F-03 (bypassing the login limit by rotating X-Forwarded-For) is closed by the
+ * limiters' keying rule rather than by this default. They only believe `req.ip`
+ * when the value below is a subnet/preset list, which is the only form that
+ * makes Express check the peer's ADDRESS rather than merely count hops. For a
+ * hop count or a bare `true` they fall back to their own rule: the nearest
+ * hop's X-Forwarded-For entry when the TCP peer is on a non-routable network,
+ * and otherwise the unforgeable socket address. Every form is therefore safe
+ * against an attacker reaching the port from the internet, and every form
+ * except `false` still gives per-client buckets behind a real proxy. Accepts:
  *   - unset / 'true' / 'on'              → true (trust the immediate peer)
  *   - 'false' / 'off' / '0'             → false (no proxy → ignore X-Forwarded-*)
  *   - a non-negative integer             → number of trusted proxy hops

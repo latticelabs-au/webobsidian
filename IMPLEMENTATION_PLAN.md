@@ -4,7 +4,7 @@
 > Convention: `[ ]` not started · `[~]` in progress · `[x]` done.
 > Update this file **every time** an item changes state.
 
-Last updated: 2026-07-27 (security fix: the default password stayed valid after an override was configured; removed the `mustChangePassword` oracle from `/auth/status`)
+Last updated: 2026-07-27 (security hardening pass, three adversarial review rounds; docs re-synchronised against the frozen `middleware/ratelimit.ts` two-valued trust rule, `PUBLIC_ORIGIN` documented, `COOKIE_SECURE` documented)
 
 ---
 
@@ -22,7 +22,9 @@ Last updated: 2026-07-27 (security fix: the default password stayed valid after 
 
 ## Phase 2: Auth gate, FR-3
 - [x] M2.1 Hash password (scrypt), self-generated JWT secret
-- [x] M2.2 `POST /auth/setup`, `/auth/login`, `/auth/logout`, `GET /auth/me`
+- [x] M2.2 `/auth/login`, `/auth/logout`, `GET /auth/me` (`POST /auth/setup` shipped here originally and was
+  **removed** in the 2026-07-27 hardening pass: unauthenticated, it set the owner password and returned a session
+  cookie behind a guard that always returned `true`, so it was one edit away from remote account takeover)
 - [x] M2.3 Middleware auth guard (httpOnly cookie), route protection
 - [x] M2.4 First-run setup flow (UI + env seed `WEBOBSIDIAN_PASSWORD`)
 - [x] M2.5 Default password 123456 + change password (Settings→Account) + recovery override (`auth.passwordHash`/`WEBOBSIDIAN_PASSWORD`); migrate the old password → `userPasswordHash`
@@ -466,6 +468,132 @@ Last updated: 2026-07-27 (security fix: the default password stayed valid after 
       `desktop/release`.
 
 ### Progress log
+- 2026-07-27 (security hardening pass, three rounds of adversarial review over the whole request surface):
+  a full FIND / FIX / VERIFY sweep run three times, each round re-attacking the previous round's fixes. Recording
+  it as one entry because the rounds are not separable: several fixes were themselves defects that only the next
+  round caught, and the code is only trustworthy as the final state.
+  **Rate limiting, rewritten three times, and the reason the docs kept going stale.** `middleware/ratelimit.ts`
+  now ships two layers with one shared sliding-window store. Layer 1 is `createRateLimiter` (and the
+  `loginRateLimit` instance it builds), keyed by the exported `clientIp` through a module-level
+  `THROTTLE_KEY_SOURCE` resolved once from `config.trustProxy`. The rule is deliberately two-valued and fails
+  closed: a forwarded address is believed only when `trust proxy` is the subnet/preset list form, because that is
+  the only form where proxy-addr tests each hop's *address* rather than counting hops, so a directly connected
+  attacker truncates the list at index 0 and no header it sends survives. Bare `true` (the shipped default),
+  `false`, and **any hop count** all key on the TCP socket address. A list containing a `/0` prefix is demoted to
+  socket keying, because that is bare `true` wearing a subnet costume. Round 1 shipped "hop count >= 1 implies
+  `req.ip`", which reopened F-03 on the very configuration its own comment recommended; round 2 replaced that with
+  "a private TCP peer may speak for its client", which is false for any layer-4 forwarder or SNAT hop and handed
+  free bucket minting to Docker Desktop's port proxy, `ssh -R`, `kubectl port-forward` and any LAN-adjacent
+  attacker, with no operator misconfiguration required. Both heuristics are gone. Layer 2 is
+  `createFailureLimiter`, keyed on the caller's identity and charging only failures with a success clearing the
+  counter, which is the designed remedy for Layer 1's shared bucket; it is **built but has no call site yet**, so
+  `/auth/login` is still Layer 1 only and a shared bucket really can lock the owner out for the remainder of a
+  window. Store hardening in the same file: `boundKey` caps a key at 128 characters by keeping a 63-character
+  prefix and appending a SHA-256 of the *full* key, so a caller-supplied key (`routes/shares.ts` keys its unlock
+  limiter on client plus the unvalidated `:id` path segment) cannot park megabytes in the map and cannot be made
+  to collide; `sweep()` orders eviction by live hit count first and `lastSeen` second, because ordering by
+  recency alone let an attacker exhaust a budget, flood the store with junk keys and return to a clean bucket;
+  `EVICT_DOWN_TO_KEYS = 9_000` gives the size trigger hysteresis, since evicting to exactly the cap made every
+  request past it rebuild and sort a 10,000-entry array on a single-process server; `validateWindow` throws
+  rather than clamps, because `max: -1` silently locks a surface out and `windowMs: NaN` silently disables the
+  limiter while still looking installed.
+  **Auth.** `services/auth.ts` gained `credentialFingerprint()` and a `cv` claim checked by `verifyToken`, so a
+  password change now evicts every other session (`routes/auth.ts` re-issues the caller's cookie so the user who
+  just secured the account is not logged out); `authenticatePassword()` returns a `CredentialKind` and
+  `auditCredentialUse()` logs recovery-override use, kind only, never the value; scrypt moved to
+  `scrypt$N=131072,r=8,p=1$<salt>$<hash>` with a 2-slot semaphore, because the unauthenticated share-unlock path
+  calls `verifyPassword` directly and a 128 MiB working set without a cap is a memory-exhaustion amplifier. New
+  `services/password-policy.ts` exports `isDefaultPasswordActive()`, so "is `123456` accepted" and "must the user
+  change it" derive from one predicate; `POST /auth/setup` was deleted outright as an account-takeover primitive
+  and `GET /auth/status` now returns only `{ passwordSet }`, since `mustChangePassword` on an unauthenticated
+  route let a port scan enumerate instances still accepting the default.
+  **Vault and settings.** `services/vault.ts` canonicalises through `fs.realpath.native` (the JS resolver only
+  follows symlinks, so junctions and 8.3 short names survived it) and runs `assertSegmentsAllowed` twice, on the
+  requested spelling and on the canonical path; `resolveForMutation` rejects the vault root itself, which is what
+  made `DELETE /api/files?path=.` delete the whole vault; temp files moved inside the target directory with a
+  random suffix. `services/settings.ts` gained `withSettingsLock` (mirroring `withGitLock`), an in-flight memo on
+  `loadSettingsImpl` that stops two cold callers generating two `jwtSecret`s, `CURRENT_SETTINGS_VERSION = 2` with
+  the migration gated on the raw JSON via `isPreUserPasswordFile`, `vaultRootPath`/`vaultRelativePath` healing
+  rather than throwing (a throwing refinement would make `loadSettings` rewrite from defaults and destroy the
+  stored secrets), and `isWithinRoot` fixing a containment test that was wrong at a drive root.
+  `routes/settings.ts` no longer accepts `vault.allowedRoots` from the request at all. New
+  `services/apikey-usage.ts` moved last-used telemetry out of `settings.json`, so `authenticateKey` stops writing
+  the settings file on every authenticated request.
+  **Public surface.** `services/rendercanvas.ts` gates inlined note bodies **and** `canvasEmbedTargets` on
+  `isPubliclyShared()`, so a shared canvas can no longer render arbitrary vault notes or serve their attachments
+  to anonymous visitors; `safeLinkUrl` and `SAFE_COLOR_RE` close `javascript:` hrefs and CSS injection through a
+  node colour; `parseCanvas` normalises the JSON once so a hand-crafted `.canvas` cannot 500 the page.
+  `routes/shares.ts` added `unlockRateLimit`, a minimum and maximum share-password length, `Secure` on the unlock
+  cookie and `noStore()` on every share response.
+  **Transport and errors.** `server/src/index.ts` replaced fail-open dev CORS with an explicit `DEV_CORS_ORIGIN`
+  opt-in and added `originAllowedForUpgrade()` for `/ws`, an evidence-tiered check whose tiers are `PUBLIC_ORIGIN`
+  (exact allowlist, new env), then proxy-attested `X-Forwarded-Host`/`-Proto`/`-Port`, then direct TLS, then two
+  named and logged fail-open branches for proxies that rewrite the authority. `middleware/error.ts` suppresses
+  5xx detail behind an `errorId` using `isOperationalError()` (a disqualifier list, so a throw site needs no
+  cooperation) and runs `sanitiseForClient()` on every status to strip absolute paths and URL credentials.
+  **Documentation, this round.** The three previous doc passes each described a `ratelimit.ts` that had been
+  replaced after they were written, and round 2's advice was judged net-harmful: it pushed operators off the
+  default onto `TRUST_PROXY=172.16.0.0/12` as "the safest way to get per-client throttling", when a `/12` broad
+  enough to cover the LAN behind the proxy makes those clients' own `X-Forwarded-For` believed and hands each of
+  them a fresh bucket per request. Corrected in `PRD.md` (NFR Security, FR-9, and the `settings.json` model,
+  which still showed `"version": 1`, omitted `vault.attachmentDir`, and still said an empty `userPasswordHash`
+  means `123456` is live), `SECURITY.md`, `.env.example`, `docker-compose.yml`, `README.md` and the superseded
+  F-03 entry below. Every one of them now states: a hop count buys nothing for the limiters; the default is safe
+  and its cost is a shared bucket that expires on its own; the subnet form is a refinement with a precondition,
+  not a recommendation. `PUBLIC_ORIGIN` and `COOKIE_SECURE`, both read by the server and previously in no
+  document at all, are now in `.env.example` and the README env tables.
+  **Verified:** the trust rule, the two-layer split and the absence of any `createFailureLimiter` call site were
+  read out of the frozen `middleware/ratelimit.ts` and confirmed by grepping every importer of
+  `../middleware/ratelimit.js` (`routes/auth.ts` takes `loginRateLimit` only, `middleware/apikey.ts` and
+  `routes/shares.ts` take `createRateLimiter`); the `/ws` tiering was read out of `originAllowedForUpgrade` and
+  `expectedDeploymentAuthority` in `index.ts` rather than from the previous README prose, which wrongly claimed
+  nginx's default `Host $proxy_host` rejects every upgrade when the code allows it with a throttled warning; the
+  cookie claim was read out of `cookieOpts` in `routes/auth.ts`. The two settings-model corrections were checked
+  against `CURRENT_SETTINGS_VERSION` and the `attachmentDir` field in `services/settings.ts`. All six files scan
+  clean for U+2014 (one pre-existing em dash in `.env.example` was removed). **`npm run typecheck && npm run
+  build` has not been run for this pass and remains the outstanding mechanical gate**, and the two behavioural
+  acceptance criteria (a shared bucket must not be forgeable, an unreachable dependency must leave the process
+  alive and reporting unhealthy) still need a live run rather than a green typecheck.
+- 2026-07-27 (docs: the security documentation promised a property the code no longer delivers, plus the
+  operator guidance that the rate-limit fix depends on): the hardening pass changed how the rate limiters
+  identify a client, and five documents were left asserting the previous invariant, "keyed on the real TCP
+  socket address ... regardless of the `trust proxy` configuration". That claim is now false for two of the
+  four `TRUST_PROXY` forms. A security document that promises a property the code does not deliver is its own
+  defect: it is the sentence an operator reads instead of thinking about their topology, so it actively
+  discourages the configuration that would make the guarantee true.
+  **Corrected in 5 places**, all describing the same rule from `middleware/ratelimit.ts`
+  (`TRUST_PROXY_IDENTIFIES_CLIENT`) rather than restating a summary of it: `PRD.md` (the NFR Security bullet
+  and the FR-9 `TRUST_PROXY` description), this file (the F-03 entry now carries a "superseded" paragraph
+  instead of silently contradicting the code), `SECURITY.md`, `.env.example` and `docker-compose.yml`.
+  Care was taken not to overstate in the other direction either: the shipped default is still unconditionally
+  safe against XFF rotation, and that is said plainly.
+  **The operationally important half:** the fix is **inert under the default configuration**. `TRUST_PROXY`
+  unset resolves to bare `true`, which keys on the socket address, which behind a reverse proxy is one shared
+  bucket for every visitor: "10 login attempts per 15 minutes" is an instance-wide budget and any stranger's
+  failures lock the owner out. The engine cannot guess a hop count (guessing "there is probably one proxy" is
+  exactly the assumption a spoofed `X-Forwarded-For` exploits), so closing the finding in practice is a
+  documentation job. `.env.example`, `SECURITY.md`, `docker-compose.yml` and `README.md` now tell operators to
+  set `TRUST_PROXY` to the proxy's subnet, or to a hop count **together with** `HTTP_BIND=127.0.0.1`, and say
+  why each form is or is not self-validating (a subnet list rejects a direct connection from outside it; a hop
+  count only counts hops and never checks the peer).
+  **Same pass, other stale docs found while checking** (repo rule 1/4: the docs are the source of truth):
+  `PRD.md` still listed `POST /auth/setup` in the API surface and this file still counted it as shipped under
+  M2.2, though the route was deleted as an account-takeover primitive; `PRD.md`'s data model still documented
+  the 3-field `scrypt$<salt>$<hash>` string, but hashes are now written as
+  `scrypt$N=131072,r=8,p=1$<salt>$<hash>` (parameters stored in the string so the cost can be raised again,
+  legacy hashes still verifiable, `userPasswordHash` upgraded opportunistically on login while the hand-edited
+  `passwordHash` deliberately is not); and `PRD.md` still said an empty `userPasswordHash` means `123456` is in
+  use, which stopped being true when configuring an override started retiring the default. `README.md` gained
+  a real nginx location block, because it told operators to put nginx in front of `127.0.0.1:8787` while
+  nginx's default `Host $proxy_host` makes the WebSocket origin check reject every upgrade, and that failure is
+  silent on both ends (no server log, no client `onerror`): live updates simply stop.
+  **Documentation only**, no source file touched in this entry, so there is nothing here to verify at runtime;
+  the code claims above were read out of `middleware/ratelimit.ts`, `config.ts`, `routes/auth.ts` and
+  `services/auth.ts` rather than taken from the previous docs.
+  **Superseded by the entry at the top of this log.** This pass wrote its prose against a revision of
+  `middleware/ratelimit.ts` that was replaced later the same day, so every claim below about a hop count giving
+  per-client buckets, and every reference to the identifier `TRUST_PROXY_IDENTIFIES_CLIENT`, describes code that
+  no longer exists. Kept for the record of how the drift happened, not as a description of behaviour.
 - 2026-07-27 (security fix: default password `123456` still accepted after an override was configured):
   `checkPassword()` (server/src/services/auth.ts) only skipped the default-password branch when
   `auth.userPasswordHash` was set. Configuring `WEBOBSIDIAN_PASSWORD` or a hand-edited `auth.passwordHash`
@@ -544,6 +672,23 @@ Last updated: 2026-07-27 (security fix: the default password stayed valid after 
   `false`, which avoids inconveniencing the majority who run behind a reverse proxy (they would lose the
   cookie's `Secure` flag and need extra configuration). `TRUST_PROXY` can still be configured down to
   `false`/a hop count/subnets when needed.
+  **Superseded 2026-07-27, read this before quoting the paragraphs above.** "Keyed on the TCP socket address
+  regardless of `trust proxy`" was true when it was written and is **no longer the whole rule**. Keying
+  unconditionally on the socket address turned out to have its own cost, and it is the one every proxied
+  deployment pays: behind a reverse proxy all clients share the proxy's address, so 10 failed logins from any
+  stranger lock the owner out for 15 minutes, instance-wide. `middleware/ratelimit.ts` now decides once at module
+  load (`THROTTLE_KEY_SOURCE`, consumed by the exported `clientIp`) and the rule is two-valued: a forwarded
+  address is believed **only** when `config.trustProxy` is the subnet/preset list form, because that is the only
+  form where proxy-addr tests each hop's *address* and therefore validates itself; every other form, bare `true`
+  (the default), `false`, and **any hop count**, keys on the TCP socket address. Two earlier revisions tried to do
+  better and both reopened F-03: the first treated "hop count >= 1" as equivalent to the subnet form, the second
+  believed the rightmost `X-Forwarded-For` entry whenever the TCP peer was private, which is false for any
+  layer-4 forwarder or SNAT hop and made Docker Desktop's port proxy, `ssh -R` and `kubectl port-forward` into
+  free bucket minting under the shipped default. So a hop count is **not** the "declare a trust boundary" escape
+  hatch this paragraph used to describe, and pairing `TRUST_PROXY=1` with `HTTP_BIND=127.0.0.1` buys nothing for
+  the limiters. Documented in `PRD.md` (NFR Security, FR-9), `SECURITY.md`, `.env.example`, `docker-compose.yml`
+  and `README.md`; the authoritative statement lives in the `ThrottleKeySource` docblock in
+  `middleware/ratelimit.ts`.
 - 2026-06-23 (fix: internal links to `.canvas` files): clicking a wikilink pointing at `Foo.canvas` navigated to
   a brand new markdown note `Foo.canvas.md`. Cause: the link graph (`keyToPath`) only indexes markdown files, so
   `/api/.../resolve` returned `null` for a target ending in `.canvas` → the client fell into the create-note
