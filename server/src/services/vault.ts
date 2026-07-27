@@ -8,8 +8,8 @@ export interface TreeNode {
   type: 'file' | 'folder';
   ext?: string;
   size?: number;
-  mtime?: number; // last-modified (ms) — for sort-by-modified-time
-  ctime?: number; // created/birth (ms) — for sort-by-created-time
+  mtime?: number; // last-modified (ms): for sort-by-modified-time
+  ctime?: number; // created/birth (ms): for sort-by-created-time
   children?: TreeNode[];
 }
 
@@ -33,7 +33,7 @@ async function fileStat(abs: string, rel: string): Promise<{ m: number; c: numbe
     const st = await fs.stat(abs);
     // birthtime can be 0 on some Linux filesystems → fall back to mtime.
     v = { m: st.mtimeMs, c: st.birthtimeMs || st.mtimeMs };
-  } catch { /* file vanished mid-walk — leave zeros */ }
+  } catch { /* file vanished mid-walk: leave zeros */ }
   statCache.set(rel, v);
   return v;
 }
@@ -82,9 +82,9 @@ async function assertRealpathInVault(abs: string, root: string): Promise<void> {
       }
       return; // deepest existing ancestor is inside the vault; the rest is new
     } catch (e: any) {
-      if (e?.status === 400) throw e; // our own escape error — propagate
+      if (e?.status === 400) throw e; // our own escape error: propagate
       const parent = path.dirname(probe);
-      if (parent === probe) return; // reached fs root without resolving — nothing to verify
+      if (parent === probe) return; // reached fs root without resolving: nothing to verify
       probe = parent;
     }
   }
@@ -188,7 +188,7 @@ export async function resolveDirCaseInsensitive(rel: string): Promise<string> {
       const ci = exact ?? entries.find((e) => e.isDirectory() && e.name.toLowerCase() === seg.toLowerCase());
       if (ci) actual = ci.name;
     } catch {
-      /* directory doesn't exist yet — keep the requested casing */
+      /* directory doesn't exist yet: keep the requested casing */
     }
     out.push(actual);
     curAbs = path.join(curAbs, actual);
@@ -405,7 +405,7 @@ export async function listMarkdownFiles(): Promise<string[]> {
     }
     for (const e of entries) {
       // Skip dotfiles/dot-dirs (`.trash`, `.obsidian`, …) like the tree view and
-      // file index do — a note moved to `.trash` must not stay a live link target
+      // file index do: a note moved to `.trash` must not stay a live link target
       // (and would otherwise shadow a real file with the same basename).
       if (IGNORED.has(e.name) || e.name.startsWith('.')) continue;
       const abs = path.join(dir, e.name);

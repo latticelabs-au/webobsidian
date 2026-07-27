@@ -4,9 +4,9 @@ import { prepareQuery, fuzzySearch, fuzzySearchPath, type FuzzyMatch } from './f
 
 /**
  * Editor suggesters (docs §9):
- *  - `[[` link suggester — trigger when lastIndexOf("[[") > lastIndexOf("]") on the
+ *  - `[[` link suggester: trigger when lastIndexOf("[[") > lastIndexOf("]") on the
  *    line text up to the cursor; `![[` works the same. Stops in display-text mode (`|`).
- *  - `#` tag suggester — trigger on /(^|\s)#…$/ before the cursor.
+ *  - `#` tag suggester: trigger on /(^|\s)#…$/ before the cursor.
  * Ranking uses the exact Obsidian fuzzy score (lib/fuzzy.ts). Max 20 items.
  */
 
@@ -19,7 +19,7 @@ export function setTagSuggestTags(fn: () => string[]) {
   vaultTags = fn;
 }
 
-// Tag body charset (§7) — editor flavour additionally requires a letter.
+// Tag body charset (§7): editor flavour additionally requires a letter.
 const TAG_TAIL_RE = /(^|\s)#([^ -⁯⸀-⹿'!"#$%&()*+,.:;<=>?@^`{|}~[\]\\\s]*)$/;
 
 interface Item {

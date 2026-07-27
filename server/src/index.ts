@@ -36,7 +36,7 @@ import { startAutoSync } from './services/autosync.js';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // Keep the local server alive on stray async errors (e.g. a deferred library task
-// throwing) instead of crashing the whole process — log loudly so bugs aren't hidden.
+// throwing) instead of crashing the whole process: log loudly so bugs aren't hidden.
 process.on('uncaughtException', (err) => {
   console.error('[uncaughtException]', err);
 });
@@ -60,7 +60,7 @@ async function main() {
   app.use(express.json({ limit: '32mb' }));
   app.use(cookieParser());
 
-  // Per-request CSP nonce — used by the SSR share page's inline <script>.
+  // Per-request CSP nonce: used by the SSR share page's inline <script>.
   app.use((_req, res, next) => {
     res.locals.cspNonce = randomBytes(16).toString('base64');
     next();
@@ -69,7 +69,7 @@ async function main() {
   // (it would break plain-HTTP self-hosting). `script-src` is 'self' + per-request
   // nonce; `style-src` allows inline styles (React inline styles + the SSR page's
   // <style>). Note: inline <script> inside ```html render-blocks won't execute under
-  // this policy — acceptable for the marginal XSS hardening it buys.
+  // this policy, acceptable for the marginal XSS hardening it buys.
   app.use(
     helmet({
       contentSecurityPolicy: {
@@ -99,7 +99,7 @@ async function main() {
     app.use(cors({ origin: 'http://localhost:5173', credentials: true }));
   }
 
-  // Health (no auth) — for docker healthcheck
+  // Health (no auth): for docker healthcheck
   app.get('/healthz', (_req, res) => res.json({ ok: true }));
 
   // Routes. NOTE: specific /api/* routers must be registered BEFORE the broad
@@ -214,7 +214,7 @@ async function setupWatcher() {
 
 function startWatcher(root: string, usePolling: boolean) {
   const watcher = chokidar.watch(root, {
-    // Ignore VCS/dep/trash dirs AND `.obsidian` — the desktop Obsidian app
+    // Ignore VCS/dep/trash dirs AND `.obsidian`: the desktop Obsidian app
     // rewrites its workspace/state files constantly, which otherwise floods the
     // server with events (→ broadcasts → full tree refetches) and pins the CPU.
     ignored: (p) => /(^|[/\\])(\.git|\.obsidian|node_modules|\.trash)([/\\]|$)/.test(p),
@@ -255,7 +255,7 @@ function startWatcher(root: string, usePolling: boolean) {
     // Drop the cached mtime/ctime so the next listTree re-stats just this file.
     invalidateStat(rel);
     if (/\.(md|markdown)$/i.test(rel)) {
-      // Update only the changed file in the search + link indexes (O(1)) — a full
+      // Update only the changed file in the search + link indexes (O(1)): a full
       // buildLinkGraph() re-reads every note in the vault and was the main CPU sink
       // when Obsidian touched files in the background.
       if (type === 'unlink') {

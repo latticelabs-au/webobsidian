@@ -61,7 +61,7 @@ async function req<T>(url: string, opts: RequestInit = {}): Promise<T> {
   const res = await fetch(url, {
     credentials: 'include',
     ...rest,
-    // headers MUST be merged last — spreading ...opts after a `headers` literal
+    // headers MUST be merged last: spreading ...opts after a `headers` literal
     // would drop Content-Type whenever a caller passes its own headers.
     headers: { 'Content-Type': 'application/json', ...(optHeaders ?? {}) },
   });
@@ -224,7 +224,7 @@ export const api = {
   // password = null clears the share's password
   setSharePassword: (id: string, password: string | null) =>
     req<{ share: ShareRecord }>(`/api/shares/${id}`, { method: 'PATCH', body: JSON.stringify({ password }) }),
-  // NOTE: the public-facing /share/<id> page is fully server-rendered (SSR) —
+  // NOTE: the public-facing /share/<id> page is fully server-rendered (SSR):
   // the SPA never fetches /public/shares/* itself.
 
   // plugins

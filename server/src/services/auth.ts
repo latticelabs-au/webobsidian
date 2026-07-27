@@ -7,11 +7,11 @@ import { config } from '../config.js';
 const scryptAsync = promisify(scrypt);
 const KEYLEN = 64;
 
-/** Mật khẩu mặc định khi cài đặt — dùng được ngay, không cần bước setup. */
+/** Default password at install time: usable right away, with no setup step. */
 export const DEFAULT_PASSWORD = '123456';
 export const MIN_PASSWORD_LEN = 6;
 
-/** So sánh chuỗi an toàn về timing (cho override pass dạng plaintext). */
+/** Timing-safe string comparison (for the plaintext override password). */
 function safeEqualStr(a: string, b: string): boolean {
   const ab = Buffer.from(a);
   const bb = Buffer.from(b);
@@ -35,20 +35,20 @@ export async function verifyPassword(password: string, stored: string): Promise<
 }
 
 /**
- * Luôn true: hệ thống luôn có mật khẩu đăng nhập hiệu dụng (tối thiểu là mặc
- * định 123456). Giữ lại cho `/auth/status` và endpoint setup legacy.
+ * Always true: the system always has an effective login password (at minimum the
+ * default 123456). Kept around for `/auth/status` and the legacy setup endpoint.
  */
 export async function isPasswordSet(): Promise<boolean> {
   return true;
 }
 
-/** Đã đổi pass khỏi mặc định chưa? */
+/** Has the password been changed away from the default yet? */
 export async function hasCustomPassword(): Promise<boolean> {
   const s = await getSettings();
   return Boolean(s.auth.userPasswordHash);
 }
 
-/** Lưu mật khẩu người dùng mới (ghi đè pass mặc định/pass cũ). */
+/** Store a new user password (overwrites the default password / the previous one). */
 export async function setUserPassword(password: string): Promise<void> {
   if (password.length < MIN_PASSWORD_LEN) {
     throw new Error(`Password must be at least ${MIN_PASSWORD_LEN} characters`);
@@ -60,29 +60,29 @@ export async function setUserPassword(password: string): Promise<void> {
 }
 
 /**
- * Kiểm tra mật khẩu đăng nhập. Chấp nhận:
- *  1) Mật khẩu người dùng (userPasswordHash), hoặc mặc định 123456 nếu chưa đổi.
- *  2) Mật khẩu override để khôi phục: auth.passwordHash (hash, sửa tay) hoặc
- *     env WEBOBSIDIAN_PASSWORD (plaintext) — luôn được chấp nhận.
+ * Check a login password. Accepts:
+ *  1) The user password (userPasswordHash), or the default 123456 if never changed.
+ *  2) A recovery override password: auth.passwordHash (a hash, edited in by hand)
+ *     or the WEBOBSIDIAN_PASSWORD env var (plaintext). Both are always accepted.
  */
 export async function checkPassword(password: string): Promise<boolean> {
   const s = await getSettings();
 
-  // (1) Mật khẩu đăng nhập hiệu dụng.
+  // (1) The effective login password.
   if (s.auth.userPasswordHash) {
     if (await verifyPassword(password, s.auth.userPasswordHash)) return true;
   } else if (safeEqualStr(password, DEFAULT_PASSWORD)) {
     return true;
   }
 
-  // (2) Mật khẩu override (recovery) — luôn kiểm tra, kể cả khi đã đổi pass.
+  // (2) Override (recovery) password: always checked, even after a password change.
   if (s.auth.passwordHash && (await verifyPassword(password, s.auth.passwordHash))) return true;
   if (config.initialPassword && safeEqualStr(password, config.initialPassword)) return true;
 
   return false;
 }
 
-/** Đổi mật khẩu: xác minh pass hiện tại rồi lưu pass mới. */
+/** Change the password: verify the current one, then store the new one. */
 export async function changePassword(current: string, next: string): Promise<void> {
   if (!(await checkPassword(current))) throw new Error('Current password is incorrect');
   await setUserPassword(next);
@@ -99,10 +99,11 @@ export async function issueToken(): Promise<string> {
 }
 
 /**
- * Xác minh token phiên CHỦ SỞ HỮU. Ngoài chữ ký hợp lệ, token bắt buộc phải có
- * `sub === 'owner'` và dùng đúng thuật toán HS256. Điều này ngăn các token khác
- * cũng ký bằng cùng `jwtSecret` (ví dụ unlock-cookie của share công khai, mang
- * `sub: 'share'`) bị tái sử dụng như một phiên owner đầy đủ.
+ * Verify an OWNER session token. Beyond a valid signature, the token is required
+ * to carry `sub === 'owner'` and to use exactly the HS256 algorithm. That stops
+ * other tokens signed with the same `jwtSecret` (for example a public share's
+ * unlock cookie, which carries `sub: 'share'`) from being replayed as a full
+ * owner session.
  */
 export async function verifyToken(token: string): Promise<boolean> {
   try {

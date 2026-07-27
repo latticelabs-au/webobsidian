@@ -13,7 +13,7 @@ function entryIcon(n: TreeNode): string {
 }
 
 /**
- * Folder content view — shown when the active path is a folder (e.g. deep-link
+ * Folder content view: shown when the active path is a folder (e.g. deep-link
  * /note/<folder>). Lists the notes/sub-folders inside instead of opening the
  * folder as an empty note.
  */

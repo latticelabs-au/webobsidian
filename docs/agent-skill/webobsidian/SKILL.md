@@ -71,8 +71,8 @@ for queries; encode `/`-containing paths in the URL path, e.g. `Notes/Ideas.md` 
 | GET | `/api/v1/health` | – | Liveness check |
 | GET | `/api/v1/notes?offset=&limit=` | read | List markdown notes (paginated) |
 | GET | `/api/v1/notes/{path}` | read | Read a note + parsed metadata |
-| PUT | `/api/v1/notes/{path}` | write | Create / overwrite a note — body `{"content":"..."}` |
-| PATCH | `/api/v1/notes/{path}` | write | Append — body `{"append":"..."}` |
+| PUT | `/api/v1/notes/{path}` | write | Create / overwrite a note: body `{"content":"..."}` |
+| PATCH | `/api/v1/notes/{path}` | write | Append: body `{"append":"..."}` |
 | DELETE | `/api/v1/notes/{path}` | write | Move note to trash |
 | GET | `/api/v1/search?q=&limit=` | search | QMD search (fielded: `tag:`, `path:`, `title:`) |
 | GET | `/api/v1/backlinks?path=` | read | Notes linking to a path |
@@ -125,7 +125,7 @@ curl -s -H "X-API-Key: $KEY" "$BASE/api/v1/tags"
 
 ## Obsidian Flavored Markdown (write notes in this dialect)
 
-The vault is a real Obsidian vault — the user also opens these files in the Obsidian app,
+The vault is a real Obsidian vault: the user also opens these files in the Obsidian app,
 so write **Obsidian Flavored Markdown**, not plain Markdown. Use `[[wikilinks]]` for links
 between vault notes (Obsidian tracks renames); use `[text](url)` **only** for external URLs.
 
@@ -217,7 +217,7 @@ graph TD
 - **Read before you overwrite** an existing note unless the user explicitly wants a fresh
   replace; preserve its frontmatter and formatting.
 - Paths are **case-sensitive** and notes must include the `.md` extension.
-- When you reference another note, link it (`[[Other Note]]`) instead of writing a bare name —
+- When you reference another note, link it (`[[Other Note]]`) instead of writing a bare name:
   it keeps the graph and backlinks intact.
 
 ## Troubleshooting

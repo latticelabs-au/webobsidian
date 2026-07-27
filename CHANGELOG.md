@@ -20,17 +20,17 @@ changes. The format is loosely based on [Keep a Changelog](https://keepachangelo
 
 ## Highlights by PRD revision
 
-- **0.9** — File tree Copy/Cut/Paste; recursive copy endpoint.
-- **0.8** — ⋯ menu parity with Obsidian Desktop; per-file Git version history (FR-4).
-- **0.7** — Per-note **Share dialog** (create/copy/toggle/password/delete) + globe badge.
-- **0.6** — Deploy hardening for self-hosting: all deploy params via `.env`, watcher polling
+- **0.9**: File tree Copy/Cut/Paste; recursive copy endpoint.
+- **0.8**: ⋯ menu parity with Obsidian Desktop; per-file Git version history (FR-4).
+- **0.7**: Per-note **Share dialog** (create/copy/toggle/password/delete) + globe badge.
+- **0.6**: Deploy hardening for self-hosting: all deploy params via `.env`, watcher polling
   fallback on inotify limits, longer healthcheck `start_period` (FR-9).
-- **0.5** — Graph node search with smooth fly-to and highlighting (FR-2).
-- **0.4** — Mobile / responsive UI: drawer sidebars, edge-swipe, on-keyboard formatting
+- **0.5**: Graph node search with smooth fly-to and highlighting (FR-2).
+- **0.4**: Mobile / responsive UI: drawer sidebars, edge-swipe, on-keyboard formatting
   toolbar, touch targets, safe-area insets (FR-11).
-- **0.3** — Per-pane ⋯ menu (split, bookmark, rename/move, etc.) and a redesigned right
+- **0.3**: Per-pane ⋯ menu (split, bookmark, rename/move, etc.) and a redesigned right
   sidebar tab strip (Backlinks incl. unlinked mentions · Outgoing links · Tags · Outline).
-- **0.2** — Deep-link URLs (`/note/...`), public read-only share links with central
+- **0.2**: Deep-link URLs (`/note/...`), public read-only share links with central
   management, server-side rendering for SEO (FR-10).
 
 ## Core (v1 baseline)

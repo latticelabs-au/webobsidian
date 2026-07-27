@@ -1,8 +1,8 @@
 // Static HTML render of a JSON Canvas (.canvas) for the public share page
 // (FR-10 share + FR-12 canvas). Ports the pure geometry from
 // web/src/lib/canvas.ts (kept in sync by hand) and lays the nodes out absolutely,
-// drawing edges as SVG Béziers — non-interactive, but crawler-friendly and a
-// faithful snapshot. Text/embedded-note bodies reuse the markdown renderer.
+// drawing edges as SVG Béziers (non-interactive, but crawler-friendly and a
+// faithful snapshot). Text/embedded-note bodies reuse the markdown renderer.
 import { renderNoteHtml, escapeHtml } from './renderhtml.js';
 import * as vault from './vault.js';
 
@@ -37,7 +37,7 @@ function resolveColor(c?: string): string | null {
 }
 
 /** Coerce a JSON-supplied geometry field to a finite number. Untrusted `.canvas`
- *  files (imported/downloaded then shared) may carry strings here — leaving them
+ *  files (imported/downloaded then shared) may carry strings here: leaving them
  *  unescaped in `style="left:${x}px"` is an attribute-injection vector. */
 function num(v: unknown, fallback = 0): number {
   const n = typeof v === 'number' ? v : Number(v);
@@ -221,7 +221,7 @@ export function canvasDescription(raw: string, max = 160): string {
 }
 
 /** Vault paths a canvas references (image file-nodes + images embedded in its
- *  markdown file-nodes) — the allowlist for the public file endpoint. */
+ *  markdown file-nodes): the allowlist for the public file endpoint. */
 export async function canvasEmbedTargets(raw: string): Promise<string[]> {
   let data: { nodes?: CNode[] };
   try { data = JSON.parse(raw); } catch { return []; }

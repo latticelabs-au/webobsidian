@@ -1,5 +1,5 @@
 /**
- * Fuzzy search — port of Obsidian's prepareQuery/fuzzySearch behaviour
+ * Fuzzy search: port of Obsidian's prepareQuery/fuzzySearch behaviour
  * (docs/obsidian-desktop-internals.md §9) so suggester ranking matches.
  *
  * Score: 0 is perfect, more negative is worse:
@@ -82,7 +82,7 @@ export function fuzzySearch(pq: PreparedQuery, target: string): FuzzyMatch | nul
   if (!pq.query) return { score: 0, matches: [] };
   const lower = target.toLowerCase();
 
-  // (1) token pass — each token via indexOf, starting after the previous match
+  // (1) token pass: each token via indexOf, starting after the previous match
   if (pq.tokens.length) {
     const ranges: [number, number][] = [];
     let midWord = 0;
@@ -103,7 +103,7 @@ export function fuzzySearch(pq: PreparedQuery, target: string): FuzzyMatch | nul
     if (ok && ranges.length) return { score: scoreOf(ranges, midWord, qLen, target.length), matches: ranges };
   }
 
-  // (2) per-char fuzzy pass — chars in order; mid-word only if adjacent to previous
+  // (2) per-char fuzzy pass: chars in order; mid-word only if adjacent to previous
   const ranges: [number, number][] = [];
   let midWord = 0;
   let pos = 0;

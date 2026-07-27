@@ -1,7 +1,7 @@
 /**
  * Strip credentials embedded in URLs (e.g. a Git PAT baked into an authenticated
  * remote `https://<token>@github.com/...`). Git error messages echo the full
- * command — including that URL — so any error we surface to the client or write
+ * command (including that URL), so any error we surface to the client or write
  * to the logs would otherwise leak the token. Apply this to every git error
  * before it leaves the process.
  */

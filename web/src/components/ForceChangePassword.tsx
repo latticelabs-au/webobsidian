@@ -9,7 +9,7 @@ const DEFAULT_PASSWORD = '123456';
 /**
  * Blocking screen shown right after login when the account is still on the
  * default password (server reports `mustChangePassword`). The vault can't be
- * used until a custom password is set — there is no dismiss.
+ * used until a custom password is set: there is no dismiss.
  */
 export default function ForceChangePassword() {
   const setMustChangePassword = useStore((s) => s.setMustChangePassword);

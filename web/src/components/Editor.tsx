@@ -306,7 +306,7 @@ export default function Editor() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activePath]);
 
-  // Sync the editor doc when `content` changes from OUTSIDE the editor — e.g. the
+  // Sync the editor doc when `content` changes from OUTSIDE the editor, e.g. the
   // active note's content arrives asynchronously after reload/hydrate, or is
   // pushed by cross-tab sync. (User typing changes content too, but then the doc
   // already equals content, so this is a no-op.)

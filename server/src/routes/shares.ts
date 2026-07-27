@@ -19,13 +19,13 @@ const isMd = (p: string) => /\.(md|markdown)$/i.test(p);
 const isCanvas = (p: string) => /\.canvas$/i.test(p);
 const isShareable = (p: string) => isMd(p) || isCanvas(p);
 
-/** Never send the password hash to the client — expose `hasPassword` only. */
+/** Never send the password hash to the client: expose `hasPassword` only. */
 function redact(rec: ShareRecord) {
   const { passwordHash, ...rest } = rec;
   return { ...rest, hasPassword: Boolean(passwordHash) };
 }
 
-/** ---- Management API (session auth) — /api/shares ------------------------- */
+/** ---- Management API (session auth): /api/shares ------------------------- */
 
 export const sharesRouter = Router();
 sharesRouter.use(requireAuth);
@@ -94,10 +94,10 @@ sharesRouter.delete(
   }),
 );
 
-/** ---- Public API (NO auth) — /public/shares ------------------------------- */
+/** ---- Public API (NO auth): /public/shares ------------------------------- */
 
 /**
- * Files the shared note embeds (`![[target]]` and `![](relative-url)`) — the
+ * Files the shared note embeds (`![[target]]` and `![](relative-url)`): the
  * only paths the public file endpoint is allowed to serve. Mirrors the
  * client-side markdown preprocessing in web/src/lib/markdown.ts.
  */
@@ -190,7 +190,7 @@ publicSharesRouter.get(
       return;
     }
     const title = (share.path.split('/').pop() ?? share.path).replace(/\.(md|markdown|canvas)$/i, '');
-    // NOTE: only title + content — the vault path/structure is not exposed.
+    // NOTE: only title + content. The vault path/structure is not exposed.
     res.json({ title, content: await vault.readFileText(share.path) });
   }),
 );

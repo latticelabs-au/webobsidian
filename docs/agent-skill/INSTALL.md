@@ -13,10 +13,10 @@ save them, and from then on be able to operate your vault remotely.
 ---
 
 ```text
-SYSTEM / TASK — Install the "webobsidian" agent skill from GitHub, then set up credentials.
+SYSTEM / TASK: Install the "webobsidian" agent skill from GitHub, then set up credentials.
 Do every step in order; do not skip the credential step.
 
-STEP 1 — Download the skill into your runtime's skills directory:
+STEP 1: Download the skill into your runtime's skills directory:
   - Claude Code: ~/.claude/skills/webobsidian/
   - Codex:       ~/.codex/skills/webobsidian/
   - OpenCode:    ~/.opencode/skills/webobsidian/
@@ -28,7 +28,7 @@ STEP 1 — Download the skill into your runtime's skills directory:
         -o "$SKILLS_DIR/webobsidian/SKILL.md"
   Confirm the file exists and starts with the YAML frontmatter "name: webobsidian".
 
-STEP 2 — Set up credentials (ASK ME; never echo the key back):
+STEP 2: Set up credentials (ASK ME; never echo the key back):
   Ask me for:
     (a) my WebObsidian base URL  (e.g. https://notes.example.com or http://host:8787)
     (b) my API key               (Settings -> API Keys; looks like wok_...)
@@ -37,7 +37,7 @@ STEP 2 — Set up credentials (ASK ME; never echo the key back):
       printf '{ "baseUrl": "%s", "apiKey": "%s" }\n' "<BASE_URL>" "<API_KEY>" > ~/.webobsidian/credentials.json
       chmod 600 ~/.webobsidian/credentials.json
 
-STEP 3 — Verify (do NOT print the API key) and confirm:
+STEP 3: Verify (do NOT print the API key) and confirm:
       BASE=$(python3 -c 'import json,os;print(json.load(open(os.path.expanduser("~/.webobsidian/credentials.json")))["baseUrl"].rstrip("/"))')
       KEY=$(python3 -c 'import json,os;print(json.load(open(os.path.expanduser("~/.webobsidian/credentials.json")))["apiKey"])')
       curl -s "$BASE/api/v1/health"
@@ -52,7 +52,7 @@ STEP 3 — Verify (do NOT print the API key) and confirm:
 ## Notes
 
 - The skill file the agent downloads is the canonical
-  [`webobsidian/SKILL.md`](webobsidian/SKILL.md) — it contains the full Agent API reference
+  [`webobsidian/SKILL.md`](webobsidian/SKILL.md): it contains the full Agent API reference
   and the Obsidian Flavored Markdown guide (wikilinks, embeds, callouts, properties, tags,
   tasks, math, mermaid).
 - Credentials are stored at `~/.webobsidian/credentials.json` (chmod 600), **outside** any

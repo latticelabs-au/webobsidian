@@ -10,16 +10,16 @@ import os from 'node:os';
 // Paths & persisted desktop config
 // ---------------------------------------------------------------------------
 // Everything user-specific lives under Electron's per-user userData dir:
-//   <userData>/desktop-config.json  — { vaultPath, secret, dataDir }
-//   <userData>/server-data/         — the server's DATA_DIR (settings.json, index)
-//   <userData>/logs/server.log      — server child stdout/stderr (debugging)
+//   <userData>/desktop-config.json  : { vaultPath, secret, dataDir }
+//   <userData>/server-data/         : the server's DATA_DIR (settings.json, index)
+//   <userData>/logs/server.log      : server child stdout/stderr (debugging)
 const CONFIG_FILE = () => path.join(app.getPath('userData'), 'desktop-config.json');
 const DATA_DIR = () => path.join(app.getPath('userData'), 'server-data');
 const LOG_FILE = () => path.join(app.getPath('userData'), 'logs', 'server.log');
 
 interface DesktopConfig {
   vaultPath?: string;
-  /** Random per-install password — passed to the server as WEBOBSIDIAN_PASSWORD. */
+  /** Random per-install password, passed to the server as WEBOBSIDIAN_PASSWORD. */
   secret: string;
 }
 
@@ -35,7 +35,7 @@ async function readConfig(): Promise<DesktopConfig> {
       return parsed as DesktopConfig;
     }
   } catch {
-    /* first run / corrupt — fall through to fresh config */
+    /* first run / corrupt: fall through to fresh config */
   }
   return { secret: randomBytes(24).toString('hex') };
 }
@@ -232,7 +232,7 @@ async function ensureVault(cfg: DesktopConfig): Promise<DesktopConfig> {
       const st = await fs.stat(cfg.vaultPath);
       if (st.isDirectory()) return cfg;
     } catch {
-      /* configured vault vanished — re-pick */
+      /* configured vault vanished: re-pick */
     }
   }
   const picked = await pickVaultDialog(true);
@@ -259,7 +259,7 @@ async function pickVaultDialog(firstRun: boolean): Promise<string> {
     await dialog.showMessageBox({
       type: 'info',
       message: 'Using a default vault',
-      detail: `No folder chosen — your notes will live in:\n${fallback}\n\nYou can switch vaults later from the menu.`,
+      detail: `No folder chosen, your notes will live in:\n${fallback}\n\nYou can switch vaults later from the menu.`,
       buttons: ['OK'],
     });
   }

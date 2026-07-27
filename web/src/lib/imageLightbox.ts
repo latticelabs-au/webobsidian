@@ -1,5 +1,5 @@
 /**
- * Full-screen image viewer (lightbox) — opens on image click in BOTH Live Preview
+ * Full-screen image viewer (lightbox): opens on image click in BOTH Live Preview
  * and Reading view. Wheel/pinch zoom toward the cursor/focal point, drag (or
  * one-finger) to pan, double-click/tap to reset, Esc or backdrop click to close.
  * A single instance lives on document.body. (PRD FR-2)

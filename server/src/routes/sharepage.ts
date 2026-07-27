@@ -1,6 +1,6 @@
 // SSR page for public share links (FR-10): GET /share/:id returns a complete
-// HTML document — note content, <title>, meta description, Open Graph + Twitter
-// tags — so crawlers (Google, FB, Zalo…) index/preview it without running JS.
+// HTML document: note content, <title>, meta description, Open Graph + Twitter
+// tags, so crawlers (Google, FB, Zalo…) index/preview it without running JS.
 import { Router } from 'express';
 import type { Request } from 'express';
 import path from 'node:path';
@@ -92,7 +92,7 @@ sharePageRouter.get(
 
     const pageUrl = `${baseUrl(req)}/share/${share.id}`;
 
-    // Password-protected & not unlocked: render the unlock form only — never
+    // Password-protected & not unlocked: render the unlock form only, never
     // leak content or descriptive metadata to crawlers.
     if (!(await isUnlocked(req, share))) {
       res.send(
@@ -117,7 +117,7 @@ document.getElementById('unlock-form').addEventListener('submit', async (e) => {
     body: JSON.stringify({ password: document.getElementById('unlock-pw').value }),
   }).catch(() => null);
   if (r && r.ok) location.reload();
-  else document.getElementById('unlock-err').textContent = 'Wrong password — try again.';
+  else document.getElementById('unlock-err').textContent = 'Wrong password, try again.';
 });
 </script>`,
         }),

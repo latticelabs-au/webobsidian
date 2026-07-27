@@ -1,4 +1,4 @@
-/* WebObsidian — faithful Obsidian theme (light default + dark).
+/* WebObsidian: faithful Obsidian theme (light default + dark).
    Tokens verbatim from Obsidian 1.12.7 app.css (docs/obsidian-desktop-internals.md §19/§21). */
 :root {
   --font-default: ui-sans-serif, -apple-system, BlinkMacSystemFont, system-ui, 'Segoe UI',
@@ -258,7 +258,7 @@ button { font-family: inherit; }
 .app.left-closed { --sidebar-width: 0px; }
 .app.right-closed { --right-width: 0px; }
 /* Pin each shell column. The columns are sized by the width vars (not `auto`), so a
-   collapsed sidebar's track is 0 and the editor (col 3, 1fr) always fills the rest —
+   collapsed sidebar's track is 0 and the editor (col 3, 1fr) always fills the rest:
    unmounting a sidebar no longer reflows the editor into the wrong track. */
 .app:not(.mobile) > .ribbon { grid-column: 1; }
 .app:not(.mobile) > .sidebar { grid-column: 2; }
@@ -306,7 +306,7 @@ body.wo-col-resizing .sidebar, body.wo-col-resizing .right-sidebar { transition:
   display: flex; align-items: center; flex-wrap: wrap; gap: 1px; padding: 6px 8px;
   flex-shrink: 0; min-height: var(--header-height);
 }
-/* Files panel packs 8 action buttons — let the title shrink away before they wrap. */
+/* Files panel packs 8 action buttons: let the title shrink away before they wrap. */
 .nav-header .nav-title { flex: 0 1 auto; }
 .nav-header .nav-title {
   font-size: 13px; color: var(--text-muted); font-weight: 500; margin-right: auto; padding-left: 4px;
@@ -470,12 +470,12 @@ body.wo-col-resizing .sidebar, body.wo-col-resizing .right-sidebar { transition:
 /* Math (KaTeX) */
 .cm-math-rendered.math-block { display: block; text-align: center; padding: 0.5em 0; }
 /* Code block: mono font on every code line; bg + inner padding only on fenced
-   blocks (HyperMD-codeblock-bg) — indented code has no bg, like Obsidian. */
+   blocks (HyperMD-codeblock-bg): indented code has no bg, like Obsidian. */
 .cm-s-obsidian .cm-line.HyperMD-codeblock { font-family: var(--font-mono); font-size: var(--font-smaller); }
 .cm-s-obsidian .cm-line.HyperMD-codeblock-bg { background: var(--background-primary-alt); padding-left: 16px; padding-right: 16px; }
 .cm-s-obsidian .cm-line.HyperMD-codeblock-begin { border-radius: var(--radius-s) var(--radius-s) 0 0; padding-top: 8px; }
 .cm-s-obsidian .cm-line.HyperMD-codeblock-end { border-radius: 0 0 var(--radius-s) var(--radius-s); padding-bottom: 8px; }
-/* HR — keep within the normal line box (no extra margins) */
+/* HR: keep within the normal line box (no extra margins) */
 .cm-s-obsidian .cm-hr-widget { display: inline-block; width: 100%; vertical-align: middle; }
 .cm-s-obsidian .cm-hr-widget hr { border: 0; border-top: 1px solid var(--background-modifier-border); margin: 0; }
 /* Code block language flair (top-right of the first line) */
@@ -495,7 +495,7 @@ body.wo-col-resizing .sidebar, body.wo-col-resizing .right-sidebar { transition:
     linear-gradient(var(--interactive-accent), var(--interactive-accent));
   background-repeat: no-repeat; background-size: 2px 100%, 2px 100%; background-position: 22px 0, 46px 0;
 }
-/* List indentation guides (one per indent unit) — same mechanism as Obsidian:
+/* List indentation guides (one per indent unit), same mechanism as Obsidian:
    absolutely positioned 1px rule spanning the full line height, offset 0.85em. */
 .cm-s-obsidian .cm-line { position: relative; }
 .cm-s-obsidian .cm-indent { display: inline-block; }
@@ -601,7 +601,7 @@ body.wo-col-resizing .sidebar, body.wo-col-resizing .right-sidebar { transition:
 /* Language flair top-right, same as Live Preview's code blocks */
 .markdown-preview pre[data-lang]::after { content: attr(data-lang); position: absolute; top: 6px; right: 10px;
   color: var(--text-faint); font-size: var(--font-ui-smaller); font-family: var(--font-ui); text-transform: capitalize; }
-/* Token palette (classHighlighter classes) — mirrors lib/highlight.ts (§19) */
+/* Token palette (classHighlighter classes): mirrors lib/highlight.ts (§19) */
 .markdown-preview .tok-comment, .markdown-preview .tok-meta { color: var(--text-faint); }
 .markdown-preview .tok-keyword { color: var(--color-pink); }
 .markdown-preview .tok-string, .markdown-preview .tok-string2, .markdown-preview .tok-literal { color: var(--color-green); }
@@ -685,7 +685,7 @@ body.wo-col-resizing .sidebar, body.wo-col-resizing .right-sidebar { transition:
 .cm-props-dd-item:hover { background: var(--bg-modifier-hover); }
 .cm-props-dd-item .prop-icon { color: var(--text-faint); width: 16px; text-align: center; }
 
-/* Callouts (reading view) — same §21 box/colors as Live Preview */
+/* Callouts (reading view): same §21 box/colors as Live Preview */
 .callout { --callout-color: var(--callout-default);
   background: rgba(var(--callout-color), 0.1); mix-blend-mode: var(--highlight-mix-blend-mode);
   border-radius: var(--radius-s); padding: 12px 12px 12px 24px; margin: 1em 0; }
@@ -875,7 +875,7 @@ body.wo-col-resizing .sidebar, body.wo-col-resizing .right-sidebar { transition:
 .outline-item { padding: 3px 10px; font-size: 13px; cursor: pointer; color: var(--text-muted); border-radius: var(--radius-s); }
 .outline-item:hover { color: var(--text-normal); background: var(--bg-modifier-hover); }
 
-/* Status bar — anchored to the bottom-right of the editor pane (like Obsidian) */
+/* Status bar: anchored to the bottom-right of the editor pane (like Obsidian) */
 .status-bar {
   position: absolute; right: 0; bottom: 0; height: var(--statusbar-height); display: flex; align-items: center; gap: 14px;
   padding: 0 14px; background: var(--bg-primary); border-top: 1px solid var(--bg-modifier-border);
@@ -1009,7 +1009,7 @@ body.wo-col-resizing .sidebar, body.wo-col-resizing .right-sidebar { transition:
 .graph-color::-webkit-color-swatch-wrapper { padding: 2px; }
 .graph-color::-webkit-color-swatch { border: 0; border-radius: 3px; }
 
-/* ---- Public share page (/share/<id>) — FR-10 ---- */
+/* ---- Public share page (/share/<id>): FR-10 ---- */
 .public-page { height: 100%; min-height: 100vh; background: var(--bg-primary); display: flex; flex-direction: column; }
 .public-page .markdown-preview { padding-bottom: 80px; }
 .public-page .public-error { color: var(--text-muted); text-align: center; margin-top: 15vh; font-size: 15px; }
@@ -1019,7 +1019,7 @@ body.wo-col-resizing .sidebar, body.wo-col-resizing .right-sidebar { transition:
 .public-unlock-error { color: #e5534b; font-size: 13px; text-align: center; }
 
 /* ====================================================================== */
-/* Mobile / responsive (phone, touch) — FR-11                              */
+/* Mobile / responsive (phone, touch): FR-11                              */
 /* Sidebars become overlay drawers; workspace fills the screen.            */
 /* ====================================================================== */
 .drawer-backdrop {
@@ -1116,7 +1116,7 @@ body.wo-col-resizing .sidebar, body.wo-col-resizing .right-sidebar { transition:
   }
   .context-item { padding: 9px 12px; }  /* finger-friendly rows */
 
-  /* ---- Keep the note content fixed in the viewport — no sideways drift. ---- */
+  /* ---- Keep the note content fixed in the viewport: no sideways drift. ---- */
   /* Long words wrap; genuinely wide blocks (code, tables, images) are capped or
      scroll inside themselves, so the page itself never pans horizontally. */
   .app.mobile .cm-host,
@@ -1189,7 +1189,7 @@ body.wo-col-resizing .sidebar, body.wo-col-resizing .right-sidebar { transition:
 }
 .mobile-toolbar button:active { background: var(--bg-modifier-hover); color: var(--text-normal); }
 
-/* Desktop formatting toolbar — in-flow strip under the view header. */
+/* Desktop formatting toolbar: in-flow strip under the view header. */
 .format-toolbar {
   display: flex; gap: 1px; align-items: center; flex-shrink: 0;
   padding: 3px 10px;
@@ -1350,7 +1350,7 @@ body.wo-col-resizing .sidebar, body.wo-col-resizing .right-sidebar { transition:
 }
 
 /* ============================================================================
-   Canvas (FR-12) — JSON Canvas infinite board, parity with Obsidian Canvas
+   Canvas (FR-12): JSON Canvas infinite board, parity with Obsidian Canvas
    ========================================================================== */
 .canvas-view {
   flex: 1;
@@ -1470,7 +1470,7 @@ body.wo-col-resizing .sidebar, body.wo-col-resizing .right-sidebar { transition:
   padding: 0 4px; pointer-events: none;
 }
 
-/* Resize — corner handles (visible) + draggable edge strips */
+/* Resize: corner handles (visible) + draggable edge strips */
 .canvas-handle {
   position: absolute; width: 12px; height: 12px;
   background: var(--background-primary); border: 2px solid var(--interactive-accent);
@@ -1480,7 +1480,7 @@ body.wo-col-resizing .sidebar, body.wo-col-resizing .right-sidebar { transition:
 .handle-ne { right: -7px; top: -7px; cursor: nesw-resize; }
 .handle-se { right: -7px; bottom: -7px; cursor: nwse-resize; }
 .handle-sw { left: -7px; bottom: -7px; cursor: nesw-resize; }
-/* Edge resize strips — sit on the border, inset from corners; below ports (z7) so
+/* Edge resize strips: sit on the border, inset from corners; below ports (z7) so
    the mid-edge connection dot still works for dragging connections. */
 .canvas-edge-resize { position: absolute; z-index: 6; }
 .resize-n { top: -4px; left: 12px; right: 12px; height: 8px; cursor: ns-resize; }
@@ -1488,7 +1488,7 @@ body.wo-col-resizing .sidebar, body.wo-col-resizing .right-sidebar { transition:
 .resize-e { right: -4px; top: 12px; bottom: 12px; width: 8px; cursor: ew-resize; }
 .resize-w { left: -4px; top: 12px; bottom: 12px; width: 8px; cursor: ew-resize; }
 
-/* Drag handle — tap/click-hold to move the node (esp. on touch) */
+/* Drag handle: tap/click-hold to move the node (esp. on touch) */
 .canvas-node-grip {
   position: absolute; top: -13px; left: 50%; transform: translateX(-50%);
   display: flex; align-items: center; justify-content: center;
@@ -1517,7 +1517,7 @@ body.wo-col-resizing .sidebar, body.wo-col-resizing .right-sidebar { transition:
 .port-left   { left: -6px; top: 50%; transform: translateY(-50%); }
 .port-right  { right: -6px; top: 50%; transform: translateY(-50%); }
 
-/* Edge labels — centered on the curve midpoint */
+/* Edge labels: centered on the curve midpoint */
 .canvas-edge-label-wrap {
   width: 200px; height: 32px; display: flex; align-items: center; justify-content: center;
   pointer-events: none;
@@ -1623,7 +1623,7 @@ body.wo-col-resizing .sidebar, body.wo-col-resizing .right-sidebar { transition:
 .canvas-toolbar button:disabled { opacity: .35; cursor: default; }
 .canvas-toolbar button:disabled:hover { background: transparent; color: var(--text-muted); }
 
-/* Selection menu (Obsidian Canvas parity) — floats above the selection */
+/* Selection menu (Obsidian Canvas parity): floats above the selection */
 .canvas-menu {
   position: absolute; z-index: 20; transform: translate(-50%, -100%);
   display: flex; flex-direction: column; align-items: center; gap: 4px;
@@ -1700,7 +1700,7 @@ body.wo-col-resizing .sidebar, body.wo-col-resizing .right-sidebar { transition:
 .canvas-swatch { width: 20px; height: 20px; border-radius: 50%; border: 1px solid rgba(0,0,0,.15); cursor: pointer; padding: 0; flex-shrink: 0; }
 .canvas-swatch.selected { box-shadow: 0 0 0 2px var(--background-primary), 0 0 0 4px var(--interactive-accent); }
 .canvas-swatch-default { background: var(--text-faint); }
-/* Custom color picker — rainbow swatch wrapping a native <input type=color> */
+/* Custom color picker: rainbow swatch wrapping a native <input type=color> */
 .canvas-swatch-custom { position: relative; overflow: hidden; background: conic-gradient(from 0deg, #f00, #ff0, #0f0, #0ff, #00f, #f0f, #f00); }
 .canvas-swatch-custom input[type='color'] { position: absolute; inset: 0; width: 100%; height: 100%; opacity: 0; border: 0; padding: 0; cursor: pointer; }
 .canvas-ctx-del { color: var(--text-error, #e5534b) !important; margin-left: 2px; }
@@ -1713,7 +1713,7 @@ body.wo-col-resizing .sidebar, body.wo-col-resizing .right-sidebar { transition:
 }
 .cm-image-wrap.is-resizing { user-select: none; }
 .cm-image-wrap.is-resizing img.cm-embed-image { cursor: ew-resize; }
-/* Left/right edge bars — appear on hover, drag to set width (Obsidian-style). */
+/* Left/right edge bars: appear on hover, drag to set width (Obsidian-style). */
 .cm-image-resize {
   position: absolute; top: 50%; transform: translateY(-50%);
   width: 7px; height: 48px; max-height: 60%;
@@ -1739,7 +1739,7 @@ audio.media-embed { display: block; width: min(100%, 480px); max-width: 100%; ma
 .preview-inner video.media-fileview { max-height: 80vh; }
 .preview-inner audio.media-fileview { width: min(100%, 520px); }
 
-/* ---- Full-screen image viewer (lightbox) — both Live & Reading ---- */
+/* ---- Full-screen image viewer (lightbox): both Live & Reading ---- */
 .image-lightbox {
   position: fixed; inset: 0; z-index: 3000;
   background: rgba(0, 0, 0, .85); overflow: hidden;

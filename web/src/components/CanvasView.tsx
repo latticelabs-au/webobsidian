@@ -172,7 +172,7 @@ export default function CanvasView() {
 
   const newId = () => {
     idSeed.current += 1;
-    // 16 hex chars, time-seeded — round-trips through the JSON Canvas format.
+    // 16 hex chars, time-seeded: round-trips through the JSON Canvas format.
     return (Date.now().toString(16) + Math.floor(Math.random() * 0xfffff).toString(16) + idSeed.current.toString(16))
       .replace(/[^0-9a-f]/g, '')
       .padEnd(16, '0')
@@ -201,7 +201,7 @@ export default function CanvasView() {
   }, [activePath]);
 
   // Zoom-to-fit once per opened canvas (after its data is parsed + viewport sized).
-  // Guard: do nothing until the canvas actually has nodes — otherwise the rAF could
+  // Guard: do nothing until the canvas actually has nodes, otherwise the rAF could
   // fire before content loads, fit an empty bbox (→ 100%), and mark the canvas as
   // fitted so the real data (one tick later) never re-fits. We only mark `fittedFor`
   // after a real fit, so the effect re-runs (via the `data` dep) until nodes exist.
@@ -286,7 +286,7 @@ export default function CanvasView() {
       const ta = editTaRef.current;
       const t = e.target as HTMLElement | null;
       if (!ta || !t) return;
-      if (t === ta || ta.contains(t)) return; // inside the textarea — keep editing
+      if (t === ta || ta.contains(t)) return; // inside the textarea: keep editing
       // Helper UIs that legitimately steal focus while editing must not commit.
       if (t.closest('.canvas-textmenu, .canvas-linkpicker, .canvas-notepicker')) return;
       commitTextEdit();
@@ -351,7 +351,7 @@ export default function CanvasView() {
     const down = (e: KeyboardEvent) => {
       const mod = e.metaKey || e.ctrlKey;
       if (mod && (e.key === 'z' || e.key === 'Z')) {
-        // ⌘Z / ⌘⇧Z — undo / redo (only when the canvas is focused / not typing).
+        // ⌘Z / ⌘⇧Z: undo / redo (only when the canvas is focused / not typing).
         if (isTyping(e.target)) return;
         e.preventDefault();
         e.shiftKey ? redo() : undo();
@@ -901,7 +901,7 @@ export default function CanvasView() {
       }
       lastTap.current = { id, t: e.timeStamp };
     }
-    // NOTE: do NOT setPointerCapture here — capturing on pointerdown retargets the
+    // NOTE: do NOT setPointerCapture here: capturing on pointerdown retargets the
     // subsequent click/dblclick to the viewport, which would break double-click-to-edit.
     // We capture lazily on the first real move (see onViewportPointerMove 'move').
     if (space.current) {
@@ -981,7 +981,7 @@ export default function CanvasView() {
       if (e.shiftKey) { if (Math.abs(dx) > Math.abs(dy)) dy = 0; else dx = 0; }
       if (Math.abs(dx) > 1 || Math.abs(dy) > 1) {
         // Capture on the first real move so the drag survives the cursor leaving a
-        // node — but NOT on pointerdown, so a plain click/dblclick still targets the node.
+        // node, but NOT on pointerdown, so a plain click/dblclick still targets the node.
         if (!dr.moved) { try { vpRef.current?.setPointerCapture(e.pointerId); } catch { /* ignore */ } }
         dr.moved = true;
       }
@@ -1473,7 +1473,7 @@ export default function CanvasView() {
                       // Keep editing while the link dropdown is open (it takes focus).
                       if (linkPicker) return;
                       // The format menu preventDefaults blur, so a real blur = done editing.
-                      // (On Android the doc-level pointerdown listener also commits — both
+                      // (On Android the doc-level pointerdown listener also commits: both
                       // paths route through commitTextEdit, which is idempotent.)
                       commitTextEdit(e.target.value);
                     }}
@@ -1482,7 +1482,7 @@ export default function CanvasView() {
                   />
                 ) : (
                   <div className="canvas-text-body markdown-preview" style={{ textAlign: (n as TextNode).textAlign ?? 'left' }}>
-                    {(n as TextNode).text.trim() ? <Preview source={(n as TextNode).text} /> : <span className="canvas-placeholder">Empty card — double-click to edit</span>}
+                    {(n as TextNode).text.trim() ? <Preview source={(n as TextNode).text} /> : <span className="canvas-placeholder">Empty card: double-click to edit</span>}
                   </div>
                 )
               )}
@@ -1503,7 +1503,7 @@ export default function CanvasView() {
           <div className="canvas-marquee" style={{ left: marquee.x, top: marquee.y, width: marquee.w, height: marquee.h }} />
         )}
 
-        {/* Alignment guides (Obsidian's canvas-snaps) — drawn while dragging nodes */}
+        {/* Alignment guides (Obsidian's canvas-snaps): drawn while dragging nodes */}
         {snap && (snap.x || snap.y) && (
           <svg className="canvas-snaps" style={{ overflow: 'visible', position: 'absolute', left: 0, top: 0, width: 1, height: 1 }}>
             {snap.x && <SnapLine g={snap.x} axis="x" scale={view.scale} />}
@@ -1512,7 +1512,7 @@ export default function CanvasView() {
         )}
       </div>
 
-      {/* Selection menu — parity with Obsidian Canvas (Remove / Set color /
+      {/* Selection menu: parity with Obsidian Canvas (Remove / Set color /
           Zoom to selection / (edges:) Arrow direction / Edit label). */}
       {(sel.nodes.size > 0 || sel.edges.size > 0) && selBBoxScreen && (
         <div
@@ -1620,7 +1620,7 @@ export default function CanvasView() {
         <span style={{ display: 'none' }}>{histV}</span>
       </div>
 
-      {/* Add toolbar (bottom-center) — card / note / image, like Obsidian */}
+      {/* Add toolbar (bottom-center): card / note / image, like Obsidian */}
       <div className="canvas-toolbar canvas-toolbar-add" onPointerDown={(e) => e.stopPropagation()}>
         <button title="Add card (or double-click canvas)" onClick={() => { const c = viewCenter(); addTextNode(c.x, c.y); }}>
           <Icon name="file-plus" size={18} />
@@ -1698,7 +1698,7 @@ export default function CanvasView() {
         </div>
       )}
 
-      {/* Text-card formatting menu (right-click inside an editing card) — Obsidian parity */}
+      {/* Text-card formatting menu (right-click inside an editing card): Obsidian parity */}
       {textMenu && (
         <TextFormatMenu items={textMenuItems()} x={textMenu.x} y={textMenu.y} onClose={() => setTextMenu(null)} />
       )}

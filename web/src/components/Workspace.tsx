@@ -138,7 +138,7 @@ export default function Workspace() {
     let items: ContextMenuItem[];
     if (path === GRAPH_PATH) {
       items = [
-        // GraphView owns the Pixi renderer — it listens for this event and
+        // GraphView owns the Pixi renderer: it listens for this event and
         // extracts the stage to a PNG (a plain canvas read would be blank).
         { label: 'Copy screenshot', icon: 'camera', onClick: () => window.dispatchEvent(new CustomEvent('wo-graph-screenshot')) },
         { label: '', separator: true },
@@ -404,7 +404,7 @@ export default function Workspace() {
               <div className="big">
                 <Icon name="file-text" size={48} />
               </div>
-              <p>No file is open — pick a note, or press ⌘O</p>
+              <p>No file is open: pick a note, or press ⌘O</p>
             </div>
           </div>
         )}

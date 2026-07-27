@@ -172,7 +172,7 @@ function OutgoingPanel() {
   }, [targets]);
 
   const links = targets.filter((t) => resolved[t] !== undefined && resolved[t] !== null);
-  // /api/resolve only knows notes — an unresolved attachment embed (image/pdf/…)
+  // /api/resolve only knows notes: an unresolved attachment embed (image/pdf/…)
   // is NOT a "create this note" candidate, so keep those out of the list.
   const unresolved = targets.filter(
     (t) => resolved[t] === null && !/\.(png|jpe?g|gif|svg|webp|bmp|ico|pdf|mp3|mp4|mov|zip)$/i.test(t),
@@ -204,7 +204,7 @@ function OutgoingPanel() {
           </div>
         )}
         {unresolved.map((t) => (
-          <div key={t} className="outgoing-item unresolved" onClick={() => openWikilink(t)} title="Not created yet — click to create">
+          <div key={t} className="outgoing-item unresolved" onClick={() => openWikilink(t)} title="Not created yet: click to create">
             <Icon name="file-plus" size={14} />
             <span>{t}</span>
           </div>

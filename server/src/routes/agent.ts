@@ -7,7 +7,7 @@ import { backlinksFor, buildLinkGraph } from '../services/links.js';
 import { parseNote } from '../services/markdown.js';
 
 /**
- * Agent API (PRD FR-6) — REST surface for AI agents, authenticated by API key.
+ * Agent API (PRD FR-6): REST surface for AI agents, authenticated by API key.
  * All note paths are vault-relative. Scopes: read / write / search.
  */
 export const agentRouter = Router();

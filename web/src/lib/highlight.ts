@@ -8,7 +8,7 @@ import { tags as t } from '@lezer/highlight';
  * so the same style serves light & dark.
  *
  * Deliberately does NOT style markdown structure tags (emphasis, heading, link,
- * escape…) — Live Preview decorations own those. This is what fixes stray red
+ * escape…): Live Preview decorations own those. This is what fixes stray red
  * escapes/brackets that defaultHighlightStyle painted in body text.
  */
 export const obsidianHighlightStyle = HighlightStyle.define([

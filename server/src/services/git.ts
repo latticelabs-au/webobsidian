@@ -36,7 +36,7 @@ async function git(): Promise<SimpleGit> {
 // Auto-sync (every 30s), the debounced commit-on-save, and the manual /git/*
 // routes all drive git on the SAME repo. Run two at once and their `git add`/
 // `commit` collide on `.git/index.lock` ("Another git process seems to be
-// running") — and a command killed mid-write leaves that lock behind, which then
+// running"), and a command killed mid-write leaves that lock behind, which then
 // wedges EVERY later op (the "completely dead" state). Funnelling all mutating
 // ops through one async queue removes the race; clearing a stale lock at the head
 // of each op heals a leftover from a crash or an external Obsidian-git process.
@@ -60,7 +60,7 @@ async function clearStaleLocks(): Promise<void> {
         console.warn(`[git] cleared stale ${name} (age ${Math.round(age / 1000)}s)`);
       }
     } catch {
-      /* lock absent — nothing to clear */
+      /* lock absent: nothing to clear */
     }
   }
 }
@@ -155,7 +155,7 @@ export async function ensureLfsAttributes(): Promise<void> {
   }
   // Write a CANONICAL (sorted) .gitattributes so every device/instance produces a
   // byte-identical file. Otherwise each side rewrites it in a different order and
-  // every sync conflicts on .gitattributes — which silently wedges the repo in an
+  // every sync conflicts on .gitattributes, which silently wedges the repo in an
   // unfinished merge and stops sync entirely. Only write when content changes.
   const content = [...lines].sort().join('\n') + '\n';
   if (content !== existing) await fs.writeFile(file, content);
@@ -251,7 +251,7 @@ export interface GitCommit {
 
 /**
  * Recent commits touching `filePath` (vault-relative), newest first. Returns []
- * when the vault isn't a git repo or the file has no history yet — the version
+ * when the vault isn't a git repo or the file has no history yet: the version
  * history UI treats that as "no versions".
  */
 export async function log(filePath: string, limit = 50): Promise<GitCommit[]> {
@@ -446,7 +446,7 @@ async function recoverMerge(g: SimpleGit): Promise<void> {
 
 /** Convenience: stage+commit+pull+push in one go. Reports conflicts. Runs entirely
  *  inside the git queue (via the exported `sync` wrapper), so it calls the unlocked
- *  *Impl helpers directly — re-entering withGitLock here would dead-lock. */
+ *  *Impl helpers directly: re-entering withGitLock here would dead-lock. */
 async function syncImpl(message?: string): Promise<{ ok: boolean; log: string[] }> {
   const log: string[] = [];
   const g = await git();

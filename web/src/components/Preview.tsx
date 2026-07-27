@@ -56,7 +56,7 @@ const loadMermaid = () =>
 let mmdSeq = 0;
 
 /** Add a "Render HTML" toggle to a ```html block. Clicking swaps the source
- *  for a sandboxed iframe (scripts run but isolated — no same-origin, so the
+ *  for a sandboxed iframe (scripts run but isolated, no same-origin, so the
  *  saved page can't touch the vault/app). Toggles back to source on re-click. */
 function setupHtmlPreview(codeEl: HTMLElement): void {
   const pre = codeEl.parentElement as HTMLElement | null;
@@ -120,7 +120,7 @@ export default function Preview({ source }: { source?: string }) {
     };
   }, [content]);
 
-  // Post-render pass — same renderers as Live Preview so both modes match:
+  // Post-render pass, same renderers as Live Preview so both modes match:
   // KaTeX for [data-tex] spans, mermaid for ```mermaid fences, callout icons.
   const bodyRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
@@ -231,7 +231,7 @@ export default function Preview({ source }: { source?: string }) {
     });
   };
 
-  // Inline title (note filename), Obsidian-style — skipped when the note already
+  // Inline title (note filename), Obsidian-style: skipped when the note already
   // opens with an H1 equal to the title (avoids duplicating the Trilium heading).
   const title = !source && activePath ? (activePath.split('/').pop() ?? '').replace(/\.(md|markdown)$/i, '') : '';
   const firstLine = content
