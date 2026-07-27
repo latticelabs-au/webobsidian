@@ -11,11 +11,15 @@ import {
   ensureVaultBrowsable,
   isVaultRelativeSubpath,
   isUnsafeE2eePairing,
+  isOidcUsable,
   isWithinRoot,
+  normalizeOidcList,
+  OIDC_CALLBACK_PATH,
   REDACTED_SECRET,
   type Settings,
 } from '../services/settings.js';
 import { redactUrlCreds } from '../lib/redact.js';
+import { isReservedClaim } from '../services/oidc.js';
 import { config } from '../config.js';
 
 /** Build an error the shared error middleware will answer with `status`. */
@@ -28,7 +32,7 @@ function httpError(status: number, message: string): Error & { status: number } 
 interface SettingsPatchBody {
   vault?: Record<string, unknown>;
   git?: Record<string, unknown>;
-  // Both of these have to be listed here AND handled in the if-chain inside the
+  // Each of these has to be listed here AND handled in the if-chain inside the
   // PUT below. A block that is missing from that chain is silently unwritable
   // through the API and the request still answers 200 with the unchanged
   // settings, which is the worst failure mode this endpoint has: the operator
@@ -37,6 +41,7 @@ interface SettingsPatchBody {
   // redaction, this allowlist, the UI panel) and half of it fails quietly.
   sync?: Record<string, unknown>;
   livesync?: Record<string, unknown>;
+  oidc?: Record<string, unknown>;
   search?: Record<string, unknown>;
   ui?: Record<string, unknown>;
   api?: Record<string, unknown>;
@@ -117,6 +122,12 @@ settingsRouter.put(
     const liveSyncPatch = body.livesync
       ? sanitizeLiveSync(body.livesync, (await getSettings()).livesync.uri)
       : null;
+    // Same shape, same reasoning, one block over. The stored OIDC block is read
+    // for the same single purpose the stored URI is read above: recognising a
+    // client that echoed back a redacted URL. Everything that can be judged from
+    // the patch alone is judged here, before the settings lock is taken, so a
+    // malformed issuer answers 400 without half-applying the rest of the body.
+    const oidcPatch = body.oidc ? sanitizeOidc(body.oidc, (await getSettings()).oidc) : null;
     const updated = await updateSettings((d) => {
       if (vaultPatch) {
         Object.assign(d.vault, vaultPatch);
@@ -160,6 +171,21 @@ settingsRouter.put(
       // error about a passphrase, which is both baffling and unfixable from the
       // UI it breaks.
       if (body.livesync || body.sync) assertSafeE2eePairing(d);
+      if (oidcPatch) {
+        // Split for exactly the reason the LiveSync patch is split: for the
+        // client secret, "absent" and "empty" both mean "leave the stored value
+        // alone", while for every other field absent means "not being changed"
+        // and empty means "clear it".
+        Object.assign(d.oidc, oidcPatch.fields, oidcPatch.secrets);
+      }
+      // Inside the mutator, and gated on the request touching the block, for the
+      // same two reasons spelled out on assertSafeE2eePairing above: these are
+      // questions about the MERGED result (a body that only turns `enabled` on is
+      // valid or not depending on the issuer already stored, and a body that only
+      // clears the issuer is valid or not depending on `enabled` already stored),
+      // and an instance that already holds a bad combination from a hand edit
+      // must not 400 on every unrelated save with an error about SSO.
+      if (body.oidc) assertUsableOidc(d);
       if (body.search) Object.assign(d.search, body.search);
       if (body.ui) Object.assign(d.ui, body.ui);
       if (typeof rateLimit === 'number') d.api.rateLimitPerMin = rateLimit;
@@ -509,6 +535,394 @@ function assertSafeE2eePairing(d: Settings): void {
       'but leaves path, mtime, size and content unencrypted in CouchDB, which looks like end-to-end ' +
       'encryption without being it. Set a passphrase, or send obfuscatePassphrase as null to clear it.',
   );
+}
+
+/**
+ * A validated OIDC patch, split by how "absent" has to be read, exactly as the
+ * LiveSync patch is. `secrets` holds only `clientSecret`, and only when the
+ * client actually supplied a new value for it.
+ */
+interface OidcPatch {
+  fields: Partial<Settings['oidc']>;
+  secrets: Partial<Pick<Settings['oidc'], 'clientSecret'>>;
+}
+
+/**
+ * True when `incoming` is the redacted form of `stored` rather than a new value.
+ *
+ * redactSettings() masks credentials embedded in the OIDC URLs, so a UI that
+ * round-trips what it read sends `https://***@host` back. That is not an edit, it
+ * is the mask, and storing it would replace a working issuer with one that
+ * resolves nowhere (and would then be refused on the way in anyway, telling the
+ * operator their URL contains credentials they never typed). It is the same idea
+ * as the REDACTED_SECRET sentinel: a value the client can only have obtained from
+ * us means "I did not change this".
+ *
+ * The `incoming !== stored` half is what keeps this from swallowing a genuine
+ * edit. redactUrlCreds is the identity on a URL without userinfo, which is every
+ * URL this build is willing to store, so without that half every unchanged save
+ * of a normal URL would take this branch. Harmless today, but it would silently
+ * stop being harmless the moment the field gained a normalisation step.
+ */
+function isRedactedUrlEcho(incoming: string, stored: string): boolean {
+  return incoming === redactUrlCreds(stored) && incoming !== stored;
+}
+
+/**
+ * Narrow an incoming oidc patch to the fields we accept, rejecting anything
+ * malformed with a 400 rather than coercing it.
+ *
+ * `current` is the stored block, needed only to recognise the redacted echoes
+ * described on isRedactedUrlEcho.
+ */
+function sanitizeOidc(v: Record<string, unknown>, current: Settings['oidc']): OidcPatch {
+  const fields: Partial<Settings['oidc']> = {};
+
+  if (v.enabled !== undefined) {
+    if (typeof v.enabled !== 'boolean') throw httpError(400, 'oidc.enabled must be a boolean');
+    fields.enabled = v.enabled;
+  }
+  if (v.issuer !== undefined) {
+    // Trailing slashes are stripped before both the echo check and validation so
+    // that this door and the schema store one canonical string; see the note on
+    // the schema field for why discovery cares.
+    const issuer = requireOidcString(v.issuer, 'oidc.issuer').trim().replace(/\/+$/, '');
+    if (!isRedactedUrlEcho(issuer, current.issuer)) fields.issuer = requireIssuerUrl(issuer);
+  }
+  if (v.clientId !== undefined) {
+    fields.clientId = requireOidcString(v.clientId, 'oidc.clientId').trim();
+  }
+  if (v.redirectUri !== undefined) {
+    const redirectUri = requireOidcString(v.redirectUri, 'oidc.redirectUri')
+      .trim()
+      .replace(/\/+$/, '');
+    if (!isRedactedUrlEcho(redirectUri, current.redirectUri)) {
+      fields.redirectUri = requireRedirectUri(redirectUri);
+    }
+  }
+  if (v.scopes !== undefined) fields.scopes = requireScopes(v.scopes);
+  if (v.allowedSubjects !== undefined) {
+    fields.allowedSubjects = requireStringList(v.allowedSubjects, 'oidc.allowedSubjects');
+  }
+  if (v.allowedGroups !== undefined) {
+    fields.allowedGroups = requireStringList(v.allowedGroups, 'oidc.allowedGroups');
+  }
+  // Refused with a 400 rather than filtered, because a rule silently dropped
+  // from an authorization allowlist is indistinguishable from one that is in
+  // force and simply never matching. The reserved-name check in particular has
+  // to say WHY: `{"claim":"type","values":["id-token"]}` looks like a specific
+  // rule and would admit every account the issuer has.
+  if (v.allowedClaims !== undefined) {
+    if (!Array.isArray(v.allowedClaims)) {
+      throw httpError(400, 'oidc.allowedClaims must be an array');
+    }
+    const rules: { claim: string; values: string[] }[] = [];
+    for (const entry of v.allowedClaims) {
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+        throw httpError(400, 'each oidc.allowedClaims entry must be an object');
+      }
+      const rec = entry as Record<string, unknown>;
+      const claim = typeof rec.claim === 'string' ? rec.claim.trim() : '';
+      if (!claim) throw httpError(400, 'each oidc.allowedClaims entry needs a claim name');
+      if (isReservedClaim(claim)) {
+        throw httpError(
+          400,
+          `oidc.allowedClaims cannot use '${claim}': that claim carries the same value for every ` +
+            'user of the issuer, or changes on every request, so a rule on it would admit ' +
+            'everybody or nobody rather than a specific person. Use a claim that identifies the ' +
+            'user, such as preferred_username or a custom claim your provider issues.',
+        );
+      }
+      const values = requireStringList(rec.values, `oidc.allowedClaims['${claim}'].values`);
+      if (values.length === 0) {
+        throw httpError(400, `oidc.allowedClaims['${claim}'] needs at least one value`);
+      }
+      rules.push({ claim, values });
+    }
+    fields.allowedClaims = rules;
+  }
+  if (v.allowPasswordLogin !== undefined) {
+    if (typeof v.allowPasswordLogin !== 'boolean') {
+      throw httpError(400, 'oidc.allowPasswordLogin must be a boolean');
+    }
+    fields.allowPasswordLogin = v.allowPasswordLogin;
+  }
+  // Validated against the literal union rather than passed through, because the
+  // zod schema's .catch('auto') would silently rewrite a typo to the default. A
+  // save that reads back as something other than what was submitted is the worst
+  // outcome for a security toggle: the operator believes PKCE is off, the server
+  // has it on, and nothing anywhere says so.
+  if (v.pkce !== undefined) {
+    if (v.pkce !== 'auto' && v.pkce !== 'force' && v.pkce !== 'off') {
+      throw httpError(400, "oidc.pkce must be one of 'auto', 'force' or 'off'");
+    }
+    fields.pkce = v.pkce;
+  }
+
+  // One secret, but it goes through readSecret() unchanged: the sentinel rule,
+  // the "empty means untouched" rule and the explicit-null escape hatch are all
+  // identical here, and re-deriving them for one field is how two copies of a
+  // security rule start to drift.
+  const secrets: OidcPatch['secrets'] = {};
+  const clientSecret = readSecret(v.clientSecret, 'oidc.clientSecret');
+  if (clientSecret !== undefined) secrets.clientSecret = clientSecret;
+
+  return { fields, secrets };
+}
+
+/** A string field, or a 400 naming the OIDC field rather than a LiveSync one. */
+function requireOidcString(value: unknown, field: string): string {
+  if (typeof value !== 'string') throw httpError(400, `${field} must be a string`);
+  return value;
+}
+
+/**
+ * True for a host whose traffic never leaves the machine.
+ *
+ * This is the whole of the http exception below, so it is deliberately narrow:
+ * the loopback names and nothing else. `localhost` is included because that is
+ * what an operator types; the 127.0.0.0/8 block and `::1` because that is what
+ * a container, an Electron shell or an SSH tunnel actually resolves to.
+ */
+function isLoopbackHost(hostname: string): boolean {
+  // URL.hostname KEEPS the brackets on an IPv6 literal (verified: `new
+  // URL('http://[::1]/').hostname` is the five characters `[::1]`), so both forms
+  // are stripped here rather than assuming the tidier one. Getting this wrong
+  // fails in the annoying direction: a working loopback issuer refused with a
+  // message about TLS.
+  const h = hostname.toLowerCase().replace(/^\[|\]$/g, '');
+  return h === 'localhost' || h === '::1' || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h);
+}
+
+/**
+ * Parse one of the two OIDC URL fields, applying the rules both of them share.
+ *
+ * Rejected in every case, because each one either cannot work or is a credential
+ * leak: a non-absolute value (there is no base to resolve it against inside the
+ * process), a scheme other than http/https, embedded userinfo (it would sit in a
+ * field the UI renders in the clear and an operator pastes into a bug report),
+ * and a fragment (RFC 6749 §3.1 forbids one on both endpoints, and the
+ * authorization response would silently drop everything after the `#` anyway,
+ * because a fragment never reaches the server).
+ */
+function parseOidcUrl(raw: string, field: string): URL {
+  const bad = (why: string) => httpError(400, `${field} ${why}`);
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    throw bad('must be an absolute URL, e.g. https://auth.example.com');
+  }
+  // `new URL` parses `data:...` and `file:///etc` perfectly happily, so the
+  // scheme has to be named explicitly rather than inferred from a successful parse.
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw bad('must use http or https');
+  }
+  if (parsed.username || parsed.password) {
+    throw bad('must not embed credentials');
+  }
+  if (parsed.hash) throw bad('must not contain a fragment');
+  return parsed;
+}
+
+/**
+ * Accept an OIDC issuer identifier, or reject the request.
+ *
+ * Empty is accepted and means "not configured", which is how an operator takes
+ * SSO out of service without deleting the client id and the allowlists they will
+ * want back later. Enabling SSO with an empty issuer is refused separately, on
+ * the merged result (assertUsableOidc).
+ *
+ * https is required, with ONE exception: a loopback host may use http.
+ *
+ * The exception exists because a self-hosted IdP on the same box (or reached
+ * through an SSH tunnel, or run from a compose file on a developer's laptop)
+ * frequently has no certificate, and refusing http there would mean the only way
+ * to try this feature is to first stand up a CA. That is a real barrier for
+ * exactly the homelab audience this is built for.
+ *
+ * The exception stops at loopback rather than extending to the whole LAN, and
+ * that boundary is the point rather than an oversight. Everything that crosses
+ * this connection is either a bearer credential or the material to mint one: the
+ * client secret goes to the token endpoint, the authorization code comes back,
+ * and the id_token that proves who the user is arrives in the response body. On
+ * loopback that traffic never touches a wire. On a LAN it touches every switch,
+ * access point and other device between here and the IdP, any of which can read
+ * the code and the secret and then mint a session as the vault owner. "It is only
+ * my home network" is the assumption; a plaintext token is the consequence when
+ * the assumption is wrong.
+ *
+ * A query string is refused because discovery is `issuer + suffix` string
+ * concatenation: `https://host/?x=1` would produce
+ * `https://host/?x=1/.well-known/openid-configuration`, a URL that is not a typo
+ * anyone spots by reading it. A path is allowed, because multi-tenant IdPs
+ * legitimately issue from one (`https://host/realms/notes`).
+ */
+function requireIssuerUrl(value: string): string {
+  const bad = (why: string) => httpError(400, `oidc.issuer ${why}`);
+  const raw = value.trim().replace(/\/+$/, '');
+  if (!raw) return '';
+  const parsed = parseOidcUrl(raw, 'oidc.issuer');
+  if (parsed.protocol !== 'https:' && !isLoopbackHost(parsed.hostname)) {
+    throw bad(
+      'must use https; http is only accepted for a loopback host (localhost, 127.0.0.1, ::1), ' +
+        'because the client secret, the authorization code and the id_token all travel over this ' +
+        'connection in the clear',
+    );
+  }
+  if (parsed.search) throw bad('must not contain a query string');
+  return raw;
+}
+
+/**
+ * Accept the redirect URI the IdP sends the authorization response to, or reject
+ * the request.
+ *
+ * Empty is accepted and means "not configured here". That is deliberately not
+ * treated as an error even when SSO is enabled: this server cannot know its own
+ * external origin from inside the process (a reverse proxy, a container port
+ * mapping and the Electron shell's 127.0.0.1 all disagree with what Node sees),
+ * so deriving it from the arriving request is a legitimate strategy for the OIDC
+ * service to take. What this door guarantees is that a value which IS stored is
+ * one the callback route can actually serve.
+ *
+ * http is allowed here without the loopback restriction that applies to the
+ * issuer, and the asymmetry is intentional: this URL is THIS server's own
+ * address, and a self-hosted WebObsidian behind a plain-http reverse proxy or on
+ * a LAN is the normal deployment rather than the exotic one. Refusing it would
+ * make the feature unusable for most of its audience. The risk is not symmetric
+ * either: an operator who terminates TLS elsewhere still gets an encrypted hop
+ * where it counts, and the value here is only ever compared, never dialled.
+ *
+ * The path must end with OIDC_CALLBACK_PATH. "Ends with" rather than "equals"
+ * because an install served under a sub-path by a reverse proxy is legitimate.
+ * A query string is refused because the authorization response appends its own
+ * (`?code=...&state=...`) and the exact-match rule at the IdP turns any
+ * pre-existing one into a registration that is easy to get subtly wrong and hard
+ * to debug: the failure surfaces at the IdP, before the redirect, as a generic
+ * "invalid redirect_uri".
+ */
+function requireRedirectUri(value: string): string {
+  const bad = (why: string) => httpError(400, `oidc.redirectUri ${why}`);
+  const raw = value.trim().replace(/\/+$/, '');
+  if (!raw) return '';
+  const parsed = parseOidcUrl(raw, 'oidc.redirectUri');
+  if (parsed.search) throw bad('must not contain a query string');
+  if (!parsed.pathname.endsWith(OIDC_CALLBACK_PATH)) {
+    throw bad(`must end with ${OIDC_CALLBACK_PATH}, which is the path this server answers on`);
+  }
+  return raw;
+}
+
+/**
+ * Accept the scope list, or reject the request.
+ *
+ * `openid` is mandatory and its absence is a 400 rather than a silent fix. Without
+ * it the authorization request is plain OAuth 2.0: the IdP may return an access
+ * token and no id_token whatsoever, so there is no signed subject to bind a
+ * session to. Silently adding the scope would be the friendlier-looking choice
+ * and the wrong one, because the operator would then be looking at a saved value
+ * they did not type while debugging why their IdP shows a consent screen they did
+ * not expect. (The schema does heal it, for hand-edited files only, where there is
+ * nobody to tell.)
+ *
+ * The character set is RFC 6749 §3.3's scope-token, which excludes the space that
+ * delimits the list and the quote and backslash that would let a value break out
+ * of the serialised parameter. A scope containing a space is not a scope, it is
+ * two, and accepting it here would silently request something other than what the
+ * operator sees stored.
+ */
+function requireScopes(value: unknown): string[] {
+  const bad = (why: string) => httpError(400, `oidc.scopes ${why}`);
+  if (!Array.isArray(value)) throw bad('must be an array of scope names');
+  const scopes = normalizeOidcList(
+    value.map((entry: unknown) => {
+      if (typeof entry !== 'string') throw bad('entries must be strings');
+      return entry;
+    }),
+  );
+  for (const scope of scopes) {
+    // RFC 6749 §3.3: scope-token = 1*( %x21 / %x23-5B / %x5D-7E ), i.e. printable
+    // ASCII minus space, double quote and backslash.
+    if (!/^[\x21\x23-\x5B\x5D-\x7E]+$/.test(scope)) {
+      throw bad(`entries must be OAuth scope tokens; ${JSON.stringify(scope)} is not one`);
+    }
+  }
+  if (!scopes.includes('openid')) {
+    throw bad(
+      "must include 'openid'; without it the IdP is not required to return an id_token, so there " +
+        'is no verified subject to attach the session to',
+    );
+  }
+  return scopes;
+}
+
+/**
+ * Accept one of the two access allowlists, or reject the request.
+ *
+ * Trimmed and de-duplicated but deliberately NOT case-folded: `sub` is an opaque,
+ * case-sensitive string by specification and group names usually are too, so
+ * lowercasing an entry here would turn a working allowlist into a lockout whose
+ * cause is invisible in the UI, since the stored value and the claim would look
+ * identical to a reader.
+ */
+function requireStringList(value: unknown, field: string): string[] {
+  if (!Array.isArray(value)) throw httpError(400, `${field} must be an array of strings`);
+  return normalizeOidcList(
+    value.map((entry: unknown) => {
+      if (typeof entry !== 'string') throw httpError(400, `${field} entries must be strings`);
+      return entry;
+    }),
+  );
+}
+
+/**
+ * Refuse to persist an OIDC block that cannot work, or that would lock everybody
+ * out. Three separate failures, all of which would otherwise answer 200 and only
+ * show themselves at the next login attempt.
+ *
+ * 1. Enabled with no issuer or no client id. There is no authorization request to
+ *    build, so the SSO button leads to an error and nothing says why.
+ * 2. A group allowlist without the `groups` scope. This one is the reason this
+ *    check exists at all: the claim is only issued when the scope is requested,
+ *    so an allowlist of groups that are never asked for can never match. Whether
+ *    that fails closed (nobody can log in) or open (the check finds no claim and
+ *    waves everyone through) depends on code elsewhere, and a security boundary
+ *    whose behaviour depends on which way another module happens to have written
+ *    an if statement is not a boundary. Refusing the combination removes the
+ *    question.
+ * 3. Password login off while OIDC is not usable. Every door closed at once,
+ *    including the Electron shell's automatic WEBOBSIDIAN_PASSWORD login, with
+ *    the only remedy being a hand edit of settings.json. The schema heals this
+ *    for a file that arrived out of band; here it is a 400, because a request
+ *    that does it is an operator about to lock themselves out and they should
+ *    hear about it now rather than at the next restart.
+ */
+function assertUsableOidc(d: Settings): void {
+  const o = d.oidc;
+  if (o.enabled && !o.issuer) {
+    throw httpError(400, 'oidc.issuer is required when oidc.enabled is true');
+  }
+  if (o.enabled && !o.clientId) {
+    throw httpError(400, 'oidc.clientId is required when oidc.enabled is true');
+  }
+  if (o.allowedGroups.length && !o.scopes.includes('groups')) {
+    throw httpError(
+      400,
+      "oidc.allowedGroups requires the 'groups' scope: the IdP only issues the groups claim when " +
+        'it is requested, so an allowlist of groups that are never asked for can never match. Add ' +
+        "'groups' to oidc.scopes, or clear oidc.allowedGroups.",
+    );
+  }
+  if (!o.allowPasswordLogin && !isOidcUsable(o)) {
+    throw httpError(
+      400,
+      'oidc.allowPasswordLogin cannot be false while OIDC is unusable: with oidc.enabled, ' +
+        'oidc.issuer and oidc.clientId not all set there would be no way to sign in at all, ' +
+        'including the desktop shell. Finish configuring OIDC in the same save, or leave password ' +
+        'login enabled.',
+    );
+  }
 }
 
 /**

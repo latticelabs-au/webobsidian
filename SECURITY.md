@@ -71,6 +71,35 @@ safely. Key points:
   when you can name your proxy's address exactly. Do not adopt a broad range merely
   to get off the default, because a range containing clients is worse than the
   default. `HTTP_BIND=127.0.0.1` is worth setting either way, on its own merits.
+- **OIDC single sign-on (FR-15), if you turn it on.** It is a second door onto the *same*
+  single owner account, so treat it as a login method rather than as access control:
+  - **Fill in the allowlist.** `oidc.allowedSubjects` / `oidc.allowedGroups` are a union and
+    an entirely empty allowlist **admits nobody**, which is deliberate. The moment you add an
+    entry, everyone it matches is the owner: there is no user model, no roles and no per-user
+    vaults, so two admitted people have identical, complete read and write over every note.
+    Prefer a group (the membership decision then lives at the IdP) or an opaque `sub`; do not
+    assume an unmatched claim will be caught by something else, because there is nothing else.
+  - **The issuer must be `https`** (plain `http` is accepted only for a loopback host). The
+    client secret, the authorization code and the ID token all cross that connection, so on a
+    LAN every hop between here and the IdP can read them and mint a session as the owner.
+  - The **OIDC client secret lives in `data/settings.json`** with the other credentials. It is
+    write-only over the API (masked on the way out, never overwritten by the mask on the way
+    in), which protects it from the UI, not from anyone who can read the file. Keep `/data`
+    private, as for the git token and the API-key hashes.
+  - **`data/oidc-users.json` is personal data.** Every accepted federated login records the
+    issuer, the IdP subject and the display claims (name, email) of that identity. It is
+    written at mode `0600` and it authorizes nothing, but it is a list of real names and
+    addresses sitting beside `settings.json`: back it up and delete it with the same care.
+  - Federated logins are audit-logged (`[audit] federated login accepted …`) with the issuer
+    and subject only, never the name or email.
+  - **Password login stays enabled by default, and that default is load-bearing.** The
+    Electron desktop app logs itself in with a shared secret over `/auth/login`, so closing
+    the password door does not harden it, it breaks it. `oidc.allowPasswordLogin` records the
+    intent to close that door, but in the current build no route consults it, so assume the
+    password door is open and keep the master password strong.
+  - Logging out clears this app's cookie only; it does not end your session at the IdP. A
+    session already minted also survives being removed from the allowlist (the allowlist is
+    checked at login) until the cookie expires or a password change evicts it.
 - Have the reverse proxy pass the client's `Host` header through
   (`proxy_set_header Host $host;` in nginx, which is **not** the default), or set
   `PUBLIC_ORIGIN` to the origin(s) users type into the browser. The `/ws` upgrade

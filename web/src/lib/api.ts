@@ -351,6 +351,182 @@ export function liveSyncE2eeError(
   );
 }
 
+/** ---- Single sign-on (OIDC, FR-15) ----------------------------------------- */
+
+/**
+ * The endpoint that starts the OIDC flow, and the only correct way to reach it
+ * is a TOP-LEVEL NAVIGATION: `location.assign(SSO_LOGIN_PATH)`.
+ *
+ * Not `req()`, and not any other fetch. Three separate reasons, and each one on
+ * its own is fatal:
+ *
+ *  - `req()` throws on any non-2xx and returns a parsed body on success. The
+ *    whole point of this endpoint is the 302 it answers with, which `fetch`
+ *    follows internally to the IdP's own origin; the browser would then be
+ *    fetching a login page as XHR and the user would never see it.
+ *  - The CSP in server/src/index.ts sets `connectSrc: ['self', 'ws:', 'wss:']`,
+ *    so the cross-origin hop of that redirect chain is refused outright.
+ *  - The same CSP sets `formAction: ['self']`, so the other browser-side option,
+ *    a `<form action="https://idp/...">`, is refused as well.
+ *
+ * CSP governs neither `location.assign()` nor a server-issued 302, which is
+ * exactly the seam the server side is built on (see server/src/services/oidc.ts).
+ * The browser navigates to OUR path, and OUR server redirects onward.
+ */
+export const SSO_LOGIN_PATH = '/auth/oidc/login';
+
+/**
+ * The path the IdP sends the authorization response back to, byte-identical to
+ * `OIDC_CALLBACK_PATH` in server/src/services/settings.ts.
+ *
+ * Copied rather than imported for the usual reason (no module crosses the
+ * server/web workspace boundary), and this copy exists only so the settings
+ * panel can show the operator the exact string to register with their IdP.
+ * `redirect_uri` matching at an authorization server is an exact string
+ * comparison (RFC 6749 §3.1.2.3, a MUST in OpenID Connect Core §3.1.2.1), so a
+ * difference of one character is not a near miss: the IdP refuses the request
+ * before the user ever reaches a consent screen, with an error page that names
+ * nothing the operator can act on. Getting this wrong is the single most common
+ * OIDC setup failure, which is why the UI shows it rather than describing it.
+ */
+export const SSO_CALLBACK_PATH = '/auth/oidc/callback';
+
+/**
+ * The query parameter `routes/auth.ts` redirects a failed SSO attempt back to
+ * `/` with. Private: nothing outside this module should be reading the raw
+ * value, because the whole point of `ssoErrorMessage` below is that only a known
+ * code is ever turned into text.
+ */
+const SSO_ERROR_PARAM = 'sso_error';
+
+/**
+ * The closed set of failure reasons the callback can hand back, mirrored from
+ * `OidcErrorCode` in server/src/services/oidc.ts plus the `internal` catch-all
+ * that routes/auth.ts adds for anything that is not an `OidcError`.
+ *
+ * The server deliberately sends a code and not a message: the underlying error
+ * text can carry the issuer URL, a token endpoint response body or a client id,
+ * and an unauthenticated visitor can drive this entire path by visiting
+ * `/auth/oidc/login`. The detail stays in the server log; the browser gets an
+ * opaque token that this file, and only this file, turns into a sentence.
+ */
+export type SsoErrorCode =
+  | 'not_configured'
+  | 'discovery_failed'
+  | 'invalid_state'
+  | 'idp_rejected'
+  | 'exchange_failed'
+  | 'no_identity'
+  | 'not_allowed'
+  | 'internal';
+
+/**
+ * One sentence per code, written for the person staring at the login screen.
+ *
+ * Two audiences share this screen and they need different next steps, so each
+ * message says who has to do something: a user can retry an expired transaction
+ * or an IdP refusal themselves, while a missing client secret or an unreachable
+ * issuer is the operator's problem and no amount of clicking will fix it.
+ *
+ * None of them quote anything the server sent beyond the code itself. That is
+ * the guarantee this map exists to keep.
+ */
+const SSO_ERROR_MESSAGES: Record<SsoErrorCode, string> = {
+  not_configured:
+    'Single sign-on is not finished being set up on this server. Ask whoever runs it to complete the SSO settings.',
+  discovery_failed:
+    'This server could not reach the identity provider. Try again in a moment; if it keeps failing, the issuer address needs checking.',
+  invalid_state:
+    'That sign-in attempt expired or had already been used. Start again from this page.',
+  idp_rejected:
+    'The identity provider refused the sign-in. It may have been cancelled, or this app may not be permitted to sign you in.',
+  exchange_failed:
+    'The identity provider answered, but this server could not verify the response. Ask whoever runs it to check the client id and secret.',
+  no_identity:
+    'The identity provider did not say who you are, so no session could be created.',
+  not_allowed:
+    'You signed in with the identity provider, but that account is not allowed into this vault.',
+  internal: 'Single sign-on failed unexpectedly. The reason is in the server log.',
+};
+
+/**
+ * Turn a code from the callback into something worth showing.
+ *
+ * An unrecognised value is mapped to the generic sentence rather than rendered,
+ * which is not defensive padding: the value arrives in a query parameter, so it
+ * is whatever the visitor typed into their own address bar. Mapping first means
+ * an attacker-chosen string is never displayed to the person reading the page,
+ * even though React would escape it, and a code added by a future server build
+ * degrades to a vague message instead of a blank error line.
+ */
+export function ssoErrorMessage(code: string): string {
+  return SSO_ERROR_MESSAGES[code as SsoErrorCode] ?? SSO_ERROR_MESSAGES.internal;
+}
+
+/**
+ * The captured value, or `undefined` while nothing has looked yet. `null` is a
+ * real answer ("there was no error on this page load") and has to be
+ * distinguishable from "not read yet", which is why this is a three-state.
+ */
+let ssoErrorCapture: string | null | undefined;
+
+/**
+ * Read the failure code off the current URL, once, and scrub it out of the
+ * address bar.
+ *
+ * MEMOISED ON PURPOSE, and it is load-bearing rather than an optimisation.
+ * main.tsx renders under `React.StrictMode`, which deliberately double-invokes
+ * render bodies and effects in development: a plain "read it, then strip it"
+ * would return the code on the first call and `null` on the second, so the error
+ * the user needs to see would vanish before it was ever painted, in dev only.
+ * Memoising makes repeated calls answer identically no matter who calls or how
+ * often, so the callers do not have to care.
+ *
+ * The parameter is removed from the URL because it is a one-shot report about a
+ * navigation that already happened. Leaving it in place would mean a reload, a
+ * bookmark or a shared link re-displays a stale failure with nothing behind it,
+ * and `history.replaceState` does that without adding a history entry the Back
+ * button would have to walk through.
+ */
+export function consumeSsoError(): string | null {
+  if (ssoErrorCapture !== undefined) return ssoErrorCapture;
+  let code: string | null = null;
+  try {
+    const url = new URL(window.location.href);
+    code = url.searchParams.get(SSO_ERROR_PARAM);
+    if (code !== null) {
+      url.searchParams.delete(SSO_ERROR_PARAM);
+      window.history.replaceState(null, '', `${url.pathname}${url.search}${url.hash}`);
+    }
+  } catch {
+    // A URL this browser cannot parse is not worth failing a render over; the
+    // login screen simply shows no SSO error.
+    code = null;
+  }
+  ssoErrorCapture = code;
+  return code;
+}
+
+/**
+ * The redirect URI to register with the IdP, derived from the page the operator
+ * is looking at.
+ *
+ * Derived rather than read from settings because the server genuinely cannot
+ * know its own external origin from inside the process: a reverse proxy, a
+ * container port mapping and the Electron shell's 127.0.0.1 all disagree with
+ * what Node sees, while the browser is holding the one address that actually
+ * reached the app. It is shown as a suggestion to copy, never sent anywhere on
+ * its own, so a wrong guess costs nothing.
+ *
+ * `location.origin` carries no path, so an install served under a sub-path by a
+ * reverse proxy (https://host/notes/...) has to add that prefix by hand. The
+ * server's own check is "ends with the callback path" precisely to allow that
+ * shape, and the settings panel says so next to the value.
+ */
+export function ssoRedirectUri(): string {
+  return `${window.location.origin}${SSO_CALLBACK_PATH}`;
+}
+
 /** How loud a LiveSync verdict is. Maps onto a colour at each call site. */
 export type LiveSyncTone = 'off' | 'ok' | 'warn' | 'bad';
 
@@ -501,7 +677,15 @@ export const api = {
   // /auth/status is unauthenticated, so it deliberately reports nothing about
   // whether the default password is still in use. mustChangePassword comes from
   // /auth/login and /auth/me instead.
-  authStatus: () => req<{ passwordSet: boolean }>('/auth/status'),
+  //
+  // `ssoEnabled` is the one thing it does report, and it is a single boolean by
+  // design on the server side: the login screen has to decide whether to draw an
+  // SSO button before anyone has authenticated, so something has to be public.
+  // What is NOT public is anything about who: no issuer, no client id, no
+  // provider name, no hint about whether a given person would be let in. It is
+  // also `enabled AND completely configured` rather than just `enabled`, because
+  // a button that leads straight to an error page is worse than no button.
+  authStatus: () => req<{ passwordSet: boolean; ssoEnabled: boolean }>('/auth/status'),
   // There is deliberately no `setup()` here any more. It posted to
   // POST /auth/setup, which server/src/routes/auth.ts removed on purpose: it was
   // an unauthenticated "set the owner password and hand me a session cookie"
@@ -511,8 +695,12 @@ export const api = {
   // could still do was invite someone to wire a button onto a 404 and then
   // "fix" it by putting the route back. Removing the call site removes the
   // invitation.
+  // `sso` is always false here: this route only ever mints a session from a
+  // password. It is typed and reported anyway so /auth/login and /auth/me have
+  // one shape, and a caller can read one field in one place instead of inferring
+  // the session kind from which endpoint happened to answer.
   login: (password: string) =>
-    req<{ ok: true; mustChangePassword: boolean }>('/auth/login', {
+    req<{ ok: true; sso: boolean; mustChangePassword: boolean }>('/auth/login', {
       method: 'POST',
       body: JSON.stringify({ password }),
     }),
@@ -522,7 +710,20 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ currentPassword, newPassword }),
     }),
-  me: () => req<{ authenticated: boolean; mustChangePassword: boolean }>('/auth/me'),
+  /**
+   * Who am I, and does this session have to change its password?
+   *
+   * `sso` says the session was minted from an IdP login rather than from the
+   * password form, and the split between the two flags is the server's, not
+   * ours: `mustChangePassword` is the DECISION (the server already excludes SSO
+   * sessions from it, so a client that has never heard of SSO keeps working) and
+   * `sso` is the EXPLANATION (it lets the UI say why the change-password wall is
+   * not being shown, and suppress prompts that would make no sense to a
+   * federated user). App.tsx honours both; see the gate there for why a client
+   * that only read `mustChangePassword` would still be correct, and why reading
+   * `sso` too is worth the line anyway.
+   */
+  me: () => req<{ authenticated: boolean; sso: boolean; mustChangePassword: boolean }>('/auth/me'),
 
   // files
   tree: () => req<TreeNode>('/api/files/'),

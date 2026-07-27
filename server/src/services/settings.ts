@@ -352,6 +352,298 @@ const LiveSyncBlockSchema = z.object({
     }),
 });
 
+/**
+ * The path this server serves the OIDC authorization response on, as it appears
+ * in `redirect_uri`.
+ *
+ * It lives here, next to the setting it validates, because three separate places
+ * have to agree on it byte-for-byte and only one of them is a route file: the
+ * settings PUT refuses a redirectUri that does not end with it, the OIDC service
+ * builds the authorization request from the stored value, and the operator types
+ * the same string into the IdP's client registration. `redirect_uri` matching at
+ * the authorization server is an exact string comparison (RFC 6749 §3.1.2.3,
+ * restated as a MUST for OIDC in OpenID Connect Core §3.1.2.1), so a difference
+ * of one character is not a near miss: the IdP refuses the whole request, before
+ * the user ever reaches a consent screen, with an error page that names nothing
+ * this operator can act on.
+ *
+ * The leading `/auth` is the mount point of authRouter in server/src/index.ts.
+ * "Ends with" rather than "equals" is what the check below tests, because an
+ * install behind a reverse proxy that serves WebObsidian under a sub-path
+ * (https://host/notes/auth/oidc/callback) is a legitimate deployment and the
+ * server cannot know its own external prefix from inside the process.
+ */
+export const OIDC_CALLBACK_PATH = '/auth/oidc/callback';
+
+/**
+ * Trim, drop empties and de-duplicate a list of opaque strings, preserving order.
+ *
+ * Used for all three of the OIDC list fields (scopes, allowedSubjects,
+ * allowedGroups) because they want identical treatment: an operator pastes them
+ * one per line, so blank lines and stray padding are the normal input, and a
+ * duplicate entry means nothing in any of the three.
+ *
+ * Shared by both doors for the usual reason: the API normalises what it stores
+ * and the schema normalises what it loads, and a scope list that differed between
+ * the two would mean the authorization request sent after a save is not the one
+ * sent after a restart.
+ *
+ * Order is preserved rather than sorted, and nothing is case-folded. Sorting
+ * would rewrite input the operator reads back in the UI for no gain, and folding
+ * case would be actively wrong for the allowlists: `sub` is an opaque,
+ * case-sensitive string by specification, so lowercasing it turns a working
+ * allowlist entry into a lockout that looks identical to a working one.
+ */
+export function normalizeOidcList(values: string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const raw of values) {
+    const entry = raw.trim();
+    if (!entry || seen.has(entry)) continue;
+    seen.add(entry);
+    out.push(entry);
+  }
+  return out;
+}
+
+/**
+ * `openid` first, always. Without that scope the authorization request is a bare
+ * OAuth 2.0 request: the IdP is entitled to return an access token and NO
+ * id_token at all, so there is no signed subject to bind a session to and the
+ * whole point of this feature (persisting an identity rather than merely opening
+ * a door) quietly evaporates. The API refuses a scope list that omits it with a
+ * 400, so this heal only ever runs against a hand-edited file.
+ */
+function withOpenIdScope(scopes: string[]): string[] {
+  return scopes.includes('openid') ? scopes : ['openid', ...scopes];
+}
+
+/**
+ * True when the OIDC block is in a state the login flow can actually run in.
+ *
+ * Exported for the same structural reason as isUnsafeE2eePairing above: the HTTP
+ * layer, the schema's self-heal and (later) the OIDC service itself all have to
+ * ask this question in the same words, or an operator ends up with a block that
+ * one layer calls configured and another calls empty.
+ *
+ * `redirectUri` is deliberately NOT part of the test. It is validated when it is
+ * present, but an empty one is left to the service to fill in from the request
+ * that is actually arriving, which is the only place the server's external
+ * origin is knowable. `clientSecret` is not part of it either: a public client
+ * authenticating with PKCE alone has no secret, and this IdP supports that.
+ */
+export function isOidcUsable(o: { enabled: boolean; issuer: string; clientId: string }): boolean {
+  return Boolean(o.enabled && o.issuer && o.clientId);
+}
+
+/**
+ * Native OIDC single sign-on (FR-15), as a sibling of the `git` and `livesync`
+ * blocks.
+ *
+ * Why the identity is configured here at all, rather than being left to a
+ * reverse-proxy forward-auth: a forward-auth gate tells this process that SOMEONE
+ * authenticated and nothing else, so every visitor collapses into the one owner
+ * session and no per-user state can ever be built on top of it. It also only
+ * covers browsers, leaving the /api/v1 agent API, the Electron shell talking to
+ * 127.0.0.1 and the /ws upgrade unserved. Storing the issuer and the client here
+ * means the identity is something this server learns and can keep.
+ */
+const OidcBlockSchema = z.object({
+  /**
+   * Off by default, so this block appearing in an existing install changes
+   * nothing until an operator opts in. `.catch()` for the reason documented on
+   * `version`: a bad literal in a hand-edited file must not fail the parse and
+   * take jwtSecret, the API keys and git.token down with it.
+   */
+  enabled: z.boolean().default(false).catch(false),
+  /**
+   * Whether to send a PKCE challenge, and the reason this is a setting rather
+   * than a constant.
+   *
+   * PKCE should be on wherever it works, but hardcoding it locks out any IdP
+   * that genuinely does not support it, with no recourse for the operator.
+   * Hardcoding it OFF would be worse. So three states, and the default is the
+   * one that is both secure and correct against a real-world server:
+   *
+   *   'auto'  send S256 when the server advertises it, AND when the server says
+   *           nothing at all. Silence is not denial. This is not a hypothetical:
+   *           Pocket ID supports S256 per client but omits
+   *           `code_challenge_methods_supported` from its discovery document
+   *           entirely, so a strict reading of the metadata would silently
+   *           downgrade a working deployment. Only skip when the server
+   *           explicitly publishes a method list that excludes S256, which is
+   *           the one case where it has actually told us no.
+   *   'force' always send, for a server whose metadata is wrong in the other
+   *           direction (advertises a list that omits S256 while supporting it).
+   *   'off'   never send. The escape hatch for a server that rejects the
+   *           parameter outright.
+   *
+   * A silent PKCE downgrade is invisible in every log, which is why
+   * `describePkceDecision()` records the branch taken at connect time: the
+   * answer to "is PKCE actually on?" has to be observable, not inferred.
+   */
+  pkce: z.enum(['auto', 'force', 'off']).default('auto').catch('auto'),
+  /**
+   * The IdP's issuer identifier, e.g. https://auth.example.com.
+   *
+   * Stored WITHOUT a trailing slash, and the reason is the same shape as
+   * livesync.uri's: discovery appends a fixed suffix to this string
+   * (`issuer + "/.well-known/openid-configuration"`), so a stored trailing slash
+   * produces a double slash. Some servers tolerate that and some 404, and the
+   * ones that 404 do it in a way that looks like the IdP being down rather than
+   * like a settings typo. Both doors normalise identically so there is one
+   * stored form.
+   *
+   * The value is also compared against the `iss` claim of the returned id_token,
+   * which is another reason it has to be one canonical string rather than
+   * whatever the operator happened to paste.
+   */
+  issuer: z
+    .string()
+    .default('')
+    .transform((v) => v.trim().replace(/\/+$/, '')),
+  clientId: z
+    .string()
+    .default('')
+    .transform((v) => v.trim()),
+  /**
+   * The client secret, for a confidential client. NEVER trimmed, for the same
+   * reason the LiveSync secrets are not: it is an opaque credential issued by
+   * something else, this process never gets to decide which of its bytes are
+   * significant, and a silently trimmed secret fails as an authentication error
+   * at the token endpoint with nothing pointing back at the save that caused it.
+   *
+   * Empty is legitimate. A public client using PKCE alone has no secret, and
+   * that is a supported (and, where the redirect target is a desktop shell,
+   * preferable) configuration.
+   */
+  clientSecret: z.string().default(''),
+  /**
+   * Where the IdP sends the authorization response. Must end with
+   * OIDC_CALLBACK_PATH; see the note on that constant for why exact matching
+   * makes this field unforgiving.
+   *
+   * Trailing slashes are stripped rather than preserved. `/callback` and
+   * `/callback/` are two different registrations to an authorization server, and
+   * the form this Express app actually serves is the one without the slash, so
+   * normalising to it turns a paste artefact into a working configuration
+   * instead of an "invalid redirect_uri" page.
+   */
+  redirectUri: z
+    .string()
+    .default('')
+    .transform((v) => v.trim().replace(/\/+$/, '')),
+  /**
+   * The scopes requested at the authorization endpoint.
+   *
+   * The default is the minimum that yields a usable identity: `openid` for the
+   * id_token itself, `profile` and `email` for something human-readable to show
+   * next to the session. `groups` is deliberately NOT in the default, because
+   * asking for a claim nothing consults is a request for data this application
+   * has no reason to hold. Add it when allowedGroups is used, which is exactly
+   * what the API insists on (see assertUsableOidc in routes/settings.ts).
+   *
+   * The `.catch()` heals to the default list rather than to the empty one: an
+   * empty scope list is not a safer request, it is a request that returns no
+   * identity at all.
+   */
+  scopes: z
+    .array(z.string())
+    .default(['openid', 'profile', 'email'])
+    .transform((v) => withOpenIdScope(normalizeOidcList(v)))
+    .catch((ctx: { input: unknown }) => {
+      console.warn(
+        `[settings] refusing oidc.scopes ${JSON.stringify(ctx.input)}; requesting openid, profile, email instead`,
+      );
+      return ['openid', 'profile', 'email'];
+    }),
+  /**
+   * The IdP subjects (`sub` claims) allowed to take the owner session, and the
+   * groups allowed to do the same. EMPTY MEANS "ANY SUBJECT THE IdP WILL
+   * AUTHENTICATE", and that deserves to be said out loud rather than discovered.
+   *
+   * On a single-account homelab IdP that is exactly right and asking for an
+   * allowlist would be busywork. On a shared IdP (a work SSO, a family instance,
+   * anything with self-registration enabled) it means every account in the
+   * directory can log in as the owner of this vault, with full read and write
+   * over every note. The two fields are the boundary; there is no third thing
+   * checking anything. Set at least one of them whenever the IdP has more
+   * accounts than this vault has owners.
+   *
+   * Matching is on the raw claim values, so entries are trimmed and de-duplicated
+   * but never case-folded: `sub` is an opaque, case-sensitive string by
+   * specification, and lowercasing it would turn a non-match into a silent
+   * lockout that no amount of staring at the two strings explains.
+   *
+   * Both heal to the empty list on a malformed hand edit. That is the permissive
+   * direction, and it is the right one here only because the gate in front of it
+   * is the IdP: healing to a non-empty guess would invent an access rule nobody
+   * wrote, and healing to "deny everything" would lock the operator out of the
+   * instance with the fix living in the file that is already broken.
+   */
+  allowedSubjects: z
+    .array(z.string())
+    .default([])
+    .transform((v) => normalizeOidcList(v))
+    .catch((ctx: { input: unknown }) => {
+      console.warn(
+        `[settings] refusing oidc.allowedSubjects ${JSON.stringify(ctx.input)}; allowing any authenticated subject instead`,
+      );
+      return [] as string[];
+    }),
+  allowedGroups: z
+    .array(z.string())
+    .default([])
+    .transform((v) => normalizeOidcList(v))
+    .catch((ctx: { input: unknown }) => {
+      console.warn(
+        `[settings] refusing oidc.allowedGroups ${JSON.stringify(ctx.input)}; applying no group restriction instead`,
+      );
+      return [] as string[];
+    }),
+  /**
+   * Allowlist rules on a claim this app does not know the name of.
+   *
+   * The four fixed axes cover what OIDC standardises, and standardised claims
+   * are not what most IdPs key identity on. A real Pocket ID token carries
+   * `preferred_username`, `nextcloud_username` and `portainer_username` at once,
+   * because it lets an operator define per-client custom claims, and which one
+   * means "the user" is a deployment decision. So take the claim name from the
+   * operator rather than adding a fixed field per claim anyone might use.
+   *
+   * Rules OR with each other and with the fixed axes, matching how the fixed
+   * axes already behave. Claim names that are the same for every user of an
+   * issuer (`iss`, `aud`, `type`, ...) are refused at the API and dropped here:
+   * see RESERVED_CLAIMS in services/oidc.ts for why each one is on that list.
+   */
+  allowedClaims: z
+    .array(z.object({ claim: z.string(), values: z.array(z.string()) }))
+    .default([])
+    .catch((ctx: { input: unknown }) => {
+      console.warn(
+        `[settings] refusing oidc.allowedClaims ${JSON.stringify(ctx.input)}; applying no claim restriction instead`,
+      );
+      return [] as { claim: string; values: string[] }[];
+    }),
+  /**
+   * Whether the password form still works once SSO is configured. DEFAULT TRUE,
+   * and the default is a compatibility requirement rather than a preference.
+   *
+   * The Electron desktop shell starts the server itself and logs in without a
+   * human: it injects a shared secret as WEBOBSIDIAN_PASSWORD and posts it to
+   * /auth/login on startup. That path has no browser to redirect to an IdP and
+   * no way to complete an authorization code flow, so turning password login off
+   * does not harden the desktop app, it bricks it. The same is true of any
+   * scripted client that logs in with the owner password. Operators who want
+   * SSO-only should turn this off deliberately, after checking that nothing they
+   * run depends on the password door.
+   *
+   * Turning it off while OIDC is not usable locks every door at once, which the
+   * API refuses (assertUsableOidc) and the schema heals (enforceLoginReachable).
+   */
+  allowPasswordLogin: z.boolean().default(true).catch(true),
+});
+
 const SettingsBaseSchema = z.object({
   /**
    * Schema version of the file on disk. Two separate behaviours, and they need
@@ -453,6 +745,7 @@ const SettingsBaseSchema = z.object({
     })
     .default({}),
   livesync: LiveSyncBlockSchema.default({}),
+  oidc: OidcBlockSchema.default({}),
   search: z
     .object({
       fuzzy: z.number().default(0.2),
@@ -536,7 +829,52 @@ function enforceSyncSafety(s: SettingsBase): SettingsBase {
   return s;
 }
 
-const SettingsSchema = SettingsBaseSchema.transform(enforceSyncSafety);
+/**
+ * Refuse to load a settings file that has locked every door.
+ *
+ * `allowPasswordLogin: false` is only meaningful next to a working OIDC
+ * configuration. With OIDC disabled (or configured with no issuer or no client
+ * id) the same flag means there is no way into this instance at all: the password
+ * form is refused, the SSO button either is not rendered or leads to an
+ * authorization request that cannot be built, and the Electron shell's automatic
+ * WEBOBSIDIAN_PASSWORD login stops working too. Nobody chooses that state on
+ * purpose; it is what a half-finished hand edit or a restored backup looks like.
+ *
+ * Healing OPEN rather than closed, which is the unusual direction for this file
+ * and so needs its reason stated:
+ *
+ *   - "Open" here is not open. It restores the password door, which is itself
+ *     credential-gated, rate-limited (middleware/ratelimit.ts) and exactly the
+ *     door this install had before OIDC was configured. No one gets in who could
+ *     not already get in.
+ *   - The alternative is an instance the operator cannot reach through any
+ *     interface, whose only remedy is hand-editing the very file that put it in
+ *     that state. A recovery path that requires filesystem access to fix a
+ *     settings typo is not a recovery path for the people most likely to hit it.
+ *   - The API refuses to CREATE this state at all (assertUsableOidc in
+ *     routes/settings.ts answers 400), so this heal only ever meets a file that
+ *     did not come through the API.
+ *
+ * A transform rather than a throwing refinement, for the reason repeated all over
+ * this file: loadSettingsImpl treats ANY parse failure as "file unusable" and
+ * rewrites from defaults(), so throwing here would answer a login-configuration
+ * mistake by destroying jwtSecret, every API key and git.token.
+ */
+function enforceLoginReachable(s: SettingsBase): SettingsBase {
+  if (!s.oidc.allowPasswordLogin && !isOidcUsable(s.oidc)) {
+    console.warn(
+      '[settings] re-enabling password login: oidc.allowPasswordLogin is false while OIDC is not ' +
+        'usable (oidc.enabled, oidc.issuer and oidc.clientId must all be set), which would leave ' +
+        'no way to sign in at all. Finish configuring OIDC, then turn password login off again.',
+    );
+    s.oidc.allowPasswordLogin = true;
+  }
+  return s;
+}
+
+const SettingsSchema = SettingsBaseSchema.transform(enforceSyncSafety).transform(
+  enforceLoginReachable,
+);
 
 export type Settings = z.infer<typeof SettingsSchema>;
 export type ApiKeyRecord = z.infer<typeof ApiKeySchema>;
@@ -855,6 +1193,36 @@ export function redactSettings(s: Settings) {
       password: s.livesync.password ? REDACTED_SECRET : '',
       passphrase: s.livesync.passphrase ? REDACTED_SECRET : '',
       obfuscatePassphrase: s.livesync.obfuscatePassphrase ? REDACTED_SECRET : '',
+    },
+    oidc: {
+      ...s.oidc,
+      /**
+       * Same treatment, and the same reasoning, as livesync.uri above. Neither
+       * of these is a secret field, but both are URLs, and a hand-edited
+       * settings.json can perfectly well carry `https://user:pass@host` in one.
+       * The API refuses that form outright (requireOidcUrl in
+       * routes/settings.ts), so this is the belt to that braces: a credential
+       * this process did not write still cannot leave it through a settings
+       * response, which is the response most likely to be pasted into a support
+       * thread. redactUrlCreds is the identity on a URL without userinfo, which
+       * is every URL this build is willing to store.
+       *
+       * routes/settings.ts knows these masks exist and treats an incoming value
+       * that is exactly the masked form of the stored one as "unchanged", rather
+       * than persisting `https://***@host` and replacing a working issuer with a
+       * broken one on the next save from a UI that round-trips what it read.
+       */
+      issuer: redactUrlCreds(s.oidc.issuer),
+      redirectUri: redactUrlCreds(s.oidc.redirectUri),
+      /**
+       * Write-only over the API, exactly like the LiveSync secrets. Empty stays
+       * empty rather than becoming the mask, so the client can still tell "this
+       * is a public client with no secret" from "configured, value withheld" and
+       * render the two differently. Conflating them would be a real loss here,
+       * because "no secret" is a legitimate configuration for a PKCE public
+       * client rather than an unfinished one.
+       */
+      clientSecret: s.oidc.clientSecret ? REDACTED_SECRET : '',
     },
     api: {
       ...s.api,

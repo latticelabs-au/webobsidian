@@ -55,6 +55,10 @@ stack runs from a single `docker compose up`.
   attachments, optional auto-sync, and per-file **version history** (browse & restore).
 - 🔐 **Login gate**: a single master password (scrypt-hashed) protects everything; JWT in
   an httpOnly cookie.
+- 🪪 **OIDC single sign-on**: sign in through your own identity provider (Pocket ID,
+  Authentik, Keycloak…) over a server-side authorization-code + PKCE flow, gated by a
+  subject/group allowlist that admits nobody until you fill it in. Every allowlisted identity
+  maps onto the **one existing owner account**: it is a second door, not multi-user.
 - 🌐 **Public sharing**: turn any note into a read-only, server-rendered (SEO-friendly)
   public page at `/share/<token>`, optionally password-protected.
 - 🤖 **Agent API**: scoped API keys (`read` / `write` / `search`) let AI agents work with
@@ -390,7 +394,10 @@ See [PRD.md §2](PRD.md) for the full design.
 ## 🗺️ Compatibility & scope
 
 - ✅ Works directly on an existing Obsidian vault, including `.obsidian/` config.
-- ⚠️ **Single-user (v1)**: no real-time multi-user collaborative editing yet.
+- ⚠️ **Single-user (v1)**: no real-time multi-user collaborative editing yet. **OIDC SSO does
+  not change this**: there is no user model, so every identity your allowlist admits becomes
+  the same owner, with the same full read/write over every note. Do not deploy it expecting
+  per-user access control.
 - ⚠️ Git sync replaces Obsidian Sync/Publish.
 - ⚠️ Community-plugin support is a **subset** of the Obsidian API; plugins relying on
   Electron/Node internals may not work.
