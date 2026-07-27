@@ -1,7 +1,28 @@
 # PRD: WebObsidian
 
 > Product Requirements Document
-> Version: 1.5 · Updated: 2026-06-22 · Status: Draft
+> Version: 1.6 · Updated: 2026-07-27 · Status: Draft
+> Changelog 1.6 (FR-15: native OIDC single sign-on, requested by the user): adds **FR-15**, signing in with an
+> external **OpenID Connect** identity provider instead of (or beside) the master password. The entire
+> authorization-code flow runs **server side**: the browser hits `GET /auth/oidc/login`, the server discovers the
+> issuer, builds the authorization URL (`response_type=code`, `response_mode=query`, **S256 PKCE sent explicitly
+> even when the IdP's metadata does not advertise it**) and 302s the browser to the IdP; the callback validates
+> the response and exchanges the code itself. That is not a preference: the CSP in `server/src/index.ts`
+> (`formAction 'self'`, `connectSrc 'self'`) blocks both browser-side options, and `express.urlencoded()` is
+> registered nowhere, so a `form_post` response body would arrive empty. `state`, `nonce`, the PKCE verifier and
+> the redirect URI travel in **one** signed, single-use, 10-minute cookie (`sub: 'oidc-tx'`, path `/auth/oidc`,
+> `SameSite=Lax`). The session token keeps `sub: 'owner'` and carries the IdP identity in a **nested `idp`
+> claim**, because the top-level `sub` is the token KIND and is the only thing separating a share-unlock cookie
+> from an owner session; `cv` is still set, so a password change evicts federated sessions too. An SSO session is
+> **exempt from `mustChangePassword`**, whose only remedy is typing `123456`, which a federated user has never
+> been issued. Access is an **allowlist of IdP subjects and groups, and an empty allowlist lets NOBODY in**. Every
+> accepted login is recorded in `data/oidc-users.json` (issuer, subject, first/last seen, display claims), which
+> is the whole reason this is native rather than a reverse-proxy forward-auth: an implementation that
+> authenticates and then discards the subject leaves no groundwork behind it. **This is not multi-user**: every
+> allowlisted identity maps onto the single existing owner account, and password login stays enabled by default
+> because the Electron desktop shell logs itself in with a shared secret. New APIs: `GET /auth/oidc/login`,
+> `GET /auth/oidc/callback`; `GET /auth/status` gains `ssoEnabled`, `GET /auth/me` gains `sso`, and
+> `POST /auth/login` reports `sso: false`.
 > Changelog 1.5 (FR-13: cross-platform Electron desktop app, requested by the user): adds **FR-13**,
 > packaging WebObsidian into an **installable app** for macOS/Windows/Linux (arm64/x64/ia32). The new
 > `desktop/` workspace is an **Electron shell** that spawns the exact same existing Express server as a child
@@ -247,6 +268,9 @@ webobsidian/
   accepts the override password **whether or not** the user has already changed their password. There is no override by default.
 - Log in with one password → a JWT in an httpOnly cookie.
 - Every web route and file API requires auth (except `/login` and the healthcheck).
+- **Optionally, an external OIDC identity provider mints the same owner session** (FR-15). It is a second door
+  onto the one existing account, not a user system, and the password door stays open by default because the
+  Electron desktop shell logs itself in with a shared secret.
 
 ### FR-4 · GitHub sync
 - Configuration: repo URL, branch, token (PAT) or deploy key, commit name/email.
@@ -260,7 +284,7 @@ webobsidian/
 
 ### FR-5 · Settings (JSON db)
 - All configuration lives in `data/settings.json` (atomic write, with a backup).
-- Groups: vault, auth, git, search, api, ui, plugins.
+- Groups: vault, auth, git, oidc, search, api, ui, plugins.
 - A Settings UI to view/edit it; validated with a schema (zod).
 
 ### FR-6 · API Gate (AI Agent)
@@ -433,6 +457,122 @@ existing Express server + SPA (no code fork, no architecture change), so every w
 - **Scope (non-goals)**: no auto-update yet (users download new builds by hand); no code signing yet; no bundled portable
   git; no running several windows/vaults in parallel within one instance (single-instance lock).
 
+### FR-15 · Native OIDC single sign-on
+Goal: let the owner sign in through an external **OpenID Connect** identity provider (Pocket ID, Authentik,
+Keycloak, Authelia, Zitadel, …) instead of, or beside, the master password of FR-3.
+
+**Why native, and why not a forward-auth proxy.** Putting Authelia/Authentik/tinyauth in front of the app was
+considered and rejected. A forward-auth gate tells this process that *somebody* authenticated and nothing more,
+so every visitor collapses into the one owner session and no per-user state can ever be built on top of it; and
+it only covers browsers, leaving the `/api/v1` agent API, the Electron shell talking to `127.0.0.1` and the `/ws`
+upgrade unserved. The requirement is therefore to **persist the identity**, not merely to gate the door: an
+implementation that authenticates and then throws the IdP subject away gives working SSO and zero groundwork,
+which is the specific failure this feature exists to avoid.
+
+- **The flow is entirely server side.** `GET /auth/oidc/login` → the server performs OIDC discovery against
+  `oidc.issuer`, builds the authorization URL and 302s the browser to the IdP. `GET /auth/oidc/callback` → the
+  server validates the response, exchanges the code at the token endpoint and validates the ID token. The
+  browser never talks to the IdP through this app's own code. Two independent walls in `server/src/index.ts`
+  make that the only workable shape: the CSP sets `formAction: 'self'` (so a `<form action="https://idp/…">` is
+  refused) and `connectSrc: 'self'` (so a browser-side `fetch()` to the IdP is refused), while CSP governs
+  neither `location.assign()` nor a server-issued 302.
+- **`response_mode=query`, never `form_post`.** Two reasons, either fatal on its own: the server registers
+  `express.json()` and no `express.urlencoded()` anywhere, so a `form_post` body arrives empty; and a
+  `SameSite=Lax` cookie is not sent on a cross-site top-level POST, so the transaction cookie would be invisible
+  on exactly the request that must read it. `query` is also the spec default when the issuer publishes no
+  `response_modes_supported`, which the reference IdP does not.
+- **One signed, single-use transaction cookie.** `state`, `nonce`, the PKCE verifier and the exact
+  `redirect_uri` are sealed into `webobsidian_oidc_tx`: an HS256 JWT signed with `auth.jwtSecret`, TTL 10 minutes
+  (long enough for a TOTP prompt or a passkey), `httpOnly`, `SameSite=Lax` (the callback is a cross-site
+  top-level GET, so `strict` would withhold it), scoped to the path `/auth/oidc` so it rides on nothing else. Its
+  `sub` is `oidc-tx`, which keeps it in a different token-kind namespace from `owner` sessions and `share` unlock
+  cookies signed with the same secret. Replay is refused on both halves: the callback clears the cookie before
+  anything can fail, and the transaction's `jti` is recorded in an in-memory single-use set for its own TTL.
+- **PKCE is sent explicitly, and what it does and does not buy is stated.** The reference IdP publishes no
+  `code_challenge_methods_supported`, so any helper that gates PKCE on server metadata concludes the server does
+  not support it and silently omits the challenge. `code_challenge`/`code_challenge_method=S256` are therefore
+  passed to `buildAuthorizationUrl()` by hand and the verifier is passed to `authorizationCodeGrant()` by hand;
+  openid-client v6's `supportsPKCE()` belief is advisory and is not consulted on either path, so S256 PKCE really
+  is on the wire. An IdP that does not advertise the method is however not obliged to *enforce* it, so PKCE here
+  is defence in depth. What actually binds the callback to the browser that started it is the signed, single-use
+  transaction: `state` must match, `nonce` must appear inside the signed ID token, and the `jti` must be unused.
+- **Token validation.** The ID token's signature is checked against the discovered `jwks_uri` with the algorithm
+  pinned to `RS256` (`id_token_signed_response_alg`), along with `iss`, `aud`, `exp` and `nonce`; an ID token is
+  required, so an access token alone cannot produce a session. `userinfo` is fetched only when a claim an
+  allowlist depends on is missing from the ID token (or when there is nothing human-readable at all), and the ID
+  token wins on every field it carried. The expected subject is passed to the userinfo call, so a response for a
+  different user cannot be merged into the identity.
+- **Access control: an allowlist of subjects and groups, empty means nobody.** `oidc.allowedSubjects` and
+  `oidc.allowedGroups` are a union (any one match admits), because a real deployment mixes them: a group for the
+  team, a subject for the break-glass account. Subjects compare exactly (`sub` is opaque and case-sensitive by
+  specification); groups compare case-insensitively. **An entirely empty allowlist fails closed and admits
+  nobody.** The convenient default would be "empty means everyone", and on a shared IdP with self-registration
+  that turns a half-finished settings page into open registration on a private note vault. A locked-out operator
+  can still use the password door; a world-readable vault cannot be un-read. Saving `allowedGroups` without the
+  `groups` scope is refused with a 400, because the claim is only issued when the scope is requested and an
+  allowlist that can never match is not a boundary.
+- **The session keeps `sub: 'owner'` and nests the identity.** `issueToken()` mints
+  `{ sub: 'owner', cv, idp: { iss, sub } }`. The top-level `sub` is a token KIND, and it is the only thing
+  stopping a `sub: 'share'` unlock cookie from being replayed as a full owner session, so an IdP-controlled
+  string must never land there: an account named `owner` or `share` would otherwise mint the wrong kind of token
+  entirely. `cv` (the credential fingerprint) is set on federated sessions too, so changing the password still
+  evicts them, which is the only session-eviction mechanism this app has. `readSession()` was added beside
+  `verifyToken()` rather than changing its signature, so the two hot call sites (the auth middleware and the
+  `/ws` upgrade) keep their boolean contract.
+- **SSO sessions are exempt from `mustChangePassword`.** That flag gates the entire app in `web/src/App.tsx` and
+  its only remedy submits `changePassword('123456', …)`. A federated user on an instance that never moved off
+  the default password would face a wall whose exit is a password they were never issued. The exemption is
+  computed on the server (`GET /auth/me` returns `mustChangePassword: !sso && !hasCustomPassword`) so that a
+  client that has never heard of SSO keeps working and no future client has to re-derive it. It does not weaken
+  the password, disable the local login, or mark the instance as having a custom password: it is a property of
+  the session, so a password session on the same instance still sees the prompt.
+- **The identity is persisted.** Every accepted login is recorded in `data/oidc-users.json` (`iss`, `sub`,
+  `firstSeen`, `lastSeen`, and the display claims as of the last login), written debounced and atomically at mode
+  `0600`, deliberately outside `settings.json` so record-keeping never queues behind a password change. It
+  authorizes nothing today: no read of it gates a request and adding a row by hand does not create a user. It
+  exists so that the day a real user model arrives, "who has used this instance, under what identity" is a
+  migration rather than a rewrite. One `[audit]` line per federated login records `iss|sub` (never the display
+  claims, which have no audit value the subject does not already provide).
+- **Failures are opaque to the browser and precise in the log.** Every failure path 302s to
+  `/?sso_error=<code>` with `code` drawn from a closed set (`not_configured`, `discovery_failed`,
+  `invalid_state`, `idp_rejected`, `exchange_failed`, `no_identity`, `not_allowed`, `internal`); the detail,
+  which can contain the issuer URL or a token-endpoint response body, is logged server side only, because an
+  unauthenticated visitor can drive this whole path by visiting `/auth/oidc/login`. Discovery is lazy (a
+  misconfigured or unreachable IdP never delays or fails startup), cached per configuration (issuer + client id +
+  secret, so a settings change invalidates it with no restart), and **a failed discovery is not cached**, so a
+  transient DNS blip does not leave the SSO button permanently broken. Both SSO endpoints are rate limited (30
+  per 15 minutes, per surface, with separate stores so a login and its callback do not share one budget).
+- **Settings and UI.** A new `oidc` block in `data/settings.json` (§6) holds `enabled`, `issuer`, `clientId`,
+  `clientSecret`, `redirectUri`, `scopes`, `allowedSubjects`, `allowedGroups` and `allowPasswordLogin`, edited
+  under **Settings → the OIDC tab**. `clientSecret` is write-only over the API: it is masked with the shared
+  `••••••••` sentinel by `redactSettings()` and is only overwritten when the incoming value is non-empty and is
+  not the sentinel, so saving a form that loaded redacted values cannot wipe it. The issuer must be `https`
+  (plain `http` only for a loopback host, because the client secret, the authorization code and the ID token all
+  cross that connection), neither URL may embed credentials or carry a fragment, and `redirectUri` must end with
+  `/auth/oidc/callback`, which is the path this server answers on. The login screen offers the SSO entry point
+  only when `GET /auth/status` reports `ssoEnabled`, which is one public bit ("this instance can federate") and
+  discloses no issuer, client id or allowlist shape.
+- **Password login stays on.** `oidc.allowPasswordLogin` defaults to **true**, and that default is a
+  compatibility requirement rather than a taste: the Electron desktop shell starts the server itself and logs in
+  without a human, by posting a per-machine shared secret (`WEBOBSIDIAN_PASSWORD`) to `/auth/login`. It has no
+  browser to send to an IdP, so turning password login off does not harden the desktop app, it bricks it. The
+  same is true of any scripted client. Turning the flag off while OIDC is unusable is refused by the API (400)
+  and healed on load, because it would otherwise lock every door at once with the only remedy being a hand edit
+  of `settings.json`. **Status:** the flag is stored, validated and healed, but `POST /auth/login` does not yet
+  consult it, so in this build the password door is always open; see IMPLEMENTATION_PLAN Phase 28.
+- **Scope (non-goals), stated so nobody deploys this expecting team access control**:
+  - **This is not multi-user.** Every allowlisted IdP identity maps onto the **single existing owner account**.
+    The app has no user model: no roles, no permissions, no per-user vaults, no per-user workspace state, no
+    per-user shares or API keys. Two people admitted by the allowlist are the same owner with the same full read
+    and write over every note, and nothing distinguishes their sessions except a claim nobody dispatches on.
+  - No RP-initiated logout: `POST /auth/logout` clears the local cookie only and does not call the IdP's
+    `end_session_endpoint`, so the IdP session survives.
+  - No refresh tokens and no tracking of the IdP's session lifetime. The 30-day owner cookie is the session, and
+    an account disabled at the IdP keeps its existing cookie until it expires, is evicted by a password change,
+    or is removed from the allowlist (which takes effect on the next login, not on the current session).
+  - No device-code or hybrid flows, no dynamic client registration, no JIT/SCIM provisioning, no group-to-role
+    mapping (there are no roles), and no OIDC path for the `/api/v1` agent API, which continues to use API keys.
+
 ---
 
 ## 4. Non-functional requirements (NFR)
@@ -479,10 +619,15 @@ existing Express server + SPA (no code fork, no architecture change), so every w
 #                             # it was deleted rather than re-guarded. First run is now: log in with
 #                             # the default password (or WEBOBSIDIAN_PASSWORD), then
 #                             # POST /auth/change-password (forced by `mustChangePassword`).
-POST   /auth/login            # login → cookie
-POST   /auth/logout
+POST   /auth/login            # login → cookie; → { ok, sso:false, mustChangePassword }
+POST   /auth/logout           # clears the local cookie only (no RP-initiated logout at the IdP)
 POST   /auth/change-password  # change pass: { currentPassword, newPassword } (auth required)
-GET    /auth/me
+GET    /auth/me               # → { authenticated, sso, mustChangePassword } (auth required)
+GET    /auth/status           # unauthenticated → { passwordSet, ssoEnabled }; deliberately says nothing
+                              # about mustChangePassword (see NFR Security)
+GET    /auth/oidc/login       # FR-15: 302 → the IdP authorization endpoint, sets the transaction cookie
+GET    /auth/oidc/callback    # FR-15: authorization response → session cookie + 302 /,
+                              # or 302 /?sso_error=<code> (closed set of codes, detail only in the log)
 GET    /api/files            # directory tree
 GET    /api/files/*path      # read a file (md/binary)
 PUT    /api/files/*path      # write
@@ -554,6 +699,21 @@ GET    /api/v1/tags
               "token": "", "authorName": "", "authorEmail": "",
               "autoSync": false, "intervalSec": 300,
               "lfsPatterns": ["*.png","*.jpg","*.pdf","*.mp4"] },
+  // FR-15. `enabled` off by default, so this block appearing in an existing install changes nothing.
+  // `issuer` is stored WITHOUT a trailing slash (discovery is `issuer + "/.well-known/openid-configuration"`
+  // string concatenation, and the value is compared against the id_token's `iss`); https is required except
+  // for a loopback host. `clientSecret` is write-only over the API: redactSettings() masks it with the shared
+  // `••••••••` sentinel and a PUT only overwrites it when the incoming value is non-empty AND is not that
+  // sentinel, so saving a form that loaded redacted values cannot destroy it. Empty is a legitimate value for
+  // a public (PKCE-only) client as far as the schema and the API are concerned. `redirectUri` must end with
+  // `/auth/oidc/callback`; empty means "derive it from the arriving request", which is correct for a single-host
+  // install and wrong the moment a proxy rewrites the host or the path. `allowedSubjects`/`allowedGroups` are a
+  // union and AN EMPTY ALLOWLIST ADMITS NOBODY; `allowedGroups` requires the `groups` scope (the API answers 400
+  // otherwise, because the claim is only issued when it is requested). `allowPasswordLogin` defaults to true and
+  // must stay true while OIDC is unusable, or the Electron shell's automatic login breaks with no way back in.
+  "oidc":   { "enabled": false, "issuer": "", "clientId": "", "clientSecret": "",
+              "redirectUri": "", "scopes": ["openid","profile","email"],
+              "allowedSubjects": [], "allowedGroups": [], "allowPasswordLogin": true },
   "search": { "fuzzy": 0.2, "indexFrontmatter": true },
   "api":    { "keys": [ { "id": "...", "name": "agent1",
                           "hash": "...", "scopes": ["read","search"],
@@ -574,6 +734,30 @@ GET    /api/v1/tags
     // never rewrites the record), so a share created before the cost bump keeps its old
     // parameters and stays verifiable through the legacy 3-field branch.
 ]
+```
+
+### `data/oidc-users.json` (federated identities seen, FR-15)
+```jsonc
+// Keyed by `<iss>|<sub>`. Written debounced (10s) and atomically at mode 0600, and kept OUT of
+// settings.json on purpose: it is telemetry-grade record-keeping written on the login path, and it has no
+// business queueing behind (or ahead of) a password change over one shared cache and one shared file.
+//
+// IT AUTHORIZES NOTHING. Every allowlisted identity maps onto the single owner account, so no read of this
+// file gates a request, no absence of a record denies one, and adding a row by hand does not create a user.
+// It exists so that the day a real user model arrives, "who has used this instance and under what identity"
+// is answerable from data already on disk: a migration rather than a rewrite that asks everyone to re-enrol.
+// Best effort by design (a hard kill can lose up to 10s of updates); the identity is re-recorded next login.
+{
+  "https://auth.example.com|8f3c…": {
+    "iss": "https://auth.example.com",
+    "sub": "8f3c…",                       // opaque, stable, never reassigned by the IdP
+    "firstSeen": "2026-07-27T10:00:00.000Z",
+    "lastSeen":  "2026-07-27T18:22:41.000Z",
+    // Display claims as of the MOST RECENT login (any of them may be empty): overwritten every time, because
+    // they are the IdP's current answer. The subject is what stays fixed.
+    "name": "Ada Lovelace", "email": "ada@example.com", "preferredUsername": "ada"
+  }
+}
 ```
 
 ---

@@ -9,8 +9,10 @@ import {
   liveSyncToneColor,
   liveSyncVerdict,
   secretWillBeSet,
+  ssoRedirectUri,
   MIN_PASSWORD_LEN,
   REDACTED_SECRET,
+  SSO_CALLBACK_PATH,
   type LiveSyncSecretKey,
   type LiveSyncStatus,
   type SecretChange,
@@ -30,6 +32,7 @@ type Section =
   | 'sharing'
   | 'plugins'
   | 'appearance'
+  | 'sso'
   | 'account'
   | 'about';
 
@@ -50,7 +53,7 @@ export default function Settings() {
       <div className="modal settings-modal" onClick={(e) => e.stopPropagation()}>
         <div className="settings-layout">
           <div className="settings-nav">
-            {(['vault', 'git', 'livesync', 'api', 'sharing', 'plugins', 'appearance', 'account', 'about'] as Section[]).map((s) => (
+            {(['vault', 'git', 'livesync', 'api', 'sharing', 'plugins', 'appearance', 'sso', 'account', 'about'] as Section[]).map((s) => (
               <button key={s} className={section === s ? 'active' : ''} onClick={() => setSection(s)}>
                 {labels[s]}
               </button>
@@ -64,6 +67,7 @@ export default function Settings() {
             {section === 'sharing' && <Shares />}
             {section === 'plugins' && <Plugins />}
             {settings && section === 'appearance' && <Appearance s={settings} />}
+            {settings && section === 'sso' && <SsoSettings s={settings} reload={() => api.getSettings().then(setSettings)} />}
             {section === 'account' && <AccountSettings s={settings} reload={() => api.getSettings().then(setSettings)} />}
             {section === 'about' && <About />}
           </div>
@@ -81,6 +85,7 @@ const labels: Record<Section, string> = {
   sharing: 'Sharing',
   plugins: 'Community Plugins',
   appearance: 'Appearance',
+  sso: 'Single Sign-On (OIDC)',
   account: 'Account',
   about: 'About',
 };
@@ -332,6 +337,11 @@ const LIVESYNC_SECRETS: { key: LiveSyncSecretKey; name: string; desc: string }[]
 
 /**
  * One credential input, plus the two affordances the round-trip rule needs.
+ *
+ * Shared by the three LiveSync secrets and by the OIDC client secret, because
+ * the rule below is a property of the settings API rather than of any one block:
+ * every secret field in `PUT /api/settings` goes through the same `readSecret()`
+ * and therefore has the same three states and the same trap.
  *
  * The server sends `REDACTED_SECRET` in place of a stored secret and reads that
  * same string back as "the client did not change this" (see `readSecret` in
@@ -825,6 +835,398 @@ function LiveSyncSettings({ s, reload }: { s: any; reload: () => void }) {
           }}
         />
       </div>
+    </div>
+  );
+}
+
+/**
+ * Split a textarea the operator pastes one entry per line into a list.
+ *
+ * Newlines rather than spaces, and only for the two allowlists. A group name may
+ * legitimately contain a space ("Vault Admins"), so splitting those on
+ * whitespace would silently turn one entry into two that match nothing, and the
+ * symptom is a lockout that looks identical to a working configuration when you
+ * read the settings page. Scopes are the opposite case and are split on
+ * whitespace instead: a space is the OAuth scope delimiter by specification, so
+ * a scope cannot contain one, and the server refuses an entry that does.
+ *
+ * Blank lines and padding are dropped here as well as on the server, which
+ * de-duplicates and trims identically (`normalizeOidcList`). Doing it on both
+ * sides means the value the operator reads back after a save is the value that
+ * was sent, rather than a tidied version of it that looks like an edit.
+ */
+function splitLines(value: string): string[] {
+  return value
+    .split('\n')
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+}
+
+/**
+ * Native OIDC single sign-on (FR-15), built on the same shape as the Git and
+ * LiveSync panels: the `Row` helper, one Save button, one message line.
+ *
+ * WHY THIS BLOCK EXISTS AT ALL, since a reverse-proxy forward-auth (Authelia,
+ * Authentik, tinyauth) is the usual answer and would need no settings page: a
+ * forward-auth gate tells this server that SOMEBODY authenticated and nothing
+ * else, so every visitor collapses into the single owner session and no per-user
+ * state can ever be built on it. It also only covers browsers, leaving the
+ * /api/v1 agent API, the Electron shell talking to 127.0.0.1 and the /ws upgrade
+ * unserved. Configuring the issuer here means the identity is something this
+ * server learns and keeps.
+ *
+ * The three fields most likely to be got wrong are called out on screen rather
+ * than left to documentation: the redirect URI (exact string matching at the
+ * IdP, no near misses), the allowlists (empty means any account the IdP will
+ * authenticate) and password sign-in (turning it off breaks the desktop shell).
+ */
+function SsoSettings({ s, reload }: { s: any; reload: () => void }) {
+  const o = s.oidc ?? {};
+  const [cfg, setCfg] = useState({
+    enabled: Boolean(o.enabled),
+    // The issuer and the redirect URI arrive already masked by redactUrlCreds()
+    // in case a hand-edited settings.json embedded credentials in one of them.
+    // Round-tripping that mask is safe: the settings PUT recognises "the masked
+    // form of what is stored" as "unchanged" and leaves the stored URL alone,
+    // precisely so a form that shows what it read cannot replace a working URL
+    // with a broken one.
+    issuer: o.issuer ?? '',
+    clientId: o.clientId ?? '',
+    redirectUri: o.redirectUri ?? '',
+    scopes: (o.scopes ?? ['openid', 'profile', 'email']).join(' '),
+    allowedSubjects: (o.allowedSubjects ?? []).join('\n'),
+    allowedGroups: (o.allowedGroups ?? []).join('\n'),
+    // Defaults TRUE when absent, matching the schema. Reading a missing value as
+    // false would render a settings page claiming the password door is shut on
+    // an install where it is wide open.
+    allowPasswordLogin: o.allowPasswordLogin !== false,
+  });
+  const set = <K extends keyof typeof cfg>(k: K, v: (typeof cfg)[K]) =>
+    setCfg((p) => ({ ...p, [k]: v }));
+
+  // The client secret obeys the same round-trip rule as the LiveSync secrets, so
+  // it uses the same editor and the same three-state change model. It is the one
+  // field on this page where a mistake is silent: the server stores whatever
+  // non-sentinel string arrives, and the failure surfaces later as the token
+  // endpoint refusing every login with nothing pointing back at this save.
+  const [secret, setSecret] = useState<string>(o.clientSecret ?? '');
+  const [secretStored, setSecretStored] = useState(o.clientSecret === REDACTED_SECRET);
+  const [secretTouched, setSecretTouched] = useState(false);
+  const [secretCleared, setSecretCleared] = useState(false);
+  const [err, setErr] = useState('');
+  const [msg, setMsg] = useState('');
+  const [copied, setCopied] = useState(false);
+
+  const secretChange: SecretChange = secretCleared
+    ? 'clear'
+    : secretTouched && secret
+      ? 'set'
+      : 'keep';
+
+  const suggestedRedirectUri = ssoRedirectUri();
+
+  /**
+   * Copy the redirect URI, and say so honestly when it could not be copied.
+   *
+   * `navigator.clipboard` is undefined outside a secure context, which is
+   * exactly the plain-http self-hosted deployment this app is built for, so a
+   * button that reported success unconditionally would leave the operator
+   * pasting whatever was in the clipboard before into their IdP. The value is
+   * also rendered in a selectable read-only input for that reason: the button is
+   * the convenience, the field is the guarantee.
+   */
+  const copyRedirectUri = async () => {
+    setErr('');
+    try {
+      if (!navigator.clipboard) throw new Error('clipboard unavailable');
+      await navigator.clipboard.writeText(suggestedRedirectUri);
+      setCopied(true);
+    } catch {
+      setCopied(false);
+      setErr('Could not reach the clipboard. Select the address above and copy it by hand.');
+    }
+  };
+
+  const save = async () => {
+    setErr('');
+    setMsg('');
+    const issuer = cfg.issuer.trim().replace(/\/+$/, '');
+    const clientId = cfg.clientId.trim();
+    const redirectUri = cfg.redirectUri.trim().replace(/\/+$/, '');
+    const scopes = cfg.scopes.split(/\s+/).filter(Boolean);
+    const allowedSubjects = splitLines(cfg.allowedSubjects);
+    const allowedGroups = splitLines(cfg.allowedGroups);
+
+    // Everything from here to the request is a user-experience affordance and
+    // never the control. `assertUsableOidc` in server/src/routes/settings.ts
+    // applies every one of these rules to the MERGED settings draft and is what
+    // actually decides; the schema heals a hand-edited file on top of that. What
+    // the local copies buy is a sentence naming the field to change, because the
+    // server's 400 arrives as a paragraph under a Save button and three of these
+    // four rules are counter-intuitive enough that an operator would not guess
+    // which box caused it.
+    if (cfg.enabled && !issuer) {
+      setErr('Issuer is required when single sign-on is enabled.');
+      return;
+    }
+    if (cfg.enabled && !clientId) {
+      setErr('Client ID is required when single sign-on is enabled.');
+      return;
+    }
+    if (redirectUri && !redirectUri.endsWith(SSO_CALLBACK_PATH)) {
+      setErr(`Redirect URI must end with ${SSO_CALLBACK_PATH}, which is the path this server answers on.`);
+      return;
+    }
+    if (!scopes.includes('openid')) {
+      // The server refuses this with a 400 rather than silently adding the
+      // scope, and so does this page, for the same reason: without `openid` the
+      // authorization request is plain OAuth 2.0, the IdP is entitled to return
+      // an access token and no id_token at all, and there is then no signed
+      // subject to attach a session to. Quietly fixing it would leave the
+      // operator debugging a consent screen they did not ask for.
+      setErr("Scopes must include 'openid', or the identity provider is not required to say who you are.");
+      return;
+    }
+    if (allowedGroups.length > 0 && !scopes.includes('groups')) {
+      setErr(
+        "Allowed groups requires the 'groups' scope: the identity provider only issues the groups " +
+          'claim when it is asked for, so an allowlist of groups that are never requested can never ' +
+          'match. Add groups to the scopes, or clear the group allowlist.',
+      );
+      return;
+    }
+    if (!cfg.allowPasswordLogin && !(cfg.enabled && issuer && clientId)) {
+      setErr(
+        'Password sign-in cannot be turned off while single sign-on is incomplete: with SSO not ' +
+          'enabled, or the issuer or client ID missing, there would be no way to sign in at all, ' +
+          'including the desktop app. Finish the SSO settings in this same save, or leave password ' +
+          'sign-in on.',
+      );
+      return;
+    }
+
+    const oidc: Record<string, unknown> = {
+      enabled: cfg.enabled,
+      issuer,
+      clientId,
+      redirectUri,
+      scopes,
+      allowedSubjects,
+      allowedGroups,
+      allowPasswordLogin: cfg.allowPasswordLogin,
+    };
+    // 'keep' sends nothing at all. The sentinel would be ignored by the server
+    // anyway, but omitting the key says what is meant and keeps the mask out of
+    // the request body entirely. 'clear' sends an explicit JSON null, which is
+    // the server's documented signal for "remove this" and the only thing a text
+    // input cannot produce by accident.
+    if (secretChange === 'set') oidc.clientSecret = secret;
+    else if (secretChange === 'clear') oidc.clientSecret = null;
+
+    try {
+      await api.putSettings({ oidc });
+    } catch (e) {
+      setErr(apiErrorMessage(e, 'Could not save the single sign-on settings'));
+      return;
+    }
+    // Re-derive the credential editor from what was just applied rather than
+    // from a re-read: the server either applied exactly this patch or threw, so
+    // a re-read cannot say anything the request did not already decide, and the
+    // props this component was built from do not update in place.
+    const nowStored = secretWillBeSet(secretStored, secretChange);
+    setSecretStored(nowStored);
+    setSecret(nowStored ? REDACTED_SECRET : '');
+    setSecretTouched(false);
+    setSecretCleared(false);
+    reload();
+    setMsg('Saved single sign-on settings');
+  };
+
+  return (
+    <div>
+      <h2>Single Sign-On (OIDC)</h2>
+      <p style={{ color: 'var(--text-muted)' }}>
+        Sign in with an OpenID Connect provider instead of the vault password. This server runs the
+        authorization code flow itself and records who signed in, rather than sitting behind a proxy
+        that only reports that somebody did.
+      </p>
+      <Row name="Enable single sign-on" desc="The login screen shows a Sign in with SSO button once this block is complete.">
+        <input type="checkbox" checked={cfg.enabled} onChange={(e) => set('enabled', e.target.checked)} />
+      </Row>
+      <Row name="Issuer" desc="The provider's issuer identifier, e.g. https://auth.example.com. No trailing slash, no query string.">
+        <input
+          className="text-input"
+          style={{ width: 260 }}
+          value={cfg.issuer}
+          onChange={(e) => set('issuer', e.target.value)}
+        />
+      </Row>
+      <Row name="Client ID" desc="From the client you registered at the provider">
+        <input
+          className="text-input"
+          style={{ width: 260 }}
+          value={cfg.clientId}
+          onChange={(e) => set('clientId', e.target.value)}
+        />
+      </Row>
+      {/*
+        The one place this page can disagree with the login screen, so it says so
+        rather than leaving it to be discovered.
+
+        The settings API accepts an empty secret (a public client authenticating
+        with PKCE alone is a legitimate registration, and the schema documents it
+        as such), but `isOidcAvailable()` in server/src/services/oidc.ts, which is
+        what /auth/status answers and therefore what decides whether the button
+        is drawn, treats a missing secret as "not configured". So a block saved
+        without one is stored happily, reports no error, and produces a login
+        screen with no SSO button on it: exactly the silent, self-inflicted
+        failure this panel exists to prevent.
+      */}
+      {cfg.enabled && !secretWillBeSet(secretStored, secretChange) && (
+        <div style={{ color: '#d29922', margin: '6px 0' }}>
+          Single sign-on is enabled with no client secret stored. The login screen only offers the
+          SSO button once a secret is saved, so add the one your provider issued for this client.
+        </div>
+      )}
+      <SecretRow
+        name="Client secret"
+        desc="Stored server-side, never sent back to this page. Issued by the provider alongside the client ID."
+        value={secret}
+        stored={secretStored}
+        cleared={secretCleared}
+        onFocus={() => {
+          if (secretTouched || secretCleared) return;
+          setSecretTouched(true);
+          setSecret('');
+        }}
+        onChange={setSecret}
+        onToggleClear={() => {
+          const next = !secretCleared;
+          setSecretCleared(next);
+          if (next) {
+            setSecretTouched(false);
+            setSecret(secretStored ? REDACTED_SECRET : '');
+          }
+        }}
+      />
+      {/*
+        Shown, not described, and shown before the field that holds it. Redirect
+        URI matching at an authorization server is an EXACT string comparison, so
+        a difference of one character is not a near miss: the provider refuses
+        the whole request before the user ever reaches a consent screen, with an
+        error page that names nothing this operator can act on. It is the single
+        most common OIDC setup failure, and the fix is always "copy this string
+        into the provider", so the string is on screen.
+
+        It is derived from the address this page was loaded from, because the
+        server genuinely cannot know its own external origin from inside the
+        process: a reverse proxy, a container port mapping and the Electron
+        shell's 127.0.0.1 all disagree with what Node sees, while the browser is
+        holding the address that actually reached the app.
+      */}
+      <Row
+        name="Redirect URI to register"
+        desc="Copy this into the provider's client registration, exactly. If a proxy serves this app under a sub-path, add that prefix in front of /auth."
+      >
+        <span style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+          <input
+            className="text-input"
+            readOnly
+            style={{ width: 260 }}
+            value={suggestedRedirectUri}
+            onFocus={(e) => e.currentTarget.select()}
+          />
+          <button className="btn secondary" style={{ padding: '2px 8px' }} onClick={copyRedirectUri}>
+            {copied ? 'Copied' : 'Copy'}
+          </button>
+        </span>
+      </Row>
+      <Row
+        name="Redirect URI override"
+        desc={`Leave empty to use the address each request arrives on. Set it when a proxy rewrites the host or path. Must end with ${SSO_CALLBACK_PATH}.`}
+      >
+        <input
+          className="text-input"
+          style={{ width: 260 }}
+          placeholder={suggestedRedirectUri}
+          value={cfg.redirectUri}
+          onChange={(e) => set('redirectUri', e.target.value)}
+        />
+      </Row>
+      <Row
+        name="Scopes"
+        desc="Space-separated. openid is required. Add groups only if you use the group allowlist below."
+      >
+        <input
+          className="text-input"
+          style={{ width: 260 }}
+          value={cfg.scopes}
+          onChange={(e) => set('scopes', e.target.value)}
+        />
+      </Row>
+      {/*
+        The allowlists are the boundary, and their empty state is the opposite of
+        the intuitive one, so it is stated on screen rather than left in a
+        comment. On a single-account homelab provider, empty is exactly right and
+        an allowlist would be busywork. On anything shared (a work SSO, a family
+        instance, a provider with self-registration) empty means every account in
+        the directory can sign in as the owner of this vault, with full read and
+        write over every note.
+      */}
+      <Row
+        name="Allowed subjects"
+        desc="One per line. Empty means any account the provider will authenticate. Subjects are opaque and case-sensitive, but never reassigned to a different person."
+      >
+        <textarea
+          className="text-input"
+          rows={3}
+          style={{ width: 260, resize: 'vertical', fontFamily: 'var(--font-monospace, monospace)' }}
+          value={cfg.allowedSubjects}
+          onChange={(e) => set('allowedSubjects', e.target.value)}
+        />
+      </Row>
+      <Row
+        name="Allowed groups"
+        desc="One per line. Empty means no group restriction. Needs the groups scope above, and puts the membership decision in the provider where it belongs."
+      >
+        <textarea
+          className="text-input"
+          rows={3}
+          style={{ width: 260, resize: 'vertical', fontFamily: 'var(--font-monospace, monospace)' }}
+          value={cfg.allowedGroups}
+          onChange={(e) => set('allowedGroups', e.target.value)}
+        />
+      </Row>
+      {/*
+        Default on, and the default is a compatibility requirement rather than a
+        preference. The Electron desktop shell starts the server itself and logs
+        in with no human present: it injects a shared secret as
+        WEBOBSIDIAN_PASSWORD and posts it to /auth/login on startup. That path
+        has no browser to send to a provider and no way to complete an
+        authorization code flow, so turning this off does not harden the desktop
+        app, it bricks it. The same is true of any script that signs in with the
+        owner password.
+      */}
+      <Row
+        name="Allow password sign-in"
+        desc="Keep the password form working alongside SSO. Turning it off breaks the desktop app and any script that signs in with the owner password."
+      >
+        <input
+          type="checkbox"
+          checked={cfg.allowPasswordLogin}
+          onChange={(e) => set('allowPasswordLogin', e.target.checked)}
+        />
+      </Row>
+      <div style={{ display: 'flex', gap: 8, marginTop: 12 }}>
+        <button className="btn" onClick={save}>Save</button>
+      </div>
+      {err && <div style={{ color: '#e5534b', margin: '6px 0' }}>{err}</div>}
+      {msg && <div style={{ color: 'var(--text-accent, #4caf50)', margin: '6px 0' }}>{msg}</div>}
+      <p style={{ color: 'var(--text-faint)', fontSize: 12, marginTop: 16 }}>
+        A failed sign-in returns to the login screen with a short reason. The full detail, including
+        the issuer and anything the provider said, stays in the server log: an unauthenticated
+        visitor can start this flow, so nothing beyond that reason is shown in the browser.
+      </p>
     </div>
   );
 }

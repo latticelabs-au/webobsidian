@@ -35,11 +35,22 @@ export default function App() {
   const toast = useStore((s) => s.toast);
   const [checking, setChecking] = useState(true);
   const [theme, setTheme] = useState<'theme-dark' | 'theme-light'>('theme-light');
+  /**
+   * Whether this session was minted by the identity provider rather than by the
+   * password form (FR-15).
+   *
+   * Local component state rather than store state on purpose: only the gate
+   * below consults it, and the store is shared with the workspace-persistence
+   * machinery that syncs across tabs and devices, which is the last place a
+   * property of THIS browser's session belongs.
+   */
+  const [sso, setSso] = useState(false);
 
   useEffect(() => {
     api
       .me()
       .then((r) => {
+        setSso(Boolean(r.sso));
         setMustChangePassword(Boolean(r.mustChangePassword));
         setAuthed(true);
       })
@@ -187,9 +198,42 @@ export default function App() {
   }, [isMobile, setMobileDrawer]);
 
   if (checking) return <div className={theme} style={{ height: '100%' }} />;
-  if (!authed) return <div className={theme}><Login onAuthed={() => setAuthed(true)} /></div>;
+  if (!authed) {
+    return (
+      <div className={theme}>
+        {/*
+          `setSso(false)` on the way in, because this callback only ever fires
+          from a PASSWORD login (Login.tsx's SSO button navigates away instead of
+          resolving a promise). Without it, a session that had been SSO-backed
+          earlier in this page's life, then expired and was replaced from the
+          password form, would keep the exemption below and skip a
+          change-password wall that now genuinely applies.
+        */}
+        <Login
+          onAuthed={() => {
+            setSso(false);
+            setAuthed(true);
+          }}
+        />
+      </div>
+    );
+  }
   // Signed in but still on the default password → block the app until it's changed.
-  if (mustChangePassword) return <div className={theme}><ForceChangePassword /></div>;
+  //
+  // AN SSO SESSION IS EXEMPT, and this is a lockout fix rather than a
+  // convenience. ForceChangePassword's only action is
+  // `changePassword('123456', ...)`: it submits the DEFAULT password as the
+  // current one. A user who signed in through the IdP on an instance that never
+  // moved off that default was never issued a local password and has nothing to
+  // type, so the screen would be a wall with no exit at all, produced entirely
+  // by a flag meaning to be helpful.
+  //
+  // The server already excludes SSO sessions from `mustChangePassword` on
+  // /auth/me, so `!sso` is belt to those braces and the ordering of the two is
+  // what makes it safe: the flag stays THE decision (a client that had never
+  // heard of SSO would still behave correctly), while this clause only ever
+  // removes a wall that a federated session cannot pass. It can never add one.
+  if (mustChangePassword && !sso) return <div className={theme}><ForceChangePassword /></div>;
 
   // On mobile the sidebars are overlay drawers (always mounted, slid in/out by
   // CSS), driven by the device-local `mobileDrawer` state, not the persisted

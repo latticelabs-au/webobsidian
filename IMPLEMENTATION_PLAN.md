@@ -4,7 +4,7 @@
 > Convention: `[ ]` not started · `[~]` in progress · `[x]` done.
 > Update this file **every time** an item changes state.
 
-Last updated: 2026-07-27 (security hardening pass, three adversarial review rounds; docs re-synchronised against the frozen `middleware/ratelimit.ts` two-valued trust rule, `PUBLIC_ORIGIN` documented, `COOKIE_SECURE` documented)
+Last updated: 2026-07-27 (Phase 28: native OIDC single sign-on, FR-15 / PRD 1.6. Server-side authorization-code + S256 PKCE flow, a nested `idp` session claim, a subject/group allowlist that fails closed, and `data/oidc-users.json`. Code complete and unverified: neither the typecheck/build gate nor a live login has been run for this pass)
 
 ---
 
@@ -467,7 +467,186 @@ Last updated: 2026-07-27 (security hardening pass, three adversarial review roun
       Root scripts `desktop`/`desktop:dist`/`desktop:publish`; `.gitignore` gains `desktop/.gen` and
       `desktop/release`.
 
+## Phase 28: Native OIDC single sign-on, FR-15, PRD 1.6 (requested by the user)
+Status convention applies literally here: `[~]` means the code is complete in the tree but **has not been run**.
+`npm run typecheck && npm run build` has not been executed for this pass, there is no vitest coverage of the OIDC
+modules yet, and no live authorization-code round trip against a real IdP has been performed. Nothing below is
+`[x]` until at least one of those exists.
+
+- [~] M28.1 Settings: the `oidc` block in `services/settings.ts` (`enabled`, `issuer`, `clientId`,
+      `clientSecret`, `redirectUri`, `scopes`, `allowedSubjects`, `allowedGroups`, `allowPasswordLogin`), every
+      field with a `.default()` and a `.catch()` heal, so one bad literal in a hand-edited file cannot fail the
+      parse and make `loadSettingsImpl` rewrite from defaults, destroying `jwtSecret`, the API keys and
+      `git.token`. `issuer`/`redirectUri` are stored with trailing slashes stripped; `clientSecret` is never
+      trimmed (it is opaque key material). `redactSettings()` masks `clientSecret` with the shared
+      `REDACTED_SECRET` sentinel and runs `redactUrlCreds()` over both URLs. New exports shared by both doors:
+      `OIDC_CALLBACK_PATH`, `normalizeOidcList()`, `isOidcUsable()`. `enforceLoginReachable()` re-enables password
+      login when it is off while OIDC is unusable, healing **open** (a credential-gated, rate-limited door that
+      was already there) rather than leaving an instance no interface can reach.
+- [~] M28.2 Settings API (`routes/settings.ts`): `sanitizeOidc()` with a per-field allowlist; `requireIssuerUrl`
+      (https, http only for a loopback host, no userinfo, no fragment, no query string), `requireRedirectUri`
+      (must end with `OIDC_CALLBACK_PATH`, no query string), `requireScopes` (RFC 6749 §3.3 scope-token charset,
+      `openid` mandatory), `requireStringList` (trimmed, de-duplicated, never case-folded). `clientSecret` goes
+      through the existing `readSecret()` so the sentinel rule is not re-derived. `isRedactedUrlEcho()` stops a UI
+      that round-trips a masked URL from persisting `https://***@host`. `assertUsableOidc()` refuses three states
+      with a 400: enabled without issuer/clientId, `allowedGroups` without the `groups` scope, and password login
+      off while OIDC is unusable.
+- [~] M28.3 `services/oidc.ts`: lazy discovery cached per configuration (issuer + client id + secret) with a
+      **failed discovery deliberately not cached**; `client_secret_basic` negotiated when the server publishes a
+      list excluding `client_secret_post`; `id_token_signed_response_alg: 'RS256'` pinned;
+      `allowInsecureRequests` applied only for a loopback http issuer (and re-applied when the configuration is
+      rebuilt). `buildAuthorizationUrl()` sends `response_type=code`, `response_mode=query`, `state`, `nonce` and
+      **`code_challenge` + `code_challenge_method=S256` explicitly**, because this IdP publishes no
+      `code_challenge_methods_supported` and anything that gates PKCE on metadata would silently omit it;
+      verified against the shipped openid-client 6.8.4 that neither `buildAuthorizationUrl()` nor
+      `authorizationCodeGrant()` consults `supportsPKCE()`. `handleCallback()` opens the transaction, refuses an
+      `?error=` response, compares `state` itself before calling the library, exchanges the code with the
+      verifier and `idTokenExpected: true`, then applies the allowlist. `fetchUserInfo` runs only when a claim an
+      allowlist needs is missing, is bound to the expected subject, and is non-fatal. Errors are a closed
+      `OidcErrorCode` union; `describeError()` redacts URL credentials and scrubs the client secret before
+      anything is logged.
+- [~] M28.4 Transaction cookie: `state` + `nonce` + PKCE verifier + `redirect_uri` sealed into one HS256 JWT
+      (`sub: 'oidc-tx'`, 10 minute TTL) rather than four cookies, so the caller cannot hold three of the four and
+      cannot decide how to bind them. Single use is enforced by a `jti` map with the same TTL and a 10,000 entry
+      cap with oldest-first eviction, because clearing the cookie is not enough on its own (a second tab or a
+      restored session can still hold a copy).
+- [~] M28.5 Session shape (`services/auth.ts`): `issueToken(idp?)` mints `{ sub: 'owner', cv, idp: { iss, sub } }`
+      with the IdP identity **nested**, never in the top-level `sub`, which is the token KIND and the only thing
+      separating a `sub: 'share'` unlock cookie from an owner session. `cv` is set on federated sessions too, so
+      a password change still evicts them. `readSession()` added beside `verifyToken()` (whose boolean signature
+      is unchanged, so neither hot call site pays for the third caller); `readIdpClaim()` ignores a malformed
+      claim rather than rejecting the token, degrading towards fewer exemptions. `CredentialKind` gains `'sso'`
+      and `auditCredentialUse()` logs one line per federated login carrying `iss|sub` and no display claims.
+- [~] M28.6 Routes (`routes/auth.ts`): `GET /auth/oidc/login` (302 to the IdP, transaction cookie set with
+      `sameSite: 'lax'`, `path: /auth/oidc`) and `GET /auth/oidc/callback` (clears the cookie first, so every exit
+      leaves the browser without a transaction; parses the query off `req.originalUrl` rather than Express's
+      parsed object; records the identity, audits, mints the session, 302s to `/`). Failures 302 to
+      `/?sso_error=<code>`. Two separate rate limiters (30 per 15 minutes each), because one middleware instance
+      owns one store and a complete login hits both surfaces. `GET /auth/status` gains `ssoEnabled` (one public
+      bit, no issuer/client/allowlist detail); `GET /auth/me` gains `sso` and computes the
+      **`mustChangePassword` exemption server side**; `POST /auth/login` reports `sso: false` so both endpoints
+      have one shape.
+- [~] M28.7 `services/oidc-users.ts`: `data/oidc-users.json`, keyed `<iss>|<sub>`, in-memory authoritative with a
+      debounced (10s), serialized, atomic 0600 write and an `unref`'d timer; hydration never overwrites a record
+      the running process already holds, so `lastSeen` cannot go backwards across a restart. Grants nothing
+      today; it is the migration source that makes a future user model a migration rather than a rewrite.
+- [ ] M28.8 Web UI: an SSO button on the login screen gated on `authStatus().ssoEnabled`, rendering of the
+      `?sso_error=<code>` codes as sentences, the `sso` flag from `/auth/me` threaded through the store so
+      Settings suppresses the change-password prompts on a federated session, and an OIDC panel in
+      `Settings.tsx` (`Section` union, tab list, title map, panel component, `GitSettings` as the template).
+      **Not started:** `web/src/lib/api.ts` still types `/auth/status` as `{ passwordSet }` and `/auth/me` as
+      `{ authenticated, mustChangePassword }`, so the two new fields are not read anywhere in the client and the
+      feature is currently configurable only by editing `data/settings.json` or by a raw `PUT /api/settings`.
+- [ ] M28.9 Tests: no `oidc` coverage exists in `server/src/__tests__` yet. Wanted, and all of it reachable
+      without a network: the `sub`-discriminator rule (an `oidc-tx` token must not verify as an owner session and
+      vice versa), `cv` preservation on a federated session, the `mustChangePassword` exemption, single-use
+      transaction rejection, the empty-allowlist-admits-nobody rule, the settings round trip for the
+      `clientSecret` sentinel, and `redactSettings()` masking.
+- [ ] M28.10 Reconcile four mismatches between `services/oidc.ts` and the settings contract, found while writing
+      these docs and each of them a silent behaviour difference rather than a type error:
+      (a) `oidc.scopes` is stored and validated but the service ignores it and derives its own list
+      (`openid profile email`, plus `groups` when the issuer advertises it or advertises nothing), so a custom
+      scope list has no effect and `assertUsableOidc`'s "allowedGroups requires the groups scope" 400 guards a
+      field the request does not read;
+      (b) the service reads an `allowedEmails` array that the zod schema does not define, and zod strips unknown
+      keys, so the email allowlist can never be populated and is dead;
+      (c) the service's `isConfigured()` requires `clientSecret`, while the schema, `isOidcUsable()` and the API
+      all document an empty secret as a legitimate public-client configuration, so a PKCE-only client silently
+      gets no SSO button and `not_configured` on `/auth/oidc/login`;
+      (d) the `allowedSubjects`/`allowedGroups` doc comment in `services/settings.ts` says an empty allowlist
+      admits any subject the IdP will authenticate, which is the **opposite** of what `isAllowed()` does (it
+      fails closed). The code is right and the comment is wrong; a comment that inverts an access rule is worse
+      than no comment.
+- [ ] M28.11 Enforce `oidc.allowPasswordLogin` at `POST /auth/login`. It is stored, validated by the API and
+      healed by the schema, but no route consults it, so setting it to false today changes nothing. Whatever
+      enforces it must leave a way back in (the recovery override password is the obvious carve-out, since it is
+      what the Electron shell and a locked-out operator both use).
+- [ ] M28.12 Mechanical gate + live acceptance: `npm run typecheck && npm run build`, the 309 vitest tests, and
+      one real round trip against `https://auth.adityav.au` proving (1) a login mints a session whose token
+      carries `sub: 'owner'` with the identity nested under `idp`, (2) a subject outside the allowlist is refused
+      with `not_allowed`, (3) an empty allowlist admits nobody, (4) a replayed callback URL is refused, and
+      (5) an unreachable issuer leaves the process alive, logs a `discovery_failed` detail, and recovers on the
+      next attempt without a restart.
+
 ### Progress log
+- 2026-07-27 (FR-15, PRD 1.6: native OIDC single sign-on, server side, on branch `feat/oidc-sso`):
+  a second door onto the existing owner account, opened by an external OpenID Connect identity provider. The
+  design constraint that shaped everything is the one in the PRD's own rationale: a reverse-proxy forward-auth
+  (Authelia, Authentik, tinyauth) was rejected because it tells this process that somebody authenticated and
+  nothing else, so there is one owner session forever with no groundwork under it, and because it covers browsers
+  only, leaving `/api/v1`, the Electron shell on `127.0.0.1` and the `/ws` upgrade unserved. **An implementation
+  that authenticates and then discards the IdP subject is the same failure wearing different clothes**, which is
+  why `services/oidc-users.ts` exists and is written before the session is minted.
+  **The flow is server side because the browser is walled off from it.** The CSP in `index.ts` sets
+  `formAction: 'self'` (a `<form action="https://idp/…">` is refused) and `connectSrc: 'self'` (a browser-side
+  `fetch()` to the IdP is refused), while governing neither `location.assign()` nor a server-issued 302. So the
+  browser hits our endpoint and we redirect, and we exchange the code. `response_mode=query` for two independent
+  reasons, either fatal alone: `express.urlencoded()` is registered nowhere, so a `form_post` body arrives empty,
+  and a `SameSite=Lax` cookie is not sent on a cross-site top-level POST, so the transaction cookie would be
+  invisible on exactly the request that must read it.
+  **PKCE, and the honest version of it.** This IdP's discovery document omits `code_challenge_methods_supported`
+  entirely, so anything that gates PKCE on server metadata concludes the server does not support it and quietly
+  drops the challenge. `code_challenge` and `code_challenge_method=S256` are therefore passed to
+  `buildAuthorizationUrl()` explicitly and the verifier to `authorizationCodeGrant()` explicitly; the shipped
+  openid-client 6.8.4 was read to confirm that neither call consults `supportsPKCE()` (the authorization URL
+  copies given parameters verbatim, and oauth4webapi sets `code_verifier` whenever the verifier is not its
+  `nopkce` sentinel). S256 PKCE really is on the wire. What is **not** claimed: an IdP that does not advertise
+  the method is not obliged to enforce it, so PKCE here is defence in depth, and the load-bearing binding is the
+  signed, single-use transaction cookie (`state` matched, `nonce` inside the signed ID token, `jti` unused).
+  **The session shape is the security decision of this change.** `services/auth.ts` mints `{ sub: 'owner', cv }`
+  and `routes/shares.ts` mints `{ sub: 'share', … }` under the SAME HMAC secret, so `sub` is a token KIND and is
+  the only thing stopping a share-unlock cookie from being replayed as a full owner session. An IdP subject in
+  that field would put an attacker-selectable string into a discriminator: an account named `share` or `owner`
+  would mint the wrong kind of token entirely. The identity therefore lives one level down, in `idp: { iss, sub }`,
+  where nothing dispatches on it, and the transaction cookie takes a third kind (`sub: 'oidc-tx'`) so both
+  replay directions are refused explicitly. `cv` is still set on federated sessions, deliberately: it is the only
+  eviction mechanism this app has, and a password change is exactly the action taken when a session is believed
+  stolen, so it has to evict every session and not only the ones created by typing a password. `readSession()`
+  was added beside `verifyToken()` rather than changing its signature, because its two call sites (the auth
+  middleware and the `/ws` upgrade) want a boolean on the hottest auth path in the app.
+  **The `mustChangePassword` wall.** The flag is derived from `!hasCustomPassword()`, gates the whole app in
+  `App.tsx`, and its only exit submits `changePassword('123456', …)`. A federated user on an instance still on
+  the default password would have been shown a wall whose only key is a password they were never issued: a total
+  lockout produced by a flag meaning to be helpful. `/auth/me` now computes `mustChangePassword: !sso &&
+  !hasCustomPassword()` **on the server**, so a client that has never heard of SSO keeps working and no future
+  client can re-derive the exemption incorrectly; `sso` is reported alongside as the explanation, not the gate.
+  **Access control fails closed, and that is the opposite of convenient.** `isAllowed()` admits on a union of
+  `allowedSubjects` (exact, opaque, case-sensitive) and `allowedGroups` (case-insensitive), and **an entirely
+  empty allowlist admits nobody**. "Empty means everyone" would turn a half-finished settings page or a healed
+  hand edit into open registration on a private note vault, including every self-registered account at a shared
+  IdP. A locked-out operator still has the password door, which is a recoverable inconvenience; a silently
+  world-readable vault is not recoverable at all. `assertUsableOidc()` also refuses `allowedGroups` without the
+  `groups` scope, because a claim that is never requested can never match and a boundary whose behaviour depends
+  on how another module happened to write an `if` is not a boundary.
+  **Failure handling.** Discovery is lazy (an unreachable IdP never delays or fails startup), cached per
+  configuration so a settings change invalidates it with no restart, and **a failed discovery is evicted rather
+  than cached**, so a transient DNS blip cannot leave the SSO button permanently broken until someone restarts
+  the process, which is the sticky-silent-failure class the reference bridge documents at length. The browser
+  only ever receives `/?sso_error=<code>` from a closed union; the detail (which can quote an issuer URL or a
+  token-endpoint body) goes to the log, with URL credentials redacted and the client secret scrubbed, because an
+  unauthenticated visitor can drive this whole path by visiting `/auth/oidc/login`. Both SSO endpoints are rate
+  limited with **separate** stores, since one middleware instance owns one store and a complete login is one hit
+  on each surface.
+  **Secrets follow the existing pattern exactly.** `clientSecret` is masked with the shared `REDACTED_SECRET`
+  sentinel by `redactSettings()`, is only overwritten when the incoming value is non-empty and is not the
+  sentinel, and is never trimmed. Both OIDC URLs go through `redactUrlCreds()` on the way out, and the API
+  refuses a URL carrying userinfo on the way in.
+  **What this is NOT, stated because deploying it under the wrong expectation is the real risk.** It is **not
+  multi-user**. Every allowlisted identity maps onto the one existing owner: no roles, no per-user vaults, no
+  per-user workspace state, no per-user shares or keys. Two admitted people are the same owner with full read and
+  write over every note. Password login also **remains enabled by default** and `POST /auth/login` does not yet
+  consult `oidc.allowPasswordLogin`; that default is a compatibility requirement rather than an oversight,
+  because the Electron shell logs itself in by posting `WEBOBSIDIAN_PASSWORD` and has no browser to send to an
+  IdP, so closing the password door would brick the desktop app rather than harden it.
+  **Not verified, and listed rather than glossed:** `npm run typecheck && npm run build` has not been run for
+  this pass, there is no vitest coverage of the OIDC modules (the 309 existing tests do not touch them), the web
+  client still types `/auth/status` as `{ passwordSet }` and reads neither `ssoEnabled` nor `sso`, and no live
+  authorization-code round trip has been performed against `https://auth.adityav.au`. Four contract mismatches
+  between `services/oidc.ts` and the settings block were found while writing these docs and are recorded as
+  M28.10 rather than being papered over here: the service ignores `oidc.scopes`, reads an `allowedEmails` field
+  the schema does not define (zod strips it, so that allowlist is dead), requires a `clientSecret` the schema
+  documents as optional for a public client, and is contradicted by the settings comment claiming an empty
+  allowlist admits everyone. The code fails closed; the comment is wrong.
 - 2026-07-27 (security hardening pass, three rounds of adversarial review over the whole request surface):
   a full FIND / FIX / VERIFY sweep run three times, each round re-attacking the previous round's fixes. Recording
   it as one entry because the rounds are not separable: several fixes were themselves defects that only the next

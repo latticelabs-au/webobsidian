@@ -282,7 +282,18 @@ export async function setUserPassword(password: string): Promise<void> {
  * environment for the life of the deployment, so their use has to be visible
  * somewhere rather than being indistinguishable from a normal login.
  */
-export type CredentialKind = 'user' | 'default' | 'override-hash' | 'override-env';
+export type CredentialKind =
+  | 'user'
+  | 'default'
+  | 'override-hash'
+  | 'override-env'
+  /**
+   * Not returned by `authenticatePassword()`: no password was checked. It exists
+   * so that a federated login is auditable through the SAME function as every
+   * other way of becoming the owner, rather than through a second, parallel
+   * logging path that could drift out of step with this one.
+   */
+  | 'sso';
 
 /**
  * Check a login password and report WHICH credential matched. Accepts:
@@ -351,7 +362,7 @@ async function upgradeUserHash(password: string, observed: string): Promise<void
 }
 
 /**
- * Record use of a recovery override credential.
+ * Record use of a recovery override credential, or a federated (SSO) login.
  *
  * The overrides are a documented recovery path and are staying, but they are
  * permanent master credentials with no expiry: `WEBOBSIDIAN_PASSWORD` in
@@ -364,12 +375,34 @@ async function upgradeUserHash(password: string, observed: string): Promise<void
  * Logs the credential KIND only. The password, the hash and the env value never
  * appear: this line ends up in the same log stream as everything else and,
  * on desktop, in a file on disk.
+ *
+ * The `sso` kind is the one case where a line is written for a perfectly
+ * ordinary login, and it carries a `subject`. That is the whole point of doing
+ * SSO natively rather than behind a forward-auth proxy: the instance now knows
+ * WHO logged in, so the log can say so. A password login has no subject to
+ * record (there is one account and no username), which is exactly the gap this
+ * closes. The subject is an opaque IdP identifier plus the issuer, not a
+ * credential and not a bearer token, so it is safe to write down; the display
+ * claims (name, email) are deliberately NOT logged, because they are personal
+ * data with no audit value that the subject does not already provide.
  */
-export function auditCredentialUse(kind: CredentialKind, action: string, client?: string): void {
+export function auditCredentialUse(
+  kind: CredentialKind,
+  action: string,
+  client?: string,
+  subject?: string,
+): void {
+  const where = client ? `, client: ${client}` : '';
+  if (kind === 'sso') {
+    console.warn(
+      `[audit] federated login accepted for ${action} (subject: ${subject ?? 'unknown'}${where})`,
+    );
+    return;
+  }
   if (kind !== 'override-hash' && kind !== 'override-env') return;
   const source = kind === 'override-env' ? 'WEBOBSIDIAN_PASSWORD env' : 'auth.passwordHash setting';
   console.warn(
-    `[audit] recovery override password accepted for ${action} (source: ${source}${client ? `, client: ${client}` : ''})`,
+    `[audit] recovery override password accepted for ${action} (source: ${source}${where})`,
   );
 }
 
@@ -419,20 +452,83 @@ function credentialFingerprint(s: Settings): string {
   return createHmac('sha256', s.auth.jwtSecret).update(material).digest('hex').slice(0, 32);
 }
 
-export async function issueToken(): Promise<string> {
+/**
+ * The identity an external IdP asserted, as carried inside a session token.
+ *
+ * NESTED, and that nesting is a security property rather than tidiness. The
+ * token's top-level `sub` is a TOKEN KIND, not a user: `sub: 'owner'` here and
+ * `sub: 'share'` in routes/shares.ts, both signed with the same `auth.jwtSecret`,
+ * and that single value is the only thing stopping a share-unlock cookie from
+ * being replayed as a full owner session (see verifyToken). Putting an IdP
+ * subject there would put an attacker-chosen string into a discriminator: an
+ * account whose subject or preferred username happened to be `share` would mint
+ * a token this app reads as the wrong KIND of token entirely, and one named
+ * `owner` would be indistinguishable from a real session minted by the password
+ * path. The IdP's namespace and this app's token-kind namespace must never be
+ * the same namespace, so the identity lives one level down where nothing
+ * dispatches on it.
+ */
+export interface IdpIdentity {
+  /** Issuer identifier, as validated against the discovery document. */
+  iss: string;
+  /** The IdP's subject identifier. */
+  sub: string;
+}
+
+/** The claims a valid owner session carries, decoded. */
+export interface OwnerSession {
+  /** The credential fingerprint the token was minted under. */
+  cv: string;
+  /** The IdP identity, or null for an ordinary password session. */
+  idp: IdpIdentity | null;
+}
+
+/**
+ * Mint an owner session token, optionally recording which IdP identity produced
+ * it.
+ *
+ * `cv` is set UNCONDITIONALLY, including on SSO sessions, and that is
+ * deliberate. It would be easy to argue that a federated session has nothing to
+ * do with the local password and should therefore not be bound to it, but the
+ * consequence of that argument is that changing the password would no longer
+ * evict SSO cookies, and `cv` is the only eviction mechanism this app has (there
+ * is no session store, see credentialFingerprint above). A password change is
+ * the action an owner takes when they believe a session has been stolen; it has
+ * to evict every session, not just the ones that happen to have been created by
+ * typing a password.
+ */
+export async function issueToken(idp?: IdpIdentity): Promise<string> {
   const s = await getSettings();
-  return jwt.sign({ sub: 'owner', cv: credentialFingerprint(s) }, s.auth.jwtSecret, {
+  const payload: { sub: string; cv: string; idp?: IdpIdentity } = {
+    sub: 'owner',
+    cv: credentialFingerprint(s),
+  };
+  // Only present when there is one, so an ordinary password session's token is
+  // byte-for-byte the shape it has always been.
+  if (idp) payload.idp = { iss: idp.iss, sub: idp.sub };
+  return jwt.sign(payload, s.auth.jwtSecret, {
     expiresIn: TOKEN_TTL,
     algorithm: 'HS256',
   });
 }
 
 /**
- * Verify an OWNER session token. Beyond a valid signature, the token is required
- * to carry `sub === 'owner'` and to use exactly the HS256 algorithm. That stops
- * other tokens signed with the same `jwtSecret` (for example a public share's
- * unlock cookie, which carries `sub: 'share'`) from being replayed as a full
- * owner session.
+ * Decode and fully verify an OWNER session token, returning its claims.
+ *
+ * This is the real implementation; `verifyToken` is the boolean face of it. The
+ * split exists because `verifyToken` has exactly two call sites
+ * (middleware/auth.ts and the WebSocket upgrade in index.ts) that want a yes/no
+ * answer and nothing else, while `/auth/me` needs to know whether the session
+ * came from an IdP. Changing verifyToken's signature to serve the third caller
+ * would have made both existing call sites carry a value they do not use, on the
+ * hottest auth path in the app; adding an accessor beside it costs nothing and
+ * keeps the boolean contract exactly as it was.
+ *
+ * Beyond a valid signature, the token is required to carry `sub === 'owner'` and
+ * to use exactly the HS256 algorithm. That stops other tokens signed with the
+ * same `jwtSecret` (for example a public share's unlock cookie, which carries
+ * `sub: 'share'`, or an OIDC transaction cookie, which carries `sub: 'oidc-tx'`)
+ * from being replayed as a full owner session.
  *
  * It must also carry a `cv` claim matching the current credential fingerprint.
  * A token minted before this claim existed has no `cv` and is rejected outright:
@@ -441,17 +537,47 @@ export async function issueToken(): Promise<string> {
  * attacker would replay. The visible consequence is that every session is logged
  * out once, on the deploy that introduces this.
  */
-export async function verifyToken(token: string): Promise<boolean> {
+export async function readSession(token: string): Promise<OwnerSession | null> {
   try {
     const s = await getSettings();
     const payload = jwt.verify(token, s.auth.jwtSecret, { algorithms: ['HS256'] });
-    if (typeof payload !== 'object' || payload === null) return false;
-    if (payload.sub !== 'owner') return false;
+    if (typeof payload !== 'object' || payload === null) return null;
+    if (payload.sub !== 'owner') return null;
     const cv = (payload as { cv?: unknown }).cv;
-    return typeof cv === 'string' && safeEqualStr(cv, credentialFingerprint(s));
+    if (typeof cv !== 'string' || !safeEqualStr(cv, credentialFingerprint(s))) return null;
+    return { cv, idp: readIdpClaim(payload) };
   } catch {
-    return false;
+    return null;
   }
+}
+
+/**
+ * Pull the nested `idp` claim out, or null.
+ *
+ * A malformed claim is IGNORED rather than rejecting the whole token, and the
+ * direction matters. Only `issueToken` mints these, and the token is HMAC-signed,
+ * so a malformed `idp` is not something an attacker can produce without the
+ * secret. What it can be is a token written by a different build. Treating it as
+ * "no IdP" degrades the session to an ordinary password session, which is
+ * strictly LESS privileged: it is still a valid owner session, but it no longer
+ * qualifies for the mustChangePassword exemption. Failing towards fewer
+ * exemptions is the safe direction; failing towards a hard rejection would log
+ * people out for a claim that grants nothing.
+ */
+function readIdpClaim(payload: object): IdpIdentity | null {
+  const raw = (payload as { idp?: unknown }).idp;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const { iss, sub } = raw as { iss?: unknown; sub?: unknown };
+  if (typeof iss !== 'string' || typeof sub !== 'string' || !iss || !sub) return null;
+  return { iss, sub };
+}
+
+/**
+ * Boolean form, for the two call sites that only need "is this a valid owner
+ * session?". Signature deliberately unchanged: see readSession above.
+ */
+export async function verifyToken(token: string): Promise<boolean> {
+  return (await readSession(token)) !== null;
 }
 
 /** ---- API keys ----------------------------------------------------------- */
