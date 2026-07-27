@@ -40,9 +40,34 @@ async function readConfig(): Promise<DesktopConfig> {
   return { secret: randomBytes(24).toString('hex') };
 }
 
+/**
+ * Persist the desktop config.
+ *
+ * The 0600 mode is load-bearing, not hygiene. This file holds `secret`, which is
+ * handed to the server as WEBOBSIDIAN_PASSWORD, and that value is an override
+ * credential: always accepted, never expiring, valid even after the owner has
+ * changed their password. Written at the umask default (0644 on Linux/macOS) the
+ * file was readable by every other local account, so any user on the machine
+ * could read the secret out of it and sign in as the vault owner.
+ *
+ * The explicit chmod matters as much as the `mode` option: `mode` is only applied
+ * when the file is created, so an install that already wrote a 0644 config would
+ * otherwise keep those permissions forever, and the fix would only protect fresh
+ * installs. On Windows chmod is close to a no-op (there, the ACL inherited from
+ * the per-user AppData directory is what protects the file), which is why a
+ * failure here is tolerated rather than fatal.
+ */
 async function writeConfig(cfg: DesktopConfig): Promise<void> {
   await fs.mkdir(path.dirname(CONFIG_FILE()), { recursive: true });
-  await fs.writeFile(CONFIG_FILE(), JSON.stringify(cfg, null, 2), 'utf8');
+  await fs.writeFile(CONFIG_FILE(), JSON.stringify(cfg, null, 2), {
+    encoding: 'utf8',
+    mode: 0o600,
+  });
+  try {
+    await fs.chmod(CONFIG_FILE(), 0o600);
+  } catch {
+    /* platform/filesystem without POSIX modes: the create-time mode is best effort */
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -185,29 +210,106 @@ function tokenFromSetCookie(setCookie: string[]): string | undefined {
   return undefined;
 }
 
+/**
+ * Set when auto-login did not produce a working session, so the user is told why
+ * instead of being dropped at a login screen with no explanation. On desktop
+ * that screen is close to a dead end: the only password that works is the
+ * per-install secret, which the user has never seen.
+ */
+let autoLoginError: string | null = null;
+
+/** Append a line to the server log file, which File > Open Logs surfaces. */
+async function appendLog(line: string): Promise<void> {
+  try {
+    await fs.mkdir(path.dirname(LOG_FILE()), { recursive: true });
+    await fs.appendFile(LOG_FILE(), `[${new Date().toISOString()}] ${line}\n`, 'utf8');
+  } catch {
+    /* logging must never be the thing that breaks startup */
+  }
+}
+
+/**
+ * Record an auto-login failure. Never include `secret` or the token in `reason`:
+ * this text goes to a log file on disk and into a dialog on screen.
+ */
+async function failAutoLogin(reason: string): Promise<void> {
+  autoLoginError = reason;
+  console.error(`[desktop] auto-login failed: ${reason}`);
+  await appendLog(`[desktop] auto-login failed: ${reason}`);
+}
+
 // Log in with the per-install secret (always accepted as the override password),
 // then seed the JWT into the window's session cookie jar so the BrowserWindow is
 // authenticated with no login prompt. If still on the default password, promote
 // the secret to the custom password (via Bearer auth) so the UI doesn't force a
-// password change on first launch. JWTs survive the password change (signed with
-// a stable jwtSecret), so the same token stays valid for the window.
+// password change on first launch.
+//
+// That promotion is why this cannot just reuse the first token. Owner tokens are
+// now bound to a fingerprint of the current credentials (see credentialFingerprint
+// in server/src/services/auth.ts), which is what makes a password change evict
+// stolen sessions. The change therefore invalidates the very token we just
+// obtained, and seeding that dead token into the cookie jar would leave the
+// window looking at a login screen it cannot get past. The server re-issues a
+// cookie on a successful change-password precisely so this flow can pick the new
+// token up; the re-login is the fallback for a server that did not.
+//
+// Every exit path reports a reason. The previous empty catch turned any failure
+// here (server not reachable, secret rejected, cookie jar write refused) into a
+// silent "please log in" prompt with no recoverable password.
 async function autoLogin(port: number, secret: string): Promise<void> {
   try {
     const login = await apiRequest('POST', `${baseUrl(port)}/auth/login`, { password: secret });
-    if (login.status !== 200) return;
-    const token = tokenFromSetCookie(login.setCookie);
-    if (!token) return;
+    if (login.status !== 200) {
+      await failAutoLogin(`the server rejected the per-install password (HTTP ${login.status})`);
+      return;
+    }
+    let token = tokenFromSetCookie(login.setCookie);
+    if (!token) {
+      await failAutoLogin('the server did not return a session cookie on login');
+      return;
+    }
 
     const mustChange = Boolean(
       login.json && typeof login.json === 'object' && (login.json as { mustChangePassword?: boolean }).mustChangePassword,
     );
     if (mustChange) {
-      await apiRequest(
+      const changed = await apiRequest(
         'POST',
         `${baseUrl(port)}/auth/change-password`,
         { currentPassword: secret, newPassword: secret },
         { Authorization: `Bearer ${token}` },
       );
+      if (changed.status !== 200) {
+        await failAutoLogin(
+          `could not adopt the per-install password as the account password (HTTP ${changed.status})`,
+        );
+        return;
+      }
+      const refreshed = tokenFromSetCookie(changed.setCookie);
+      if (refreshed) {
+        token = refreshed;
+      } else {
+        const relogin = await apiRequest('POST', `${baseUrl(port)}/auth/login`, { password: secret });
+        const retoken = tokenFromSetCookie(relogin.setCookie);
+        if (relogin.status !== 200 || !retoken) {
+          await failAutoLogin(
+            `could not re-authenticate after the password change (HTTP ${relogin.status})`,
+          );
+          return;
+        }
+        token = retoken;
+      }
+    }
+
+    // Prove the token actually authenticates before handing it to the window.
+    // Cheap, and it converts "the UI mysteriously shows the login screen" into a
+    // specific line in the log.
+    const me = await apiRequest('GET', `${baseUrl(port)}/auth/me`, undefined, {
+      Authorization: `Bearer ${token}`,
+    });
+    if (me.status !== 200) {
+      await failAutoLogin(`the session token was not accepted by /auth/me (HTTP ${me.status})`);
+      return;
     }
 
     await session.defaultSession.cookies.set({
@@ -218,8 +320,8 @@ async function autoLogin(port: number, secret: string): Promise<void> {
       sameSite: 'lax',
       expirationDate: Math.floor((Date.now() + 30 * 24 * 60 * 60 * 1000) / 1000),
     });
-  } catch {
-    // Non-fatal: the window simply shows the normal login screen.
+  } catch (err) {
+    await failAutoLogin(String(err instanceof Error ? err.message : err));
   }
 }
 
@@ -382,6 +484,18 @@ if (!app.requestSingleInstanceLock()) {
       await startServer(cfg);
       buildMenu();
       createWindow();
+      // Shown after the window exists, and not awaited, so a failed auto-login
+      // never blocks startup. The app is still usable if the user knows the
+      // password; the point is that they are told sign-in failed and where to
+      // look, instead of silently facing a login prompt.
+      if (autoLoginError) {
+        void dialog.showMessageBox({
+          type: 'warning',
+          message: 'Automatic sign-in failed',
+          detail: `WebObsidian could not sign in to its local server, so you will see the login screen.\n\nReason: ${autoLoginError}\n\nDetails are in File > Open Logs.`,
+          buttons: ['OK'],
+        });
+      }
     } catch (err) {
       dialog.showErrorBox('WebObsidian failed to start', String(err instanceof Error ? err.stack ?? err.message : err));
       app.quit();

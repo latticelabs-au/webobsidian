@@ -1,6 +1,12 @@
 import { useEffect, useRef, useState } from 'react';
 import { useStore } from '../lib/store';
-import { api } from '../lib/api';
+import {
+  api,
+  apiErrorMessage,
+  sharePasswordError,
+  vaultPathError,
+  MIN_PASSWORD_LEN,
+} from '../lib/api';
 import Icon from './Icon';
 
 type Section = 'vault' | 'git' | 'api' | 'sharing' | 'plugins' | 'appearance' | 'account' | 'about';
@@ -71,14 +77,49 @@ function VaultSettings({ s, reload }: { s: any; reload: () => void }) {
   const [path, setPath] = useState(s.vault.path);
   const [deleteMode, setDeleteMode] = useState(s.vault.deleteMode ?? 'trash');
   const [browser, setBrowser] = useState<any>(null);
+  const [err, setErr] = useState('');
+  // The vault path is the field with the largest blast radius in the whole app:
+  // it IS the root the files API reads and writes. The server now refuses empty,
+  // whitespace-only, relative and NUL-bearing values with a 400, and refuses a
+  // path outside the operator's allowed roots with a 403. Neither answer was
+  // visible before: `api.putSettings` throws and this handler swallowed it, so
+  // clearing the box and pressing Save produced no error, no alert and no
+  // reload. The pre-flight check below is a UX affordance only; requireVaultRoot
+  // and assertVaultPathAllowed in server/src/routes/settings.ts remain the gate,
+  // and the 403 in particular cannot be evaluated here at all because the
+  // allowed roots are operator configuration the browser never sees.
   const save = async () => {
-    await api.putSettings({ vault: { path } });
+    setErr('');
+    const invalid = vaultPathError(path);
+    if (invalid) {
+      setErr(invalid);
+      return;
+    }
+    try {
+      await api.putSettings({ vault: { path } });
+    } catch (e) {
+      setErr(apiErrorMessage(e, 'Could not save the vault path'));
+      return;
+    }
     await reload();
     alert('Vault path saved. Reindex from the command palette if needed.');
   };
+  // The select is updated optimistically so the control does not feel laggy, so
+  // a rejected save has to put it back: leaving the UI showing "Permanently
+  // delete" while the server still holds "trash" would misreport what the next
+  // delete actually does, which is the one place in this panel where a stale
+  // reading is dangerous rather than merely wrong.
   const saveDeleteMode = async (mode: string) => {
+    const previous = deleteMode;
+    setErr('');
     setDeleteMode(mode);
-    await api.putSettings({ vault: { deleteMode: mode } });
+    try {
+      await api.putSettings({ vault: { deleteMode: mode } });
+    } catch (e) {
+      setDeleteMode(previous);
+      setErr(apiErrorMessage(e, 'Could not save the delete mode'));
+      return;
+    }
     await reload();
   };
   const browse = async (dir?: string) => setBrowser(await api.browse(dir).catch((e) => ({ error: e.message })));
@@ -92,6 +133,7 @@ function VaultSettings({ s, reload }: { s: any; reload: () => void }) {
         <button className="btn secondary" onClick={() => browse()}>Browse…</button>
         <button className="btn" onClick={save}>Save vault path</button>
       </div>
+      {err && <div style={{ color: '#e5534b', margin: '6px 0' }}>{err}</div>}
       {browser && !browser.error && (
         <div style={{ border: '1px solid var(--bg-modifier-border)', borderRadius: 6, padding: 8, marginTop: 8 }}>
           <div style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 6 }}>{browser.dir}</div>
@@ -142,7 +184,21 @@ function GitSettings({ s, reload }: { s: any; reload: () => void }) {
   useEffect(() => {
     if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
   }, [log]);
-  const save = async () => { await api.putSettings({ git: g }); await reload(); append(['Saved git settings']); };
+  // Reported through the same log the git actions below use, rather than
+  // swallowed. `run()` already catches for every git operation; Save was the one
+  // button in this panel that did not, so a rejected settings write (session
+  // expired, or any future validation on the git block) appended nothing and the
+  // log's silence read as success.
+  const save = async () => {
+    try {
+      await api.putSettings({ git: g });
+    } catch (e) {
+      append([`Error: ${apiErrorMessage(e, 'Could not save git settings')}`]);
+      return;
+    }
+    await reload();
+    append(['Saved git settings']);
+  };
   const run = async (fn: () => Promise<any>, label: string) => {
     append([`${label}…`]);
     try {
@@ -211,13 +267,35 @@ function ApiKeys() {
   const [name, setName] = useState('my-agent');
   const [scopes, setScopes] = useState<string[]>(['read', 'search']);
   const [created, setCreated] = useState('');
+  const [err, setErr] = useState('');
   const load = () => api.listKeys().then((r) => setKeys(r.keys)).catch(() => {});
   useEffect(() => { load(); }, []);
   const toggle = (sc: string) => setScopes((p) => (p.includes(sc) ? p.filter((x) => x !== sc) : [...p, sc]));
+  // A failed create must not leave the previous key's raw value on screen under a
+  // button the user just pressed: they would copy a string that is not the key
+  // they think they just made. Clearing first, then surfacing the error, is the
+  // only ordering that cannot mislead.
   const create = async () => {
-    const r = await api.createKey(name, scopes);
-    setCreated(r.key);
+    setErr('');
+    setCreated('');
+    try {
+      const r = await api.createKey(name, scopes);
+      setCreated(r.key);
+    } catch (e) {
+      setErr(apiErrorMessage(e, 'Could not create the key'));
+      return;
+    }
     await load();
+  };
+  const revoke = async (id: string) => {
+    setErr('');
+    try {
+      await api.revokeKey(id);
+    } catch (e) {
+      setErr(apiErrorMessage(e, 'Could not revoke the key'));
+      return;
+    }
+    load();
   };
   return (
     <div>
@@ -234,6 +312,7 @@ function ApiKeys() {
         </span>
       </Row>
       <button className="btn" onClick={create}>Create key</button>
+      {err && <div style={{ color: '#e5534b', margin: '6px 0' }}>{err}</div>}
       {created && (
         <pre style={{ background: 'var(--bg-primary)', padding: 10, borderRadius: 6, marginTop: 10, wordBreak: 'break-all', whiteSpace: 'pre-wrap' }}>
           {created}
@@ -247,7 +326,7 @@ function ApiKeys() {
               <div className="name">{k.name} <span style={{ color: 'var(--text-faint)' }}>{k.prefix}…</span></div>
               <div className="desc">scopes: {k.scopes.join(', ')} · used: {k.lastUsed ?? 'never'}</div>
             </div>
-            <button className="btn danger" onClick={async () => { await api.revokeKey(k.id); load(); }}>Revoke</button>
+            <button className="btn danger" onClick={() => revoke(k.id)}>Revoke</button>
           </div>
         ))}
       </div>
@@ -270,23 +349,54 @@ function Shares() {
     navigator.clipboard?.writeText(url(id)).catch(() => {});
     notify('Public link copied');
   };
+  // Same reasoning as ShareDialog.tsx, and the same three operations: `req()`
+  // throws on any non-OK status, nothing in web/src catches an unhandled
+  // rejection, so an unwrapped call turns a server refusal into a button that
+  // does nothing at all. This panel and the per-note dialog are two entry points
+  // onto one endpoint, so they have to agree: fixing only one of them leaves the
+  // same silent failure one click away.
   const toggle = async (s: any) => {
-    await api.setShareEnabled(s.id, !s.enabled);
+    try {
+      await api.setShareEnabled(s.id, !s.enabled);
+    } catch (e) {
+      notify(apiErrorMessage(e, 'Could not change the public link'));
+      return;
+    }
     load();
   };
   const remove = async (s: any) => {
     if (!confirm(`Delete the public link for "${s.path}"? The URL stops working permanently.`)) return;
-    await api.deleteShare(s.id);
+    try {
+      await api.deleteShare(s.id);
+    } catch (e) {
+      notify(apiErrorMessage(e, 'Could not delete the public link'));
+      return;
+    }
     load();
   };
   const setPassword = async (s: any) => {
     const pw = prompt(
-      s.hasPassword
+      (s.hasPassword
         ? 'New password for this link (leave empty to REMOVE the password):'
-        : 'Password for this link:',
+        : 'Password for this link:') + `\nAt least ${MIN_PASSWORD_LEN} characters.`,
     );
     if (pw === null) return;
-    await api.setSharePassword(s.id, pw || null);
+    // UX affordance, not the security boundary: PATCH /api/shares/:id applies
+    // the identical rule and is what actually decides. Checking here only means
+    // the user is told the rule instead of watching the dialog close and nothing
+    // change. An empty string is not "too short", it is the documented way to
+    // remove the password, which is why sharePasswordError() exempts it.
+    const invalid = sharePasswordError(pw);
+    if (invalid) {
+      notify(invalid);
+      return;
+    }
+    try {
+      await api.setSharePassword(s.id, pw || null);
+    } catch (e) {
+      notify(apiErrorMessage(e, 'Could not set the password'));
+      return;
+    }
     notify(pw ? 'Password set' : 'Password removed');
     load();
   };
@@ -357,7 +467,23 @@ function Plugins() {
   const install = async () => {
     setMsg('Installing…');
     try { await api.installPlugin(repo); setMsg('Installed ✓'); setRepo(''); await load(); }
-    catch (e: any) { setMsg(`Error: ${e.message}`); }
+    catch (e) { setMsg(`Error: ${apiErrorMessage(e, 'Could not install the plugin')}`); }
+  };
+  // The checkbox was the last unwrapped call in this panel. A rejected toggle
+  // used to leave the box rendered in its new position (React re-renders from
+  // `plugins`, which load() never refreshed) while the plugin's real state was
+  // unchanged: the UI then disagreed with the server about whether a plugin was
+  // running, which is exactly the kind of quiet lie that gets debugged as a
+  // server bug. load() runs on both paths so the rendered state comes back from
+  // the server either way.
+  const setEnabled = async (id: string, enabled: boolean) => {
+    setMsg('');
+    try {
+      await api.setPluginEnabled(id, enabled);
+    } catch (e) {
+      setMsg(`Error: ${apiErrorMessage(e, 'Could not change the plugin')}`);
+    }
+    await load();
   };
   return (
     <div>
@@ -378,7 +504,7 @@ function Plugins() {
               <div className="desc">{p.description}</div>
             </div>
             <label>
-              <input type="checkbox" checked={p.enabled} onChange={async (e) => { await api.setPluginEnabled(p.id, e.target.checked); load(); }} /> enabled
+              <input type="checkbox" checked={p.enabled} onChange={(e) => setEnabled(p.id, e.target.checked)} /> enabled
             </label>
           </div>
         ))}
@@ -392,7 +518,25 @@ function Plugins() {
 
 function Appearance({ s }: { s: any }) {
   const [theme, setTheme] = useState(s.ui.theme);
-  const save = async (t: string) => { setTheme(t); await api.putSettings({ ui: { theme: t } }); location.reload(); };
+  const [err, setErr] = useState('');
+  // location.reload() only on success. Reloading after a rejected save is the
+  // worst of both: the page comes back showing the OLD theme with no error
+  // anywhere, so the control looks like it silently reverted itself rather than
+  // like the request failed. On failure the select is put back instead, so what
+  // is shown still matches what is stored.
+  const save = async (t: string) => {
+    const previous = theme;
+    setErr('');
+    setTheme(t);
+    try {
+      await api.putSettings({ ui: { theme: t } });
+    } catch (e) {
+      setTheme(previous);
+      setErr(apiErrorMessage(e, 'Could not save the theme'));
+      return;
+    }
+    location.reload();
+  };
   return (
     <div>
       <h2>Appearance</h2>
@@ -402,6 +546,7 @@ function Appearance({ s }: { s: any }) {
           <option value="obsidian-light">Obsidian Light</option>
         </select>
       </Row>
+      {err && <div style={{ color: '#e5534b', margin: '6px 0' }}>{err}</div>}
     </div>
   );
 }
@@ -418,8 +563,15 @@ function AccountSettings({ s, reload }: { s: any; reload: () => void }) {
   const save = async () => {
     setErr('');
     setMsg('');
-    if (next.length < 6) {
-      setErr('New password must be at least 6 characters');
+    // Worded from the shared constant rather than from a literal 6. This check
+    // was already here and already correct; what it was not was tied to the
+    // server's rule, so a future change to MIN_PASSWORD_LEN in
+    // server/src/services/auth.ts would have left this branch quietly claiming
+    // the old number. As everywhere else on this surface, the server re-checks
+    // (routes/auth.ts and setUserPassword both do) and remains the gate: this
+    // only saves a round trip and states the rule where the user is typing.
+    if (next.length < MIN_PASSWORD_LEN) {
+      setErr(`New password must be at least ${MIN_PASSWORD_LEN} characters`);
       return;
     }
     if (next !== confirm) {
@@ -434,8 +586,11 @@ function AccountSettings({ s, reload }: { s: any; reload: () => void }) {
       setNext('');
       setConfirm('');
       await reload();
-    } catch (e: any) {
-      setErr(e?.message ?? 'Failed to change password');
+    } catch (e) {
+      // The server's own string is worth showing verbatim here: it distinguishes
+      // "Current password is incorrect" (401) from the length 400, and those are
+      // two very different things for the user to do next.
+      setErr(apiErrorMessage(e, 'Failed to change password'));
     } finally {
       setBusy(false);
     }
@@ -457,7 +612,7 @@ function AccountSettings({ s, reload }: { s: any; reload: () => void }) {
         <input className="text-input" type="password" style={{ width: 240 }} value={current}
           onChange={(e) => setCurrent(e.target.value)} autoComplete="current-password" />
       </Row>
-      <Row name="New password" desc="At least 6 characters">
+      <Row name="New password" desc={`At least ${MIN_PASSWORD_LEN} characters`}>
         <input className="text-input" type="password" style={{ width: 240 }} value={next}
           onChange={(e) => setNext(e.target.value)} autoComplete="new-password" />
       </Row>
@@ -480,7 +635,23 @@ function AccountSettings({ s, reload }: { s: any; reload: () => void }) {
 }
 
 function About() {
-  const logout = async () => { await api.logout(); location.reload(); };
+  const [err, setErr] = useState('');
+  // Deliberately does NOT reload when the request fails. The session cookie is
+  // cleared server-side by POST /auth/logout, so reloading after a failed call
+  // would drop the user back into a fully authenticated app with no explanation:
+  // they would believe they had logged out on a machine where they had not.
+  // Telling them it failed, and leaving them signed in visibly, is the only
+  // honest outcome.
+  const logout = async () => {
+    setErr('');
+    try {
+      await api.logout();
+    } catch (e) {
+      setErr(`${apiErrorMessage(e, 'Could not log out')}. You are still signed in.`);
+      return;
+    }
+    location.reload();
+  };
   return (
     <div>
       <h2>About WebObsidian</h2>
@@ -489,6 +660,7 @@ function About() {
         agent API and community plugins.
       </p>
       <button className="btn danger" onClick={logout}>Log out</button>
+      {err && <div style={{ color: '#e5534b', margin: '6px 0' }}>{err}</div>}
     </div>
   );
 }
