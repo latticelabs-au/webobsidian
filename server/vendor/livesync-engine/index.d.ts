@@ -149,8 +149,30 @@ export type EnumerateConditions = {
 };
 
 export type HashAlgorithm = "" | "xxhash32" | "xxhash64" | "mixed-purejs" | "sha1";
-export type E2EEAlgorithm = "" | "v2" | "v3";
-export type ChunkSplitterVersion = number;
+
+/*
+ * The next two MUST stay byte-identical to the unions upstream derives from its
+ * E2EEAlgorithms and ChunkAlgorithms constants (upstream/src/common/types.ts).
+ * This file is hand-maintained, so nothing enforces that automatically, and both
+ * of these had already drifted:
+ *
+ *   E2EEAlgorithm      declared "" | "v2" | "v3"   -- "v3" does not exist
+ *                      upstream                    "" | "v2" | "forceV1"
+ *   ChunkSplitterVersion declared number           -- it is a string union
+ *
+ * Neither drift produced a compile error, which is the whole problem. Both types
+ * are used for the RemoteTweaks fields that mergeRemoteTweaks() ADOPTS from the
+ * remote database and then hands to the engine, so a wrong declaration removes
+ * type checking from exactly the values that decide how bytes are encrypted and
+ * split. `number` in particular accepted anything at all while the engine was
+ * comparing against strings.
+ *
+ * The guard is a type-level test (src/__tests__/vendor-types.test.ts) that
+ * assigns every upstream constant to these unions and back, so a future drift
+ * fails `npm run typecheck` in CI rather than silently at runtime.
+ */
+export type E2EEAlgorithm = "" | "v2" | "forceV1";
+export type ChunkSplitterVersion = "" | "v1" | "v2" | "v2-segmenter" | "v3-rabin-karp";
 
 /**
  * The full settings object the engine derives from
