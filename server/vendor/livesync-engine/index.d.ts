@@ -15,11 +15,12 @@
  * Scope: only the surface `src/entry.ts` actually exports. Members present on the
  * upstream class but deliberately omitted here (the `$$`/`$every`/`$all`
  * `LiveSyncLocalDBEnv` hooks, `enumerate`, `_enumerate`) are internal plumbing;
- * `$$createPouchDBInstance` is the one exception, declared because callers must
- * override it (see below).
+ * `$$createPouchDBInstance` is declared because callers must override it (see
+ * below), and `liveSyncLocalDB` is declared with exactly one member on it,
+ * because the class exposes `rawGet` and no raw WRITE (see its own note).
  *
  * Source of truth: vrtmrz/livesync-commonlib @ 8ed9bcd,
- * src/API/DirectFileManipulatorV2.ts
+ * src/API/DirectFileManipulatorV2.ts and src/pouchdb/LiveSyncDBFunctions.ts
  */
 
 // DELIBERATELY NO `/// <reference types="pouchdb" />`.
@@ -198,6 +199,159 @@ export type RemoteDBSettings = {
     [key: string]: unknown;
 };
 
+/**
+ * The subset of the plugin's settings that is published in the milestone
+ * document, i.e. what every client on the cluster tells every other client about
+ * how it encodes documents.
+ *
+ * Upstream derives it as `typeof TweakValuesTemplate`, the union of
+ * `TweakValuesRecommendedTemplate` and `TweakValuesShouldMatchedTemplate` (about
+ * thirty keys off the plugin's ~150-field settings object). Only the fields this
+ * server reads or writes are named; the index signature covers the rest rather
+ * than pretending this file enumerates them.
+ *
+ * SECURITY NOTE, load-bearing: neither template contains `passphrase`,
+ * `couchDB_PASSWORD` nor `couchDB_URI`, so the milestone this server writes
+ * carries no credential. `encrypt` (a boolean) is published, exactly as every
+ * Obsidian client publishes it. Anything added to this type must be checked
+ * against that, because the document is world-readable to every client on the
+ * cluster.
+ */
+export type TweakValues = {
+    minimumChunkSize?: number;
+    customChunkSize?: number;
+    longLineThreshold?: number;
+    encrypt?: boolean;
+    usePathObfuscation?: boolean;
+    enableCompression?: boolean;
+    useEden?: boolean;
+    maxAgeInEden?: number;
+    maxTotalLengthInEden?: number;
+    maxChunksInEden?: number;
+    useDynamicIterationCount?: boolean;
+    hashAlg?: HashAlgorithm;
+    enableChunkSplitterV2?: boolean;
+    chunkSplitterVersion?: ChunkSplitterVersion;
+    E2EEAlgorithm?: E2EEAlgorithm;
+    doNotUseFixedRevisionForChunks?: boolean;
+    handleFilenameCaseSensitive?: boolean;
+    usePluginSyncV2?: boolean;
+    useSegmenter?: boolean;
+    [key: string]: unknown;
+};
+
+/** A client's compatible chunk-format range, plus the version it writes. */
+export interface ChunkVersionRange {
+    /** Lowest chunk format version this client can read. */
+    min: number;
+    /** Highest chunk format version this client can read. */
+    max: number;
+    /** The version it writes. */
+    current: number;
+}
+
+/**
+ * `_local/obsydian_livesync_milestone`: the cluster's shared handshake document.
+ *
+ * A `type` ALIAS rather than an `interface`, deliberately. TypeScript gives a
+ * type alias of an object literal an implicit index signature and an interface
+ * none, so only the alias form is assignable to {@link EntryDoc}'s
+ * `Record<string, unknown>` member, which is what `putRaw` takes. Changing this
+ * to an interface breaks the write path with an assignability error that reads as
+ * unrelated.
+ *
+ * `_local/` is not replicated and does not appear in `_changes`, so the only way
+ * to observe it is a direct GET. That is why a peer that never reads it also
+ * never notices it appearing, and why `locked`/`cleaned` can be set by another
+ * client without anything in a changes feed reporting it.
+ */
+export type EntryMilestoneInfo = {
+    _id: DocumentID;
+    _rev?: string;
+    type: "milestoneinfo";
+    /** Creation timestamp. A CHANGE here means the database was rebuilt. */
+    created: number;
+    /** Nodes allowed to replicate while `locked` is set. */
+    accepted_nodes: string[];
+    /** Set by a rebuild or a chunk clean-up. Non-accepted nodes must not write. */
+    locked: boolean;
+    /** The lock came from a chunk clean-up specifically. */
+    cleaned?: boolean;
+    node_chunk_info: { [nodeId: string]: ChunkVersionRange };
+    /** Per node id, plus the reserved {@link DEVICE_ID_PREFERRED} key. */
+    tweak_values: { [nodeId: string]: TweakValues };
+};
+
+/**
+ * The verdict of {@link ensureRemoteIsCompatible}.
+ *
+ * `LOCKED` means locked but this node is accepted (the engine's own consumer
+ * proceeds); `NODE_LOCKED` and `NODE_CLEANED` mean locked and NOT accepted, and
+ * neither heals by waiting.
+ */
+export type ENSURE_DB_RESULT =
+    | "OK"
+    | "INCOMPATIBLE"
+    | "LOCKED"
+    | "NODE_LOCKED"
+    | "NODE_CLEANED"
+    | ["MISMATCHED", TweakValues];
+
+/**
+ * Every tweak key published in the milestone document (the union of upstream's
+ * recommended and should-be-matched templates). Values in the template are
+ * placeholders: {@link extractObject} uses only its KEYS.
+ */
+export const TweakValuesTemplate: TweakValues;
+
+/**
+ * The subset whose disagreement makes `ensureRemoteIsCompatible` report
+ * MISMATCHED. Note that it contains keys `DirectFileManipulatorOptions` has no
+ * field for, so a consumer of this package cannot make all of them agree.
+ */
+export const TweakValuesShouldMatchedTemplate: TweakValues;
+
+/** Fallbacks applied to both sides before comparison, for documents written by older clients. */
+export const TweakValuesDefault: TweakValues;
+
+/** Copies the template's KEYS out of `obj`. Keys absent from `obj` come back as `undefined`. */
+export function extractObject<T extends Record<string, unknown>>(template: T, obj: Record<string, unknown>): T;
+
+/**
+ * Deep inequality. With `ignoreUndefined`, any key that is `undefined` on either
+ * side is skipped entirely rather than treated as a difference, which is how a
+ * document written by an older client avoids mismatching on keys it never had.
+ */
+export function isObjectDifferent(a: unknown, b: unknown, ignoreUndefined?: boolean): boolean;
+
+/** The milestone document's id. Note upstream's "obsydian" misspelling: it is a wire identifier. */
+export const MILESTONE_DOCID: DocumentID;
+
+/** The reserved `tweak_values` key holding the cluster's authoritative settings. */
+export const DEVICE_ID_PREFERRED: "PREFERRED";
+
+/**
+ * Reconcile this client with the remote's milestone document, writing it if this
+ * client is not represented in it yet (which includes the case where it does not
+ * exist at all, i.e. a database no LiveSync client has ever initialised).
+ *
+ * Pass `false` for `infoSrc` when the document is missing: that is exactly what
+ * {@link DirectFileManipulator.rawGet} returns, and the function synthesises a
+ * base milestone from it.
+ *
+ * `updateCallback` is invoked with the document to write, and only when a write
+ * is actually needed. It must perform a raw put (see
+ * {@link DirectFileManipulator.liveSyncLocalDB}); do not transform the document
+ * on the way, since its shape is the wire contract.
+ */
+export function ensureRemoteIsCompatible(
+    infoSrc: EntryMilestoneInfo | false,
+    setting: RemoteDBSettings,
+    deviceNodeID: string,
+    currentVersionRange: ChunkVersionRange,
+    updateCallback: (info: EntryMilestoneInfo) => Promise<void>,
+): Promise<ENSURE_DB_RESULT>;
+
 // --- Options -----------------------------------------------------------------
 export type DirectFileManipulatorOptions = {
     url: string;
@@ -277,6 +431,38 @@ export declare class DirectFileManipulator {
 
     /** Reads a raw document, bypassing chunk resolution. `false` if missing. */
     rawGet<T>(id: DocumentID): Promise<false | T>;
+
+    /**
+     * The underlying local database wrapper. ONE member is declared, and only
+     * because there is no other way to write a document the class has no method
+     * for.
+     *
+     * `rawGet` exists; a `rawPut` does not. The milestone document
+     * ({@link ensureRemoteIsCompatible}) has to be written as-is, so the write has
+     * to reach `putRaw`. Declaring the member is not the same thing as reaching
+     * through an internal with a cast: this is a public property on the upstream
+     * class (`DirectFileManipulatorV2.ts:106`), the engine's own
+     * `putSyncParameters` writes through exactly this path, and naming it here
+     * means a version bump that removes it fails the typecheck instead of failing
+     * at runtime.
+     *
+     * Nothing else on `LiveSyncLocalDB` is declared, deliberately. Chunk
+     * resolution, entry decoding and the change feed all have supported entry
+     * points on the class above; use those.
+     */
+    liveSyncLocalDB: {
+        /**
+         * Write a document with no chunking, no path mapping and no id
+         * derivation. It still passes through the `transform-pouch` transforms,
+         * which for a milestone document are provably no-ops: `compressDoc`
+         * returns any document without a `data` field unchanged, and
+         * `incomingEncryptHKDF` only rewrites documents matching
+         * `isEncryptedChunkEntry` (`h:`), `isSyncInfoEntry` (the syncinfo id),
+         * `isObfuscatedEntry` (`f:`) or a non-empty `eden`. The Obsidian plugin
+         * writes the same document through the same transforms.
+         */
+        putRaw(doc: EntryDoc, options?: Record<string, unknown>): Promise<{ ok: boolean; id: string; rev: string }>;
+    };
 
     /** Writes a file. Returns false if the write did not take. */
     put(

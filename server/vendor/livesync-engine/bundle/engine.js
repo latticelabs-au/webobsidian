@@ -56,6 +56,7 @@ var MISSING_OR_ERROR = Symbol("missing_or_error");
 var LEAVE_TO_SUBSEQUENT = Symbol("leave_to_subsequent_proc");
 var TIME_ARGUMENT_INFINITY = Symbol("infinity");
 var VERSIONING_DOCID = "obsydian_livesync_version";
+var MILESTONE_DOCID = "_local/obsydian_livesync_milestone";
 var SETTING_VERSION_SUPPORT_CASE_INSENSITIVE = 10;
 var CURRENT_SETTING_VERSION = SETTING_VERSION_SUPPORT_CASE_INSENSITIVE;
 var RemoteTypes = {
@@ -342,6 +343,7 @@ var TweakValuesDefault = {
   chunkSplitterVersion: DEFAULT_SETTINGS.chunkSplitterVersion
 };
 var TweakValuesTemplate = { ...TweakValuesRecommendedTemplate, ...TweakValuesShouldMatchedTemplate };
+var DEVICE_ID_PREFERRED = "PREFERRED";
 var PREFIXMD_LOGFILE = "livesync_log_";
 var PREFIXMD_LOGFILE_UC = "LIVESYNC_LOG_";
 var FlagFilesOriginal = {
@@ -4859,9 +4861,80 @@ var DirectFileManipulator = class {
     return this.since;
   }
 };
+
+// upstream/src/pouchdb/LiveSyncDBFunctions.ts
+async function ensureRemoteIsCompatible(infoSrc, setting, deviceNodeID, currentVersionRange, updateCallback) {
+  const baseMilestone = {
+    _id: MILESTONE_DOCID,
+    type: "milestoneinfo",
+    created: /* @__PURE__ */ new Date() / 1,
+    locked: false,
+    accepted_nodes: [deviceNodeID],
+    node_chunk_info: { [deviceNodeID]: currentVersionRange },
+    tweak_values: {}
+  };
+  let remoteMilestone = infoSrc;
+  if (!remoteMilestone) remoteMilestone = baseMilestone;
+  const currentTweakValues = extractObject(TweakValuesTemplate, setting);
+  remoteMilestone.node_chunk_info = { ...baseMilestone.node_chunk_info, ...remoteMilestone.node_chunk_info };
+  const writeMilestone = remoteMilestone.node_chunk_info[deviceNodeID].min != currentVersionRange.min || remoteMilestone.node_chunk_info[deviceNodeID].max != currentVersionRange.max || isObjectDifferent(remoteMilestone.tweak_values?.[deviceNodeID], currentTweakValues) || typeof remoteMilestone._rev == "undefined" || !(DEVICE_ID_PREFERRED in remoteMilestone.tweak_values);
+  if (writeMilestone) {
+    remoteMilestone.node_chunk_info[deviceNodeID].min = currentVersionRange.min;
+    remoteMilestone.node_chunk_info[deviceNodeID].max = currentVersionRange.max;
+    remoteMilestone.tweak_values = { ...remoteMilestone.tweak_values ?? {}, [deviceNodeID]: currentTweakValues };
+    if (!(DEVICE_ID_PREFERRED in remoteMilestone.tweak_values)) {
+      remoteMilestone.tweak_values[DEVICE_ID_PREFERRED] = currentTweakValues;
+    }
+    await updateCallback(remoteMilestone);
+  }
+  let globalMin = currentVersionRange.min;
+  let globalMax = currentVersionRange.max;
+  for (const nodeId of remoteMilestone.accepted_nodes) {
+    if (nodeId == deviceNodeID) continue;
+    if (nodeId in remoteMilestone.node_chunk_info) {
+      const nodeInfo = remoteMilestone.node_chunk_info[nodeId];
+      globalMin = Math.max(nodeInfo.min, globalMin);
+      globalMax = Math.min(nodeInfo.max, globalMax);
+    } else {
+      globalMin = 0;
+      globalMax = 0;
+    }
+  }
+  if (globalMax < globalMin) {
+    if (!setting.ignoreVersionCheck) {
+      return "INCOMPATIBLE";
+    }
+  }
+  if (!setting.disableCheckingConfigMismatch) {
+    const preferred_tweak = remoteMilestone.tweak_values?.[DEVICE_ID_PREFERRED] ?? currentTweakValues;
+    const current_tweak = currentTweakValues;
+    const preferred_should_matched = extractObject(TweakValuesShouldMatchedTemplate, {
+      ...TweakValuesDefault,
+      ...preferred_tweak
+    });
+    const current_should_matched = extractObject(TweakValuesShouldMatchedTemplate, {
+      ...TweakValuesDefault,
+      ...current_tweak
+    });
+    if (isObjectDifferent(preferred_should_matched, current_should_matched, true)) {
+      return ["MISMATCHED", preferred_tweak];
+    }
+  }
+  if (remoteMilestone.locked) {
+    if (remoteMilestone.accepted_nodes.indexOf(deviceNodeID) == -1) {
+      if (remoteMilestone.cleaned) {
+        return "NODE_CLEANED";
+      }
+      return "NODE_LOCKED";
+    }
+    return "LOCKED";
+  }
+  return "OK";
+}
 var export_Logger = logger_exports.Logger;
 var export_defaultLoggerEnv = logger_exports.defaultLoggerEnv;
 export {
+  DEVICE_ID_PREFERRED,
   DirectFileManipulator,
   LOG_LEVEL_DEBUG,
   LOG_LEVEL_INFO,
@@ -4869,16 +4942,23 @@ export {
   LOG_LEVEL_URGENT,
   LOG_LEVEL_VERBOSE,
   export_Logger as Logger,
+  MILESTONE_DOCID,
+  TweakValuesDefault,
+  TweakValuesShouldMatchedTemplate,
+  TweakValuesTemplate,
   addPrefix,
   createBlob,
   createTextBlob,
   export_defaultLoggerEnv as defaultLoggerEnv,
   determineTypeFromBlob,
+  ensureRemoteIsCompatible,
+  extractObject,
   getPath,
   getPathWithoutPrefix,
   id2path_base,
   isAccepted,
   isAcceptedAll,
+  isObjectDifferent,
   isPlainText,
   path2id_base,
   shouldBeIgnored,
