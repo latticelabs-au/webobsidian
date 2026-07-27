@@ -19,9 +19,11 @@
     "typecheck": "npm --workspace server run typecheck && npm --workspace web run typecheck",
     "desktop": "npm run build && npm --workspace desktop run dev",
     "desktop:dist": "npm run build && npm --workspace desktop run dist",
-    "desktop:publish": "npm run build && npm --workspace desktop run dist:publish"
+    "desktop:publish": "npm run build && npm --workspace desktop run dist:publish",
+    "e2e": "playwright test -c e2e/playwright.config.ts"
   },
   "devDependencies": {
+    "@playwright/test": "1.58.2",
     "concurrently": "^9.1.0"
   },
   "engines": {
