@@ -4,9 +4,10 @@
  *
  * Everything structural is the bridge's: the probe/build/retry connect loop, the
  * fresh-manipulator-per-attempt rule, the remote-tweak adoption, the
- * remote-rebuilt detection, the same-content skip, and the health snapshot. Four
+ * remote-rebuilt detection, the same-content skip, and the health snapshot. Six
  * things are deliberately different, and each one is a defect fix rather than a
- * preference. They are marked FIX 3, FIX 4, FIX 10 and FATAL CONFIG below:
+ * preference. They are marked FIX 3, FIX 4, FIX 10, INBOUND LEDGER, MILESTONE
+ * HANDSHAKE and FATAL CONFIG below:
  *
  *  - FIX 3: `compareDate()` had an operator-precedence bug and an int32
  *    overflow, so the same-content dedup fired essentially at random.
@@ -15,6 +16,23 @@
  *  - FIX 10: the changes feed's `complete` event was a terminal, silent stop.
  *    This is the actual mechanism behind the "did a full push, then went silent"
  *    behaviour KICKOFF section 7 reports.
+ *  - INBOUND LEDGER: `ok` meant "connected, and the feed OBJECT is attached",
+ *    which is a claim about a socket rather than about work. Three separate
+ *    upstream defects stop documents dead while `watching` stays true (see
+ *    progress.ts, which names all three), so a wedged peer reported itself
+ *    healthy, `restartWorthy` was unreachable, and `/healthz/livesync` answered
+ *    200 forever. `snapshot()` now requires work to be flowing, measured by
+ *    `InboundProgress` plus one out-of-band `_changes` probe.
+ *  - MILESTONE HANDSHAKE: the bridge READS the cluster's milestone document and
+ *    never writes it, which is invisible while an Obsidian client has already
+ *    initialised the database (the bridge's own deployment) and wrong the moment
+ *    the daemon is the first client against an empty one, which WebObsidian is
+ *    explicitly allowed to be. Two consequences, both silent: another client
+ *    joining later seeds the document from ITS settings and we adopt them on the
+ *    next restart, having already written a database in a different format; and
+ *    a `locked`/`cleaned` flag set by a plugin rebuild or chunk clean-up is
+ *    ignored, so we keep writing into a database that has been declared rebuilt.
+ *    `connectAndWatch` now drives the engine's own `ensureRemoteIsCompatible`.
  *  - FATAL CONFIG: the three remote-tweak mismatches (encryption, obfuscation,
  *    compression) were thrown into the retry loop, so a passphrase typo retried
  *    every 30 seconds forever while the storage side wedged behind a promise
@@ -26,11 +44,26 @@
  * `redactUrlCreds`), and the logger from `types.ts` redacts again on the way
  * out. Two layers, because one forgotten call would publish the password.
  */
-import { DirectFileManipulator, createBlob, createTextBlob, isPlainText } from 'livesync-engine';
+import {
+    DEVICE_ID_PREFERRED,
+    DirectFileManipulator,
+    MILESTONE_DOCID,
+    TweakValuesDefault,
+    TweakValuesShouldMatchedTemplate,
+    TweakValuesTemplate,
+    createBlob,
+    createTextBlob,
+    ensureRemoteIsCompatible,
+    extractObject,
+    isObjectDifferent,
+    isPlainText,
+} from 'livesync-engine';
 import type {
     ChunkSplitterVersion,
-    DocumentID,
+    ChunkVersionRange,
     E2EEAlgorithm,
+    ENSURE_DB_RESULT,
+    EntryMilestoneInfo,
     FileInfo,
     FilePathWithPrefix,
     HashAlgorithm,
@@ -38,9 +71,15 @@ import type {
     PouchDatabaseConfiguration,
     PouchDatabaseHandle,
     ReadyEntry,
+    RemoteDBSettings,
+    TweakValues,
 } from 'livesync-engine';
 import { HealthTracker, type PeerHealth } from './health.js';
-import { EchoSuppressor, type LiveSyncStateStore } from './state.js';
+import { InboundProgress, type InboundProgressOptions, type InboundVerdict } from './progress.js';
+// `LiveSyncStateStore` is imported as a VALUE and not only as a type: the
+// decode-evidence fingerprint is a static on it, deliberately kept next to the
+// store that persists it rather than reimplemented here.
+import { EchoSuppressor, LiveSyncStateStore } from './state.js';
 import {
     describeError,
     validateCouchDBConf,
@@ -51,16 +90,60 @@ import {
 } from './types.js';
 
 /**
- * The id of Self-hosted LiveSync's milestone document.
+ * The chunk format range this peer advertises in the milestone document.
  *
- * Hard-coded rather than imported: the vendored package's curated entry surface
- * (`server/vendor/livesync-engine/src/entry.ts`) does not re-export
- * `MILESTONE_DOCID`, and the vendor tree is off limits for edits. The value is
- * copied verbatim from `upstream/src/common/types.ts`, misspelling included
- * ("obsydian"), because the string is a wire identifier: correcting the typo
- * would silently point this peer at a document no other LiveSync client writes.
+ * A WIRE CONSTANT, copied out of the engine because it cannot be imported:
+ * `currentVersionRange` is a module-local `const` in
+ * `upstream/src/replication/couchdb/LiveSyncReplicator.ts` and is not exported,
+ * so `src/entry.ts` has nothing to re-export. It is not a tuning knob. `max`
+ * feeds the engine's compatibility arithmetic (`ensureRemoteIsCompatible`
+ * intersects every accepted node's range and returns INCOMPATIBLE when the
+ * intersection is empty), so inventing a value here would either lock this peer
+ * out of a healthy cluster or, worse, claim we can read a chunk format we cannot.
+ *
+ * `livesync-wire-constants.test.ts` reads the literal straight out of the
+ * vendored source and fails if the two drift, because a commit bump that changed
+ * it would otherwise be silent until a real cluster refused us.
  */
-const MILESTONE_DOCID = '_local/obsydian_livesync_milestone' as DocumentID;
+export const CURRENT_VERSION_RANGE: ChunkVersionRange = { min: 0, max: 2400, current: 2 };
+
+/**
+ * Tweak keys that a mismatch on is provably harmless FOR THIS BACKEND.
+ *
+ * Context, because this list is a licence to ignore a warning and therefore has
+ * to justify itself key by key. `ensureRemoteIsCompatible` returns MISMATCHED
+ * when any key in upstream's `TweakValuesShouldMatchedTemplate` differs from the
+ * cluster's preferred values. That template is scoped to the Obsidian plugin,
+ * whose settings surface is much wider than this server's, and three of its keys
+ * are ones this server cannot set at all: `DirectFileManipulatorOptions` has no
+ * field for them, so `DirectFileManipulator`'s `settings` getter always reports
+ * `DEFAULT_SETTINGS`' value however the remote is configured. Treating those as
+ * fatal would mean refusing to sync with a perfectly compatible cluster over a
+ * value we are structurally incapable of changing.
+ *
+ * Verified in the vendored source, one at a time:
+ *
+ *  - `useSegmenter`: dead as a setting. `ContentSplitterBase.ts:83` derives the
+ *    real flag as `settings.chunkSplitterVersion === "v2-segmenter"` and never
+ *    reads `settings.useSegmenter`. We DO adopt `chunkSplitterVersion`, so the
+ *    behaviour agrees even when the advertised value does not.
+ *  - `longLineThreshold`: has no reader anywhere under `upstream/src` outside the
+ *    settings type itself. Entirely vestigial.
+ *  - `usePluginSyncV2`: governs the plugin's own plugin-sync documents. This peer
+ *    replicates note entries only (`isNoteEntryType`), so it neither reads nor
+ *    writes a document the flag applies to. Note that upstream's RECOMMENDED
+ *    template sets it to `true` while the engine default is `false`, so an
+ *    ordinary plugin user mismatches us on it by default: this entry is the
+ *    difference between working against a normal cluster and refusing to start.
+ *
+ * Everything else that can still differ after tweak adoption is format-relevant
+ * and IS fatal. See `classifyMismatch`.
+ */
+export const BEHAVIOUR_FREE_TWEAK_KEYS: ReadonlySet<string> = new Set([
+    'useSegmenter',
+    'longLineThreshold',
+    'usePluginSyncV2',
+]);
 
 /** Ceiling on the connect backoff, matching the bridge. */
 const MAX_BACKOFF_MS = 30_000;
@@ -72,6 +155,58 @@ const PROBE_TIMEOUT_MS = 10_000;
 const REACHABLE_TIMEOUT_MS = 5_000;
 /** How often the watch supervisor checks that the changes feed is still attached. */
 const WATCHDOG_INTERVAL_MS = 5_000;
+/**
+ * How often to ask CouchDB whether it holds changes the feed has not delivered.
+ *
+ * This is the only network request in the health path that a HEALTHY peer makes,
+ * so its cost is the thing to justify. It is one `_changes` request with
+ * `limit=1` and `timeout=0` starting from the feed's own cursor. Every 20 seconds
+ * is four ticks of the watchdog: frequent enough that a dead feed is classified
+ * inside the 60-second `DELIVER_GRACE_MS`, rare enough to be invisible next to
+ * the long-poll the feed itself is holding open.
+ *
+ * Exported for the guard-rail assertion in `livesync-inbound.test.ts` that this
+ * stays longer than the timeout below, so two probes can never be in flight at
+ * once over the same connection.
+ */
+export const REMOTE_PENDING_INTERVAL_MS = 20_000;
+/**
+ * Bound on that probe.
+ *
+ * THE HEALTHY ANSWER IS THE EXPENSIVE ONE, which is the opposite of what the
+ * request looks like and the reason this used to be five seconds. With
+ * `filter=_selector&limit=1`, a POSITIVE answer ("yes, something is pending")
+ * returns the moment CouchDB finds one matching row and is essentially free. The
+ * NEGATIVE answer cannot return early at all: to prove that nothing matches,
+ * CouchDB has to walk the by-sequence index from `since` to the tail and evaluate
+ * the selector on every row it passes. So the tightest deadline landed on exactly
+ * the case where everything is fine, and a timeout there is not an answer, it is
+ * a failed measurement, which now costs the peer its health signal
+ * (`noteProbeUnanswerable`). Five seconds was a false-alarm generator.
+ *
+ * The walk is bounded by the chunk (`leaf`) documents written since the cursor
+ * last moved, because the cursor now advances on every non-leaf change (see
+ * `instrumentFeed`). One large attachment is a burst of thousands of them, so the
+ * bound has to cover a burst rather than a steady state. Fifteen seconds does,
+ * and stays under `REMOTE_PENDING_INTERVAL_MS` so probes cannot overlap. It is
+ * still bounded, which is the property that matters: a health check that hangs
+ * looks exactly like the wedge it is supposed to detect.
+ */
+export const REMOTE_PENDING_TIMEOUT_MS = 15_000;
+/**
+ * How long to stay quiet between repeats of the "the probe is not answering"
+ * notice.
+ *
+ * NOT a latch. The previous shape was a single boolean that, once set, demoted
+ * every subsequent failure to `debug` for the life of the process, so a
+ * permanently broken probe produced one line at boot and then nothing: the exact
+ * "goes quiet" behaviour this subsystem exists to remove, applied to the
+ * instrument rather than to the data. Rate-limiting keeps the log readable during
+ * a long outage while leaving the condition visible to anyone reading the log
+ * later. The HEALTH signal is not rate-limited at all: `InboundProgress` keeps
+ * reporting `unobservable` for as long as the probe is unanswerable.
+ */
+const PROBE_COMPLAINT_INTERVAL_MS = 300_000;
 /**
  * Only consider a same-content skip when the two mtimes are within an hour.
  *
@@ -110,19 +245,17 @@ export class LiveSyncNotReadyError extends Error {
     }
 }
 
-/** The subset of the milestone document this peer reads. */
-interface MilestoneDoc {
-    created?: number;
-    tweak_values?: Record<string, RemoteTweaks>;
-}
-
 /**
- * The tweak fields the bridge adopts from the remote.
+ * The tweak fields this peer will ADOPT from the remote.
  *
- * Structural and partial on purpose: upstream's `TweakValues` is derived from
- * the Obsidian plugin's entire settings object and is not exported by the
- * vendored entry surface. Naming only what is read here keeps the coupling to
- * the vendored types minimal and makes the adopted set auditable at a glance.
+ * Deliberately narrower than the engine's own `TweakValues`, which this package
+ * does now export. `TweakValues` carries an index signature (it is derived from
+ * the Obsidian plugin's entire settings object), and an index signature is
+ * exactly the wrong shape for the one list in this file that has to be auditable
+ * at a glance: these are the settings that decide how this peer encrypts, splits
+ * and names every document it writes. Naming them explicitly means adding one is
+ * a visible diff rather than a value that starts flowing through because the
+ * remote happened to send it.
  */
 interface RemoteTweaks {
     customChunkSize?: number;
@@ -146,6 +279,88 @@ interface RemoteTweaks {
 /** Minimal shape of the bundled PouchDB constructor. See `buildManipulator`. */
 type PouchConstructor = new (name: string, options: PouchDatabaseConfiguration) => PouchDatabaseHandle;
 
+/**
+ * One raw event from PouchDB's changes emitter, BEFORE decryption.
+ *
+ * Only three fields are read, and all three survive end-to-end encryption. `seq`
+ * is CouchDB's, never the document's. `type` is stored in plaintext even on an
+ * encrypted database, which is not an assumption but a load-bearing fact of the
+ * engine's own design: `beginWatch` opens the feed with the server-side selector
+ * `{ type: { $ne: "leaf" } }`, and a server-side selector can only match a field
+ * CouchDB can read. `outgoingDecryptHKDF` never rewrites it either.
+ *
+ * `id` is the CouchDB document id, which is what correlates this raw row with
+ * the decrypted document the engine hands to the interest predicate later; see
+ * `changeKey()`.
+ */
+interface RawFeedChange {
+    seq?: string | number;
+    id?: unknown;
+    doc?: { _id?: unknown; type?: unknown } | null;
+}
+
+/**
+ * The part of the changes emitter this peer needs and the vendored `ChangesHandle`
+ * declaration does not carry.
+ *
+ * `addListener`, not `on`, and the difference is the whole point. See
+ * `instrumentFeed()`.
+ */
+interface RawChangesEmitter {
+    addListener?: (event: string, listener: (change: RawFeedChange) => void) => unknown;
+}
+
+/**
+ * The document types the engine's own `isNoteEntry()` accepts.
+ *
+ * Duplicated rather than imported because `isNoteEntry` is a module-private
+ * function in the vendored tree and the curated entry surface does not export it.
+ * Keeping the two in step matters: this predicate decides which delivered
+ * documents OWE A DECODE RECEIPT, and the engine's decides what reaches
+ * `checkIsInterested`, so a disagreement would show up as a permanent phantom gap
+ * between the two counters and report a healthy peer as unable to decrypt.
+ *
+ * WHAT IT DELIBERATELY DOES NOT DECIDE is how far the changes feed has got. That
+ * is a wider question (the feed's selector admits `versioninfo`, `syncinfo`,
+ * legacy `notes` and `chunkpack` too) and conflating the two produced a permanent
+ * false wedge. See the call site in `instrumentFeed()`.
+ */
+function isNoteEntryType(type: unknown): boolean {
+    return type === 'newnote' || type === 'plain';
+}
+
+/**
+ * The identity that ties one document's three appearances together, for the
+ * inbound ledger's per-document stall clocks (`PendingClock` in progress.ts).
+ *
+ * A document is seen three times on the way in, at points that carry different
+ * shapes: as a raw change row on the feed, as a decrypted `MetaEntry` in the
+ * interest predicate, and as a `ReadyEntry` in the apply callback. The clocks
+ * need to know that those are the same document, and the CouchDB `_id` is the
+ * only field that is the same at all three, verified rather than assumed:
+ *
+ *  - the raw row's `id` is CouchDB's key, and our counting listener is attached
+ *    with `addListener`, so nothing has transformed it;
+ *  - `outgoingDecryptHKDF` builds its result as `{...doc}` and rewrites `data`,
+ *    `path` and `eden`. It never touches `_id`, which it could not: the id is the
+ *    database key, and for an obfuscated vault it is already the opaque `f:` hash
+ *    on both sides;
+ *  - `getDBEntryFromMeta` sets `_id: meta._id` explicitly on both of its return
+ *    paths.
+ *
+ * The PATH would have been the natural choice and is the wrong one: with path
+ * obfuscation the raw row has no readable path at all, so the correlation would
+ * silently fail on precisely the deployments KICKOFF names in its acceptance
+ * criteria. `PendingClock` degrades to plain FIFO order rather than to a false
+ * alarm if a key ever fails to match, so this is a sharpness rather than a
+ * correctness dependency, but it is worth getting right.
+ */
+function changeKey(id: unknown, docId: unknown): string | undefined {
+    if (typeof id === 'string' && id !== '') return id;
+    if (typeof docId === 'string' && docId !== '') return docId;
+    return undefined;
+}
+
 export interface CouchDBPeerDeps {
     state: LiveSyncStateStore;
     /** Hand a remote change to the storage peer. */
@@ -161,6 +376,14 @@ export interface CouchDBPeerDeps {
      * which is half of KICKOFF section 8's last acceptance criterion.
      */
     onConnected?: () => void;
+    /**
+     * Grace-window overrides for the inbound ledger.
+     *
+     * Injectable for the same reason `HealthTracker`'s window is: the defaults are
+     * measured in minutes and a test that had to wait them out would either be
+     * slow or would quietly assert against a shorter window than production uses.
+     */
+    progress?: InboundProgressOptions;
 }
 
 export class CouchDBPeer {
@@ -176,9 +399,15 @@ export class CouchDBPeer {
     private man?: DirectFileManipulator;
     private connected = false;
     /**
-     * Connected fine, but the remote has no milestone document yet, so there is
-     * nothing to reconcile against. Tracked separately from `connected` so the
-     * health snapshot can call it syncing rather than stuck.
+     * Connected fine, but there is no milestone document to reconcile against.
+     * Tracked separately from `connected` so the health snapshot can call it
+     * syncing rather than stuck.
+     *
+     * Since the handshake landed this is close to unreachable: an absent milestone
+     * is now SEEDED rather than merely noted, so the normal outcome of connecting
+     * to an empty database is a document that exists. The flag is kept because it
+     * is what the health snapshot falls back on, and a future change that stopped
+     * producing a document should report "not syncing" rather than crash.
      */
     private remoteEmpty = false;
     private starting = false;
@@ -194,11 +423,59 @@ export class CouchDBPeer {
     /** Resolver for the interruptible backoff sleep, so stop() is immediate. */
     private wakeFromBackoff?: () => void;
 
+    /**
+     * The inbound ledger: the difference between "the feed object is attached"
+     * and "remote changes are landing in the vault". See progress.ts for the three
+     * upstream defects that make the distinction necessary.
+     */
+    private readonly progress: InboundProgress;
+    /**
+     * The changes emitter this peer has already attached its counting listener to.
+     *
+     * Identity-compared rather than a boolean because the engine replaces the
+     * emitter on its own ten-second reconnect, and an instrumented-once flag would
+     * leave every feed after the first one uncounted, i.e. silently unmeasured.
+     */
+    private instrumented?: object;
+    /** Watchdog ticks since the last remote-pending probe. See REMOTE_PENDING_INTERVAL_MS. */
+    private pendingProbeTicks = 0;
+    /** A remote-pending probe is in flight; do not start a second. */
+    private pendingProbeInFlight = false;
+    /**
+     * When the "probe is not answering" notice was last written.
+     *
+     * A TIMESTAMP, NOT A FLAG. See `noteProbeUnanswerable`: the flag it replaced
+     * silenced the notice for the life of the process after one line, which left a
+     * permanently blind peer looking like a quiet one in the log. Undefined means
+     * the probe is currently answering, so the next failure complains at once.
+     */
+    private pendingProbeComplainedAt?: number;
+
+    /**
+     * The fingerprint under which a successful decode is recorded and looked up.
+     *
+     * Computed once, from the configuration this peer was built with, because it
+     * has to be stable for the life of the peer: it is the key that decides
+     * whether persisted evidence of a working passphrase belongs to THIS
+     * configuration. `mergeRemoteTweaks` may replace `this.conf` while adopting
+     * the cluster's chunking settings, and it never touches the passphrase, the
+     * url or the database, but computing this up front means a future edit that
+     * did would not silently invalidate every peer's stored evidence.
+     */
+    private readonly decodeEvidenceKey: string;
+
     constructor(conf: LiveSyncCouchDBConf, deps: CouchDBPeerDeps) {
         this.conf = { ...conf };
         this.deps = deps;
         this.state = deps.state;
         this.log = deps.log ?? (() => {});
+        this.progress = new InboundProgress(deps.progress);
+        this.decodeEvidenceKey = LiveSyncStateStore.decodeEvidenceKey({
+            url: conf.url,
+            database: conf.database,
+            passphrase: conf.passphrase,
+            obfuscatePassphrase: conf.obfuscatePassphrase,
+        });
         this.tracker = new HealthTracker(
             () => this.snapshot(),
             () => this.couchReachable(),
@@ -239,6 +516,11 @@ export class CouchDBPeer {
         this.starting = true;
         this.stopping = false;
         this.tracker.reset();
+        // A fresh run must not inherit the previous run's gap. Its outstanding
+        // documents will be replayed from the persisted checkpoint, so counting
+        // them again would double-count the same work and, worse, would carry a
+        // stall verdict across a restart that may well have fixed it.
+        this.progress.reset();
         const firstAttempt = this.connectOnce();
         // The loop continues past the first attempt; the caller only waits for
         // that first result.
@@ -319,7 +601,9 @@ export class CouchDBPeer {
         }
         const man = this.man;
         this.man = undefined;
+        this.instrumented = undefined;
         this.tracker.reset();
+        this.progress.reset();
         try {
             man?.endWatch();
         } catch (e) {
@@ -493,14 +777,95 @@ export class CouchDBPeer {
         await res.json();
     }
 
-    /** Is CouchDB up right now? Same success threshold as the connect probe. */
+    /**
+     * Is CouchDB up right now? Same success threshold as the connect probe.
+     *
+     * A FATALLY MISCONFIGURED PEER REPORTS ITS BACKEND DOWN, whatever CouchDB
+     * says. This reads as a lie and is not one: `backendUp` exists for exactly one
+     * consumer, `HealthTracker`'s `restartWorthy`, whose question is "would
+     * restarting plausibly help?". For a wrong passphrase, a compression mismatch
+     * or a database that cannot be decrypted the answer is no, at any hour of any
+     * day, and answering yes puts `routes/livesync.ts`'s `maybeRestart` into a
+     * restart-every-cooldown loop over a fault that only an operator can fix. The
+     * condition is not hidden: `fatalReason` is reported by `snapshot()`,
+     * `getFatalReason()` and the status API, all of which say precisely what is
+     * wrong.
+     */
     private async couchReachable(): Promise<boolean> {
+        if (this.fatalReason) return false;
         try {
             await this.probeCouch(REACHABLE_TIMEOUT_MS);
             return true;
         } catch {
             return false;
         }
+    }
+
+    /**
+     * Does the remote hold non-chunk changes past the point the FEED has reached?
+     *
+     * The one fact no in-process counter can produce, and the one that separates
+     * IDLE from WEDGED when the feed has gone quiet: an attached long-poll whose
+     * connection is being black-holed by a proxy delivers nothing, raises nothing,
+     * and leaves `watching` true forever. Counting what arrives cannot see that,
+     * because the whole failure is that nothing arrives.
+     *
+     * Three details are load-bearing:
+     *
+     *  - THE SELECTOR MUST MATCH THE FEED'S, IN BOTH DIRECTIONS. `beginWatch`
+     *    opens the feed with `{ type: { $ne: "leaf" } }`, so chunk documents never
+     *    reach it and never advance its cursor. An unfiltered probe would see
+     *    every chunk written by any client as "pending", which on a busy remote is
+     *    always, so a healthy peer would report itself wedged permanently. The
+     *    converse bites just as hard and is less obvious: everything the selector
+     *    DOES admit has to advance the cursor, or the probe measures against a
+     *    position the feed has already passed. That is what `instrumentFeed()`
+     *    now guarantees, and its comment lists the document types that made the
+     *    earlier, narrower rule fail.
+     *  - THE CURSOR IS THE FEED'S, NOT THE CHECKPOINT'S. See `InboundProgress`'s
+     *    `cursor` field: the checkpoint only advances for documents this peer is
+     *    interested in, so on a remote that also carries `i:` internal documents
+     *    it lags forever by design.
+     *  - AN UNANSWERABLE PROBE RETURNS `undefined`, not `false` and not `true`.
+     *    `filter=_selector` needs CouchDB 2.0, a proxy can refuse a POST, and a
+     *    network can drop. None of those is evidence about the feed, so none of
+     *    them may be reported as one. `tickPendingProbe` routes that answer to
+     *    `noteProbeUnanswerable()`, which fails towards unhealthy rather than
+     *    towards silence.
+     */
+    private async probeRemotePending(): Promise<boolean | undefined> {
+        const since = this.progress.getCursor() ?? this.state.getSince() ?? '';
+        const query = new URLSearchParams({
+            since: since || '0',
+            limit: '1',
+            timeout: '0',
+            feed: 'normal',
+            filter: '_selector',
+        });
+        const url = `${this.conf.url}/${this.conf.database}/_changes?${query.toString()}`;
+        const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+        if (this.conf.username) {
+            // Buffer, not btoa: btoa throws above code point 0xFF, so a non-ASCII
+            // password would make every probe fail forever. Same reasoning as
+            // probeCouch, and deliberately the same spelling.
+            const creds = `${this.conf.username}:${this.conf.password ?? ''}`;
+            headers.Authorization = `Basic ${Buffer.from(creds, 'utf8').toString('base64')}`;
+        }
+        const res = await globalThis.fetch(url, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({ selector: { type: { $ne: 'leaf' } } }),
+            signal: AbortSignal.timeout(REMOTE_PENDING_TIMEOUT_MS),
+        });
+        if (!res.ok) {
+            await res.body?.cancel();
+            throw new Error(`CouchDB refused the pending-changes probe: HTTP ${res.status}`);
+        }
+        const body = (await res.json()) as { results?: unknown };
+        // A body without `results` is not an answer. Treating a shape we do not
+        // recognise as "nothing pending" would be the silent direction to fail in.
+        if (!Array.isArray(body.results)) return undefined;
+        return body.results.length > 0;
     }
 
     /**
@@ -522,13 +887,23 @@ export class CouchDBPeer {
         });
     }
 
-    /** Reconcile with the remote, then attach the changes feed. */
+    /**
+     * Reconcile with the remote, then attach the changes feed.
+     *
+     * ORDER IS LOAD-BEARING, and it is the reverse of what reads naturally.
+     * Tweak adoption happens FIRST and the milestone handshake second, so that
+     * what we publish about ourselves describes the settings we are actually
+     * going to write with. Handshake first would register the pre-adoption
+     * configuration, which is the one we are about to abandon, and would report a
+     * mismatch against the cluster's preferred values that adoption was on its way
+     * to resolving.
+     */
     private async connectAndWatch(): Promise<void> {
         await this.waitReady(READY_TIMEOUT_MS);
         let man = this.man;
         if (!man) throw new Error('manipulator was torn down while connecting');
 
-        const milestone = await man.rawGet<MilestoneDoc>(MILESTONE_DOCID);
+        const milestone = await man.rawGet<EntryMilestoneInfo>(MILESTONE_DOCID);
 
         if (milestone && milestone.tweak_values && this.conf.useRemoteTweaks) {
             const { merged, changes } = mergeRemoteTweaks(this.conf, milestone.tweak_values);
@@ -556,29 +931,38 @@ export class CouchDBPeer {
             }
         }
 
-        if (!milestone) {
-            /*
-             * A remote with no milestone document has never been initialised by a
-             * LiveSync client. The bridge logs this, records `remote-created` as
-             * "0" and RETURNS WITHOUT WATCHING, which means the peer stays deaf
-             * until the process is restarted: whenever another client does
-             * initialise the database, nothing here notices.
-             *
-             * We keep the marker (so the milestone appearing later reads as a
-             * rebuild and forces a replay from zero) but attach the feed anyway.
-             * Watching an empty database costs one idle long-poll and removes a
-             * whole class of "it only worked after I restarted it".
-             */
+        const effective = await this.handshakeMilestone(man, milestone);
+
+        /*
+         * The remote is "empty" only if the handshake could not settle it either.
+         * With the handshake in place that means one thing: `ensureRemoteIsCompatible`
+         * decided no write was needed AND handed back no document, which cannot
+         * happen for a missing milestone (a missing one always writes). The branch
+         * is kept rather than deleted because `remoteEmpty` still feeds the health
+         * snapshot, and a peer that silently reported "not syncing" because a
+         * future refactor stopped producing a document would be the same class of
+         * bug this file exists to remove.
+         */
+        if (!effective) {
             this.remoteEmpty = true;
             this.state.setRemoteCreated('0');
             this.log('remote database looks empty; watching from the first sequence.');
         } else {
             this.remoteEmpty = false;
-            const created = String(milestone.created ?? '');
+            const created = String(effective.created ?? '');
             if (this.state.getRemoteCreated() !== created) {
-                // A different `created` means a different database wearing the
-                // same name. Every sequence number we remember belongs to the old
-                // one, so the only safe checkpoint is the beginning.
+                /*
+                 * A different `created` means a different database wearing the
+                 * same name. Every sequence number we remember belongs to the old
+                 * one, so the only safe checkpoint is the beginning.
+                 *
+                 * Note what changed with the handshake: when WE seed the document,
+                 * `created` is now a real timestamp rather than the `'0'` marker
+                 * the bridge records. Recording the real value is what stops the
+                 * NEXT connect from reading our own freshly written milestone as
+                 * someone else's rebuild and forcing a pointless replay from
+                 * sequence zero on every single start.
+                 */
                 this.log('remote database looks rebuilt; fetching from the first sequence again.', 'notice');
                 this.state.setRemoteCreated(created);
                 this.state.setSince('0');
@@ -591,6 +975,327 @@ export class CouchDBPeer {
         this.startWatchdog();
     }
 
+    /**
+     * Announce this peer to the cluster, and find out whether the cluster will
+     * have it.
+     *
+     * THE BUG THIS EXISTS FOR. The reference bridge reads the milestone document
+     * and never writes it. Against the bridge author's own deployment that is
+     * invisible, because an Obsidian client always initialised the database
+     * first, so the bridge is never the seeder. WebObsidian is positioned as a
+     * first-class backend that may be pointed at an empty CouchDB, which is
+     * precisely the case the bridge never exercises, and it fails in two ways
+     * that produce no error anywhere:
+     *
+     *  1. SEEDING RACE. We write documents into an empty database using engine
+     *     defaults (`buildCouchConf` sets only url/db/credentials/passphrases, so
+     *     everything else falls through to `DEFAULT_SETTINGS`). Some time later an
+     *     Obsidian client connects, finds no milestone, and seeds one from ITS
+     *     settings, which for a current plugin differ from those defaults out of
+     *     the box (`chunkSplitterVersion`, `enableChunkSplitterV2`,
+     *     `doNotUseFixedRevisionForChunks`). Nothing complains, because there was
+     *     nothing to compare against. On our next restart we adopt those values.
+     *     The chunking half of that is storage bloat rather than data loss (reads
+     *     resolve chunks by the ids stored on the document, so existing documents
+     *     stay readable), but `handleFilenameCaseSensitive` is a genuine silent
+     *     fork: it is passed to `path2id_base` as `caseInsensitive`, so flipping
+     *     it changes the document ID of every path containing an uppercase
+     *     character. Everything we previously wrote is then orphaned under an id
+     *     we will never GET or PUT again. Updates create a second document,
+     *     deletes miss, and the vault diverges with no error on any side.
+     *  2. THE LOCK IS IGNORED. `locked` and `cleaned` are how the engine stops
+     *     clients writing into a database that is being rebuilt or having its
+     *     chunks garbage collected. A peer that never reads them keeps writing
+     *     against chunks a clean-up is in the middle of deleting.
+     *
+     * Both are closed by one call to the engine's own `ensureRemoteIsCompatible`.
+     * Driving the engine matters more than it looks: a hand-rolled milestone that
+     * disagreed with the engine's format would be a worse bug than the one it
+     * fixed, because the document is a wire contract with every Obsidian client
+     * on the cluster.
+     *
+     * Returns the document as it now stands remotely, or `false` if the engine
+     * decided nothing needed writing and there was nothing to read.
+     */
+    private async handshakeMilestone(
+        man: DirectFileManipulator,
+        milestone: EntryMilestoneInfo | false,
+    ): Promise<EntryMilestoneInfo | false> {
+        const nodeId = this.state.getNodeId();
+
+        // Before anything is written, and not derived from the engine's verdict.
+        // See `assertNotLockedOut` for why the verdict cannot be trusted for this.
+        if (milestone) this.assertNotLockedOut(milestone, nodeId);
+
+        /*
+         * Two fields have to be corrected before they are published, or we
+         * announce something we do not do. Both are upstream inconsistencies in
+         * `DirectFileManipulator`'s `settings` getter
+         * (`DirectFileManipulatorV2.ts:241-277`), which maps most of its options
+         * onto the settings object and forgets these:
+         *
+         *  - `usePathObfuscation` is never set, so it reports
+         *    `DEFAULT_SETTINGS.usePathObfuscation === false` even while
+         *    `path2id` is actively obfuscating because `obfuscatePassphrase` is
+         *    set (`:140-148`). Publishing that would tell the cluster our ids are
+         *    readable paths when they are `f:<hash>`, which is the single most
+         *    consequential thing a client can be wrong about: the two document
+         *    sets never intersect and both sides silently sync half a vault.
+         *  - `useDynamicIterationCount` is never set either, though
+         *    `$everyOnInitializeDatabase` reads `this.options.useDynamicIterationCount`
+         *    directly when it enables encryption (`:210`).
+         *
+         * `handleFilenameCaseSensitive` is pinned to an explicit `false` rather
+         * than left to fall through, for a subtler reason: its engine default is
+         * literally `undefined` (`types.ts:1187`), and the mismatch comparison
+         * runs `isObjectDifferent(..., ignoreUndefined = true)`, which SKIPS any
+         * key that is undefined on either side. Shipping `undefined` would
+         * therefore disable the mismatch check on the one field with the worst
+         * failure mode. `false` is also the truth: `path2id` passes
+         * `!options.handleFilenameCaseSensitive`, and `!undefined` is `true`, i.e.
+         * case-insensitive, i.e. exactly what `false` means.
+         *
+         * The engine reduces this object with `extractObject(TweakValuesTemplate, ...)`
+         * before it reaches the document, and that template contains no
+         * `passphrase`, no `couchDB_PASSWORD` and no `couchDB_URI`, so nothing
+         * secret is published. That is asserted by a test rather than trusted.
+         */
+        const announced: RemoteDBSettings = {
+            ...man.settings,
+            usePathObfuscation: Boolean(this.conf.obfuscatePassphrase),
+            useDynamicIterationCount: this.conf.useDynamicIterationCount ?? false,
+            handleFilenameCaseSensitive: this.conf.handleFilenameCaseSensitive ?? false,
+        };
+
+        /*
+         * The engine mutates and hands back the document it wrote, but only
+         * through this callback: when the milestone was missing it builds one
+         * internally and the caller never otherwise sees it. Capturing it here is
+         * the only way to learn the `created` timestamp of a document we just
+         * seeded, which the checkpoint logic above needs.
+         */
+        let written: EntryMilestoneInfo | undefined;
+        const result = await ensureRemoteIsCompatible(
+            milestone,
+            announced,
+            nodeId,
+            CURRENT_VERSION_RANGE,
+            async (info) => {
+                written = info;
+                /*
+                 * A raw put, because the document's shape IS the contract, and it
+                 * takes the document unchanged: no cast, because the vendored
+                 * `EntryMilestoneInfo` is declared as a type alias rather than an
+                 * interface precisely so it satisfies `putRaw`'s parameter without
+                 * one. A cast here would be the place a future shape change stops
+                 * being checked.
+                 *
+                 * It still passes through the transform-pouch transforms the engine
+                 * installs, which is both unavoidable and harmless: `compressDoc`
+                 * returns any document without a `data` field untouched, and
+                 * `incomingEncryptHKDF` only rewrites chunk entries, the syncinfo
+                 * entry, obfuscated (`f:`) ids and non-empty `eden`. The milestone
+                 * matches none of those, and the Obsidian plugin writes the same
+                 * document through the same transforms.
+                 *
+                 * A rejection here (a read-only CouchDB user, or a 409 from two
+                 * clients seeding at the same instant) propagates out of
+                 * `connectAndWatch` into the connect retry loop, which is correct
+                 * for both: a peer that cannot write the milestone cannot write
+                 * documents either, and a 409 resolves itself on the next attempt
+                 * because that attempt re-reads the document the winner wrote.
+                 */
+                await man.liveSyncLocalDB.putRaw(info);
+            },
+        );
+
+        this.applyEnsureResult(result, milestone !== false, announced);
+        return written ?? milestone;
+    }
+
+    /**
+     * Refuse to touch a database that has been locked against this node.
+     *
+     * THE ENGINE'S VERDICT CANNOT BE USED FOR THIS, and finding that out is the
+     * reason this function exists rather than a branch on `NODE_LOCKED`.
+     * `ensureRemoteIsCompatible` checks the settings mismatch FIRST and returns
+     * early (`LiveSyncDBFunctions.ts:105-120`), so a milestone that is both
+     * mismatched and locked reports only MISMATCHED. The lock check at `:122`
+     * is never reached. Verified against the vendored engine, not assumed.
+     *
+     * The Obsidian plugin does not notice because it stops on every non-OK
+     * verdict, so masking one stop with another changes nothing for it. This peer
+     * deliberately CONTINUES past a mismatch confined to keys it cannot control
+     * (see `applyMismatch`), which turns the same ordering into a hole: a
+     * `usePluginSyncV2` difference, which an ordinary plugin user has by default,
+     * would hide a chunk clean-up in progress and we would keep writing against
+     * chunks that are being deleted. That is the corruption scenario KICKOFF names
+     * as the top risk, so it is checked here, directly, on the document.
+     *
+     * Placed before the handshake WRITE as well as before the feed: registering
+     * ourselves in a database that has refused us is pointless noise in a document
+     * every other client reads.
+     */
+    private assertNotLockedOut(milestone: EntryMilestoneInfo, nodeId: string): void {
+        if (!milestone.locked) return;
+        if (Array.isArray(milestone.accepted_nodes) && milestone.accepted_nodes.includes(nodeId)) {
+            /*
+             * Locked, but this node IS accepted. The engine's own consumer
+             * (`LiveSyncReplicator.ts:867`) proceeds here, and so do we: the lock
+             * exists to keep UNACCEPTED nodes out, and diverging would mean
+             * refusing a database every Obsidian client on the cluster is happily
+             * replicating. Loud anyway, because an operator who did not knowingly
+             * lock this database wants to know.
+             */
+            this.log(
+                'the remote database is marked locked, but this server is listed as an accepted node, ' +
+                    'so replication continues. Someone rebuilt or cleaned this database.',
+                'notice',
+            );
+            return;
+        }
+
+        /*
+         * Locked and NOT accepted. Neither `cleaned` nor a plain lock heals by
+         * waiting, and both mean the same thing for our stored state: the remote
+         * has been rebuilt or had its chunks garbage collected, so our checkpoint
+         * points into a sequence space that no longer exists and the chunks our
+         * documents reference may already be gone.
+         *
+         * There is no unlock action on this side, deliberately. Unlocking asserts
+         * that this client has re-fetched the rebuilt database, and this peer has
+         * no rebuild flow that would make the assertion true. Recovery is an
+         * operator action from a plugin client followed by a restart here (a fatal
+         * reason is only cleared by `start()`), and the message says so rather
+         * than leaving it to be guessed.
+         */
+        const what = milestone.cleaned ? 'cleaned up (chunk garbage collection)' : 'rebuilt or locked';
+        throw new LiveSyncFatalError(
+            `The remote database has been ${what} since this server last synchronised, and this server ` +
+                'is not among the nodes accepted afterwards. Continuing would write into a database that ' +
+                'has been declared rebuilt, against chunks that may already be deleted, so the peer has ' +
+                'stopped. Unlock the database (or mark this device resolved) from a Self-hosted LiveSync ' +
+                'client, then restart the backend.',
+        );
+    }
+
+    /**
+     * Act on the engine's verdict.
+     *
+     * The three lock verdicts are handled here only as a backstop: `assertNotLockedOut`
+     * has already made the same judgement directly on the document, and made it
+     * first, precisely because the engine's mismatch check can return before its
+     * lock check ever runs. Reaching one of them here means the document said
+     * something the direct check did not, so it is treated the same way rather
+     * than assumed unreachable.
+     *
+     * Stopping is a thrown `LiveSyncFatalError`, which `connectLoop` turns into a
+     * recorded reason instead of another retry, and which `requireReady` then uses
+     * to refuse every subsequent `put`/`delete`. That last part is the point: for
+     * these conditions, continuing to WRITE is the corruption scenario, not merely
+     * an unhealthy state.
+     */
+    private applyEnsureResult(result: ENSURE_DB_RESULT, existed: boolean, announced: RemoteDBSettings): void {
+        if (result === 'OK' || result === 'LOCKED') {
+            // LOCKED means locked-but-accepted, which `assertNotLockedOut` has
+            // already reported. Nothing further to say.
+            if (result === 'OK' && !existed) {
+                this.log(
+                    'remote database had no milestone document; seeded one and registered this server ' +
+                        'in it, so a client joining later reconciles against our format instead of ' +
+                        'silently seeding a different one.',
+                    'notice',
+                );
+            }
+            return;
+        }
+
+        if (result === 'NODE_LOCKED' || result === 'NODE_CLEANED') {
+            const what = result === 'NODE_CLEANED' ? 'cleaned up (chunk garbage collection)' : 'rebuilt';
+            throw new LiveSyncFatalError(
+                `The remote database has been ${what} since this server last synchronised, and this ` +
+                    'server is not among the nodes accepted afterwards. Continuing would write into a ' +
+                    'database that has been declared rebuilt, against chunks that may already be ' +
+                    'deleted, so the peer has stopped. Unlock the database (or mark this device ' +
+                    'resolved) from a Self-hosted LiveSync client, then restart the backend.',
+            );
+        }
+
+        if (result === 'INCOMPATIBLE') {
+            throw new LiveSyncFatalError(
+                'The remote database uses a chunk format outside the range this server can read ' +
+                    `(${CURRENT_VERSION_RANGE.min}-${CURRENT_VERSION_RANGE.max}). Retrying cannot help; ` +
+                    'the engine bundled with this server has to be updated.',
+            );
+        }
+
+        // Only ["MISMATCHED", preferred] is left, and the tuple form is what
+        // narrows it: the string cases are all handled above.
+        this.applyMismatch(result[1], announced);
+    }
+
+    /**
+     * A settings mismatch against the cluster's preferred values, after adoption
+     * has already had its turn.
+     *
+     * WHY THIS IS NOT SIMPLY FATAL. `ensureRemoteIsCompatible` compares the whole
+     * of upstream's `TweakValuesShouldMatchedTemplate`, which is scoped to the
+     * Obsidian plugin. Three of its keys are ones this server has no option for
+     * and therefore cannot make agree at any price, and one of those three
+     * (`usePluginSyncV2`) differs from an ordinary plugin user BY DEFAULT: the
+     * engine's default is `false` and its own recommended template says `true`.
+     * A blanket fatal would mean refusing to sync with a normal cluster over a
+     * flag that governs documents this peer never touches. See
+     * `BEHAVIOUR_FREE_TWEAK_KEYS` for the per-key evidence.
+     *
+     * So the verdict is split on which keys actually differ. Anything outside
+     * that audited set is format-relevant and IS fatal, which is what finally
+     * closes the two silent-divergence directions `mergeRemoteTweaks` could not
+     * see: a remote that says `encrypt: false` while we hold a passphrase, and a
+     * remote that says `usePathObfuscation: false` while we obfuscate. Both are
+     * one-way holes there (it only throws when the REMOTE has the feature on and
+     * we do not), and both produce two document sets that never intersect.
+     */
+    private applyMismatch(preferred: TweakValues, announced: RemoteDBSettings): void {
+        const differing = mismatchedKeys(preferred, announced);
+
+        /*
+         * The engine said the settings mismatch and we cannot name a single key
+         * that does. That is not a benign case, it is evidence that
+         * `mismatchedKeys` and `ensureRemoteIsCompatible` have stopped agreeing,
+         * and dismissing a verdict we cannot classify is exactly the silent
+         * failure this file exists to remove. Refuse instead, and say why in terms
+         * that point at this code rather than at the operator's settings.
+         */
+        if (differing.length === 0) {
+            throw new LiveSyncFatalError(
+                'The remote reports that this server\'s settings do not match the cluster\'s preferred ' +
+                    'settings, but this server cannot determine which setting differs. That is an ' +
+                    'internal inconsistency, not a configuration error, and it is treated as fatal ' +
+                    'because continuing would mean ignoring a mismatch nobody can see. Please report it.',
+            );
+        }
+
+        const harmful = differing.filter((k) => !BEHAVIOUR_FREE_TWEAK_KEYS.has(k));
+
+        if (harmful.length === 0) {
+            this.log(
+                `the cluster's preferred settings differ from this server's on ${differing.join(', ')}. ` +
+                    'These have no effect on the documents this server reads or writes, so replication ' +
+                    'continues; unify them from the Obsidian clients if you want the warning to stop.',
+                'notice',
+            );
+            return;
+        }
+
+        throw new LiveSyncFatalError(
+            `This server's settings disagree with the cluster's preferred settings on ${harmful.join(', ')}. ` +
+                'These decide how documents are encrypted, split and named, so continuing would write ' +
+                'documents the other clients cannot read (or under ids they will never look at, which ' +
+                'forks the vault silently). Make them agree; retrying cannot help.',
+        );
+    }
+
     // --- the changes feed ------------------------------------------------------
 
     private startWatch(): void {
@@ -600,9 +1305,45 @@ export class CouchDBPeer {
         // Re-read the checkpoint on every (re)arm so a reconnect resumes where the
         // last processed change left off rather than where this process started.
         man.since = this.state.getSince() || '0';
+        /*
+         * Hand the ledger the evidence that OUTLIVES this run, before the first
+         * document can arrive.
+         *
+         * Here rather than in `start()` because this is the point where the feed
+         * is armed, and it is the only point on every path that arms one
+         * (`start()` reaches it through the connect loop, the watchdog's re-arm
+         * reaches it directly). Getting this wrong is silent and expensive: a peer
+         * that failed to adopt its own history reads the first undecryptable
+         * document as proof of a wrong passphrase, stops itself, and blocks the
+         * push direction. See `InboundProgress.adoptPriorDecodeEvidence`.
+         */
+        if (this.state.hasDecodedWith(this.decodeEvidenceKey)) this.progress.adoptPriorDecodeEvidence();
         man.beginWatch(
             async (entry: ReadyEntry, seq?: string | number) => {
-                await this.onRemoteChange(entry);
+                const key = changeKey(undefined, entry?._id);
+                let applied: boolean;
+                try {
+                    applied = await this.onRemoteChange(entry);
+                } catch (e) {
+                    /*
+                     * COUNTED AND SAID OUT LOUD, then rethrown unchanged.
+                     *
+                     * The engine catches whatever this callback throws and logs
+                     * `WATCH: PROCESS FAILED` at its INFO level with the reason at
+                     * VERBOSE, so before this block a remote document that could
+                     * not be written to the vault vanished without a single line
+                     * an operator would ever see. Rethrowing preserves the
+                     * behaviour that actually protects the data (the checkpoint
+                     * advance below is skipped, so the change is not marked as
+                     * consumed), while the counter makes the loss visible: see
+                     * `InboundProgress.noteFailed` for why a failure settles the
+                     * ledger instead of pinning it, and `syncImpl` for where the
+                     * per-pass verdict is derived from it.
+                     */
+                    this.progress.noteFailed(key);
+                    this.log(`could not apply a remote change: ${describeError(e)}`, 'error');
+                    throw e;
+                }
                 /*
                  * FIX 4 (part 2): advance the checkpoint HERE, from the change's
                  * own sequence, and only after the change has been applied.
@@ -629,9 +1370,164 @@ export class CouchDBPeer {
                     man.since = value;
                     this.state.setSince(value);
                 }
+                /*
+                 * Last, and split on what the storage side actually did with it.
+                 *
+                 * `dispatch` returns false without throwing for a document this
+                 * server refuses to host: an excluded path (`.trash/`, any
+                 * dot-prefixed segment, `.git`, `.obsidian`), a path that fails
+                 * `resolveInVault`, one that resolves to the vault root, or an
+                 * echo of our own push. The boolean used to be discarded, so all
+                 * of those counted as `applied`, which overstated the counter,
+                 * disagreed with `rt.pulled` (which is incremented from the same
+                 * boolean in `dispatchToStorage`), and made the one number an
+                 * operator would use to check the ledger against the status API
+                 * quietly wrong.
+                 *
+                 * The CHECKPOINT still advances on a refusal, deliberately, and
+                 * `StoragePeer.put`'s own doc comment explains why: a refused path
+                 * replayed forever would pin the feed at that sequence. Only the
+                 * classification changes here, and `noteSkipped` is the correct
+                 * one because a refusal is a terminal outcome rather than a loss.
+                 */
+                if (applied) this.progress.noteApplied(key);
+                else this.progress.noteSkipped(key);
             },
-            (doc: MetaEntry) => this.isInterested(doc, baseDir),
+            (doc: MetaEntry) => {
+                /*
+                 * The interest predicate doubles as the DECODE receipt, and that
+                 * is the only place such a receipt can be taken.
+                 *
+                 * The engine calls this from inside its `change` listener, which
+                 * runs after `transform-pouch` has awaited `outgoing(doc)`. So
+                 * reaching this line is proof the document decrypted; NOT reaching
+                 * it, for a document the raw feed already counted as delivered, is
+                 * proof it did not. Nothing downstream can distinguish the two,
+                 * because a rejected `outgoing` never calls the engine's listener
+                 * at all (mechanism 1 in progress.ts).
+                 */
+                const key = changeKey(undefined, doc?._id);
+                this.progress.noteDecoded(key);
+                /*
+                 * The same proof, written down where it survives this process.
+                 *
+                 * This is the ONLY caller, and it is on the proof itself rather
+                 * than on anything that merely correlates with it, because the
+                 * record suppresses the fatal "nothing decrypts" verdict. Cheap
+                 * enough to do per document: the store compares a string and only
+                 * marks itself dirty when the value actually changes, so this is
+                 * one write per configuration rather than one per change.
+                 */
+                this.state.markDecodedWith(this.decodeEvidenceKey);
+                const interested = this.isInterested(doc, baseDir);
+                // A deliberate refusal is a terminal outcome, not a loss. Without
+                // this the ledger would treat every `i:` document on the remote as
+                // a document we failed to write, and report a healthy peer wedged.
+                if (!interested) this.progress.noteSkipped(key);
+                return interested;
+            },
         );
+        this.instrumentFeed();
+    }
+
+    /**
+     * Attach a counting listener to the RAW changes emitter.
+     *
+     * WHY `addListener` AND NOT `on`. Decryption is a `transform-pouch` transform,
+     * and that library's `changes()` wrapper replaces the emitter's `on` with
+     *
+     *     async (change) => origListener(await modifyChange(change))
+     *
+     * where `modifyChange` decrypts. Registering through `on` would therefore put
+     * this counter BEHIND the very decryption whose failure it exists to detect,
+     * and would additionally decrypt every document a second time. `addListener`
+     * is the untouched `EventEmitter.prototype` method (transform-pouch installs
+     * its wrapper as an own property named `on` and nothing else), so a listener
+     * registered through it sees the document exactly as CouchDB sent it.
+     *
+     * THAT IS A DEPENDENCY-VERSION ASSUMPTION, SO IT IS CHECKED RATHER THAN
+     * TRUSTED. If a future transform-pouch wraps `addListener` too, the wrapper
+     * would be an own property of the emitter and this counter would be swallowed
+     * in exactly the case it was written for: the subsystem would go back to
+     * reporting green while doing nothing. The `hasOwnProperty` check below turns
+     * that into a loud, permanent "unobservable" verdict instead.
+     */
+    private instrumentFeed(): void {
+        const changes = this.man?.changes;
+        if (!changes || this.instrumented === changes) return;
+        const emitter = changes as unknown as RawChangesEmitter;
+        if (
+            typeof emitter.addListener !== 'function' ||
+            Object.prototype.hasOwnProperty.call(changes, 'addListener')
+        ) {
+            this.progress.setObservable(false);
+            this.log(
+                'the changes feed cannot be instrumented, so a wedged inbound direction would be ' +
+                    'indistinguishable from an idle one; reporting unhealthy rather than guessing.',
+                'error',
+            );
+            return;
+        }
+        this.progress.setObservable(true);
+        this.instrumented = changes;
+        emitter.addListener('change', (change: RawFeedChange) => {
+            /*
+             * Runs inside PouchDB's emitter, so it must never throw: an exception
+             * here would propagate out of `emit()` and take the feed down, turning
+             * a health instrument into the outage it measures.
+             */
+            try {
+                if (!change) return;
+                /*
+                 * EVERY CHANGE ADVANCES THE CURSOR. ONLY NOTE-TYPED CHANGES OWE A
+                 * DECODE RECEIPT. Those are two questions, and an earlier revision
+                 * answered them with one `if`, which is the bug this shape exists
+                 * to prevent.
+                 *
+                 * The feed's server-side selector is `{ type: { $ne: "leaf" } }`
+                 * (upstream `beginWatch`), and `probeRemotePending()` asks CouchDB
+                 * with the identical selector from the cursor this call sets. So
+                 * the cursor has to move for everything that selector admits, not
+                 * just for the subset the engine goes on to decode. Real,
+                 * replicated, non-`_local` types that pass it and that upstream's
+                 * `isNoteEntry` then drops: `versioninfo` (id
+                 * `obsydian_livesync_version`, written to the REMOTE by upstream's
+                 * own version negotiation on every version bump), `syncinfo`,
+                 * `notes` (the legacy note type, i.e. every document in a vault
+                 * migrated from an older LiveSync) and `chunkpack`. Gate the
+                 * cursor on `isNoteEntryType` and any one of them sitting past it
+                 * makes the probe answer "pending" for the life of the process:
+                 * `snapshot().ok` goes false, `couchReachable()` stays true
+                 * because nothing is actually wrong, the peer is judged
+                 * restart-worthy every grace window, `/healthz/livesync` serves a
+                 * permanent 503, and the reset on reconnect only restarts the
+                 * loop. Nothing in that chain is recoverable without an operator,
+                 * over a database that is working perfectly.
+                 *
+                 * The decode receipt is the separate question, and it keeps the
+                 * narrower predicate for a reason of its own: only `newnote` and
+                 * `plain` reach `checkIsInterested`, so only those can ever
+                 * produce the receipt `InboundProgress.noteDecoded()` records.
+                 * Claiming a `versioninfo` owed one would open a gap no decode
+                 * could ever close and report a healthy peer as unable to decrypt.
+                 *
+                 * `change.doc` may legitimately be absent (a change row without an
+                 * included document); the sequence is still real and the feed
+                 * still delivered it, so the cursor still moves.
+                 *
+                 * The third argument is the document identity the ledger's stall
+                 * clocks correlate on: see `changeKey()`, and `PendingClock` in
+                 * progress.ts for what the clocks do with it.
+                 */
+                this.progress.noteFeedChange(
+                    change.seq,
+                    isNoteEntryType(change.doc?.type),
+                    changeKey(change.id, change.doc?._id),
+                );
+            } catch {
+                /* deliberately empty: see above */
+            }
+        });
     }
 
     /**
@@ -649,17 +1545,35 @@ export class CouchDBPeer {
         return path.startsWith(baseDir);
     }
 
-    /** Apply one remote change to the storage side. */
-    private async onRemoteChange(entry: ReadyEntry): Promise<void> {
+    /**
+     * Apply one remote change to the storage side.
+     *
+     * RETURNS WHETHER ANYTHING LANDED, and the caller records the answer rather
+     * than assuming it. Four of the paths below end without a write and without
+     * an exception: a path this server refuses to host, an echo of our own push
+     * in either direction, and `StoragePeer.put`/`delete` returning false for the
+     * same reasons on their side (an excluded path, one that fails
+     * `resolveInVault`, one that resolves to the vault root). A remote carrying
+     * `.trash/note.md` or any vault dotfile as an ordinary document takes one of
+     * them on every replication. Discarding the boolean made all of that count as
+     * `applied`, which is the one number in the ledger an operator would reach for
+     * to check it against `applied.pulled` in the status API, and the two came
+     * from the same boolean on one side and not on the other.
+     *
+     * Throwing still means something different from returning false, and the
+     * distinction is the checkpoint's: a throw leaves it where it is so the change
+     * is replayed, a refusal advances it so the same rejected document is not
+     * replayed forever. That is `StoragePeer.put`'s contract, unchanged.
+     */
+    private async onRemoteChange(entry: ReadyEntry): Promise<boolean> {
         const remotePath = String(entry.path ?? '');
         const vaultPath = this.toVaultPath(remotePath);
-        if (!vaultPath) return;
+        if (!vaultPath) return false;
 
         if (entry.deleted || entry._deleted) {
-            if (this.echo.isRepeating(vaultPath, false)) return;
+            if (this.echo.isRepeating(vaultPath, false)) return false;
             this.log(`${vaultPath} delete detected`, 'debug');
-            await this.deps.dispatch(vaultPath, false);
-            return;
+            return await this.deps.dispatch(vaultPath, false);
         }
 
         const data: FileData = {
@@ -669,9 +1583,9 @@ export class CouchDBPeer {
             deleted: entry.deleted || entry._deleted,
             data: decodeEntryData(entry),
         };
-        if (this.echo.isRepeating(vaultPath, data)) return;
+        if (this.echo.isRepeating(vaultPath, data)) return false;
         this.log(`${vaultPath} change detected`, 'debug');
-        await this.deps.dispatch(vaultPath, data);
+        return await this.deps.dispatch(vaultPath, data);
     }
 
     /**
@@ -694,6 +1608,13 @@ export class CouchDBPeer {
         if (this.watchdog) return;
         this.watchdog = setInterval(() => {
             if (this.stopping || !this.man) return;
+            // Before anything else, because both are about whether the inbound
+            // direction can be measured at all, and a re-armed feed (ours or the
+            // engine's own ten-second retry) is a brand new emitter that nothing
+            // is counting until this runs.
+            this.instrumentFeed();
+            this.escalateInboundFatal();
+            this.tickPendingProbe();
             if (this.man.watching) {
                 /*
                  * Recovery, and the second half of KICKOFF section 8's last
@@ -729,6 +1650,133 @@ export class CouchDBPeer {
             }
         }, WATCHDOG_INTERVAL_MS);
         this.watchdog.unref?.();
+    }
+
+    /**
+     * Turn a TOTAL decryption failure into a stop, not into another retry.
+     *
+     * This is the same judgement `mergeRemoteTweaks` already makes for the three
+     * settings it refuses to adopt, applied to the case that only shows up once
+     * documents start arriving. A passphrase does not become correct by being
+     * tried again in thirty seconds, and continuing has a second cost beyond the
+     * wasted retries: the PUSH direction would keep writing chunks encrypted with
+     * a key no other client shares, so the longer the peer runs the more of the
+     * remote database is unreadable to everyone including itself after a restart.
+     * Stopping leaves every local edit's baseline unadvanced, so nothing is lost
+     * and a corrected passphrase replays all of it.
+     *
+     * TOTAL IS THE LOAD-BEARING WORD, AND IT IS WHY THE PREDICATE LIVES IN THE
+     * LEDGER RATHER THAN HERE. `verdict.fatal` is true only when NOTHING has ever
+     * decoded, on this run OR any earlier one, for this passphrase against this
+     * database (`InboundProgress.verdict()` argues the split at length). Two
+     * revisions got that wrong in turn, and both took a human to clear:
+     *
+     *  - escalating on ANY undecodable document meant one bad document among five
+     *    hundred good ones stopped the peer, took the push direction with it via
+     *    `requireReady`, made `couchReachable()` report the backend down so
+     *    `restartWorthy` could never become true, and printed a message telling
+     *    the operator to change a passphrase five hundred documents had just
+     *    decrypted with;
+     *  - escalating on the RUN's counter fixed that for exactly as long as the
+     *    process lived. The demoted `degraded` verdict is restart-worthy, the
+     *    restarted pair replays from the checkpoint, and past a checkpoint of 499
+     *    the remote has exactly one document to hand back: the bad one. So the
+     *    fresh run measured `decoded === 0` and escalated the identical partial
+     *    failure to fatal, with the identical wrong message, about ninety seconds
+     *    later.
+     *
+     * The message may name the likely cause here, and only here, because "nothing
+     * has ever decrypted" is that cause's signature rather than a guess: nothing
+     * on the connect path decrypts anything (the reachability probe is a plain
+     * GET, and the milestone is a `_local/` document, which `transform-pouch`
+     * refuses to transform), so a wrong passphrase connects cleanly and then
+     * decrypts nothing at all. The partial case gets a message worded from the
+     * evidence instead, and does not come through this function.
+     */
+    private escalateInboundFatal(): void {
+        if (this.fatalReason) return;
+        const verdict = this.progress.verdict();
+        if (!verdict.fatal) return;
+        this.markFatal(
+            `${verdict.detail}. Nothing has ever decrypted with this passphrase against this database, ` +
+                'which is what a wrong end-to-end encryption passphrase looks like (or a remote written ' +
+                'with a different one). Retrying cannot help, and continuing would publish chunks no ' +
+                'other client can read, so the peer has stopped.',
+        );
+        // Fire and forget: stop() is bounded, never throws, and the watchdog must
+        // not become a place that awaits I/O.
+        void this.stop().catch(() => {});
+    }
+
+    /**
+     * Run the remote-pending probe on its own, slower cadence.
+     *
+     * Skipped entirely while disconnected or fatally misconfigured: neither state
+     * has anything to learn from the answer, and hammering a CouchDB that is
+     * already refusing us is how a health check becomes a denial of service
+     * against the operator's own database.
+     */
+    private tickPendingProbe(): void {
+        if (!this.connected || this.fatalReason || this.pendingProbeInFlight) return;
+        this.pendingProbeTicks += 1;
+        if (this.pendingProbeTicks * WATCHDOG_INTERVAL_MS < REMOTE_PENDING_INTERVAL_MS) return;
+        this.pendingProbeTicks = 0;
+        this.pendingProbeInFlight = true;
+        void this.probeRemotePending()
+            .then((pending) => {
+                // `undefined` is a body this code did not recognise, which is not
+                // an answer however cleanly it arrived. Routed to the same place a
+                // thrown probe goes, because the consequence is identical: we do
+                // not know whether the feed is missing changes.
+                if (pending === undefined) {
+                    this.noteProbeUnanswerable('CouchDB returned a _changes body with no results array');
+                    return;
+                }
+                this.progress.setRemotePending(pending);
+                this.pendingProbeComplainedAt = undefined;
+            })
+            .catch((e: unknown) => {
+                this.noteProbeUnanswerable(describeError(e));
+            })
+            .finally(() => {
+                this.pendingProbeInFlight = false;
+            });
+    }
+
+    /**
+     * Record that the pending-changes probe produced no answer.
+     *
+     * TWO SEPARATE OBLIGATIONS, AND ONLY ONE OF THEM MAY BE RATE-LIMITED.
+     *
+     * The health signal is unconditional: `noteProbeUnanswerable()` starts (or
+     * leaves running) the clock that turns into an `unobservable` verdict, and it
+     * keeps reporting for as long as the probe stays unanswerable. The previous
+     * shape cleared the clock instead, which made a broken probe resolve to `ok`;
+     * the probe is the ONLY detector for a feed that has gone silent while still
+     * reporting itself attached, so "I could not tell" reading as "fine" disables
+     * the instrument that covers the original bug, using the same proxy or network
+     * fault that would cause it.
+     *
+     * The LOG is rate-limited, because a failing probe fails every 20 seconds and
+     * an unthrottled notice would bury the rest of the server's log within a day.
+     * It is throttled by time and not by a one-shot flag: the flag version emitted
+     * exactly one line per process and then went silent, so an operator reading
+     * the log during an incident found nothing about a subsystem that had been
+     * blind since boot.
+     */
+    private noteProbeUnanswerable(reason: string): void {
+        this.progress.noteProbeUnanswerable();
+        const now = Date.now();
+        const due =
+            this.pendingProbeComplainedAt === undefined ||
+            now - this.pendingProbeComplainedAt >= PROBE_COMPLAINT_INTERVAL_MS;
+        if (!due) return;
+        this.pendingProbeComplainedAt = now;
+        this.log(
+            `pending-changes probe did not answer, so a silently dead changes feed cannot be ` +
+                `detected; reporting the inbound direction as unobservable: ${reason}`,
+            'notice',
+        );
     }
 
     // --- peer operations -------------------------------------------------------
@@ -847,19 +1895,32 @@ export class CouchDBPeer {
     // --- health ----------------------------------------------------------------
 
     /**
-     * Synchronous snapshot. `ok` means actually syncing: connected AND either
-     * watching or a known-empty remote.
+     * Synchronous snapshot.
+     *
+     * `ok` means actually syncing, and the second half of that sentence is the
+     * change this file exists to make. It used to mean "connected AND either
+     * watching or a known-empty remote", which is a statement about a socket and a
+     * boolean the engine sets once. Work flowing is now a required term: an
+     * attached feed that is delivering nothing while the remote holds changes, or
+     * delivering documents that never reach the vault, is NOT ok, however
+     * cheerfully `man.watching` reports itself.
      *
      * A brief dip while the feed reconnects makes `ok` false, which is correct:
      * the grace window in `HealthTracker` is what stops that from being read as a
-     * wedge.
+     * wedge, and `InboundProgress` applies the same rule to its own three clocks.
      */
     snapshot(): PeerHealth {
         const watching = this.man?.watching === true;
-        const syncing = this.connected && (watching || this.remoteEmpty);
+        const inbound = this.progress.verdict();
+        const attached = this.connected && (watching || this.remoteEmpty);
+        const syncing = attached && !inbound.stalled;
         let detail: string;
         if (this.fatalReason) detail = `configuration error: ${this.fatalReason}`;
         else if (!this.connected) detail = 'connecting';
+        // Ordered ahead of 'watching' deliberately: while the inbound direction is
+        // stalled, "watching" is true and is the single most misleading thing this
+        // peer could say about itself.
+        else if (attached && inbound.stalled) detail = inbound.detail;
         else if (watching) detail = 'watching';
         else if (this.remoteEmpty) detail = 'connected (empty remote)';
         else detail = 'reconnecting';
@@ -868,11 +1929,46 @@ export class CouchDBPeer {
             type: this.type,
             ok: syncing,
             detail,
-            // Only asserted here when we are demonstrably syncing; probeHealth()
-            // refines it with a real probe in every other case.
+            /*
+             * Asserted only when we are demonstrably syncing; probeHealth()
+             * refines it with a real probe in every other case.
+             *
+             * Note that a stall makes this false while CouchDB is reachable, which
+             * is exactly the combination `HealthTracker` needs in order to reach a
+             * `restartWorthy` verdict at all: it requires a non-ok snapshot AND a
+             * reachable backend. Before the inbound ledger existed, a wedged feed
+             * kept `ok` true, so the tracker returned early on every probe and the
+             * whole restart path in routes/livesync.ts was unreachable in precisely
+             * the failure mode it was built for.
+             */
             backendUp: syncing,
             restartWorthy: false,
+            /*
+             * The peer's veto on the restart the line above cannot see. Gated on
+             * `attached` so it can only ever suppress a restart that would have
+             * been prompted by the INBOUND verdict: while the peer is
+             * disconnected or the feed is detached, reconnecting is exactly the
+             * right response and nothing here may block it.
+             *
+             * `HealthTracker` reads this; `PeerHealth.restartFutile` argues the
+             * case, and `InboundVerdict.restartFutile` lists which states set it
+             * and why each of them survives a fresh peer pair unchanged.
+             */
+            restartFutile: attached && inbound.restartFutile,
         };
+    }
+
+    /**
+     * The inbound ledger's verdict and counts, for the status API and the sync
+     * pass.
+     *
+     * Exposed rather than folded into `PeerHealth` because the two answer
+     * different questions: `PeerHealth` is the supervisor's boolean, this is the
+     * evidence behind it, and `syncImpl` needs the evidence in order to say
+     * something true about a direction it does not itself drive.
+     */
+    inbound(): InboundVerdict {
+        return this.progress.verdict();
     }
 
     /** Health with the backend-aware restart verdict. */
@@ -1010,11 +2106,23 @@ export function mergeRemoteTweaks(
     conf: LiveSyncCouchDBConf,
     tweakValues: Record<string, RemoteTweaks>,
 ): { merged: LiveSyncCouchDBConf; changes: string[] } {
-    // The milestone stores tweaks per node id; the bridge takes the first entry,
-    // and so do we. They are expected to agree (a cluster with disagreeing
-    // chunking settings is already broken), and there is no better tiebreak
-    // available from here.
-    const tweaks = Object.values(tweakValues)[0];
+    /*
+     * `tweak_values` is keyed by node id, PLUS one reserved key: `PREFERRED`
+     * (`DEVICE_ID_PREFERRED`), which is the cluster's authoritative answer. The
+     * bridge ignores it and takes `Object.values(...)[0]`, i.e. whichever entry
+     * the JSON parser happened to put first.
+     *
+     * That is not a stylistic difference. `ensureRemoteIsCompatible` compares
+     * against `tweak_values[PREFERRED]` and nothing else, so adopting some other
+     * node's entry means adopting values the engine will then declare mismatched.
+     * With a single client the two coincide, which is why the bridge's version
+     * looks fine; the moment a third client joins with different settings, the
+     * bridge can adopt a stale node's tweaks and the disagreement is permanent.
+     *
+     * The first-entry fallback is kept for a milestone written by a client old
+     * enough not to set `PREFERRED` at all.
+     */
+    const tweaks = tweakValues[DEVICE_ID_PREFERRED] ?? Object.values(tweakValues)[0];
     if (!tweaks) return { merged: conf, changes: [] };
 
     if (tweaks.encrypt && !conf.passphrase) {
@@ -1085,4 +2193,38 @@ export function mergeRemoteTweaks(
     }
 
     return { merged, changes };
+}
+
+/**
+ * Which of the "should be matched" tweak keys actually differ between the
+ * cluster's preferred values and what this peer announced about itself.
+ *
+ * `ensureRemoteIsCompatible` computes the same comparison and returns a boolean
+ * verdict; this reproduces it and returns the KEYS, because the verdict alone
+ * cannot be acted on correctly (see `applyMismatch`).
+ *
+ * REPRODUCED USING THE ENGINE'S OWN TEMPLATES AND COMPARISON, not by hand. Both
+ * `extractObject` calls, the `TweakValuesDefault` underlay and the
+ * skip-if-undefined-on-either-side rule are lifted directly from
+ * `LiveSyncDBFunctions.ts:105-119` and `octagonal-wheels`' `isObjectDifferent`
+ * with `ignoreUndefined = true`. Doing it any other way would let this function
+ * and the engine disagree about what mismatched, which would show up as a peer
+ * that refuses to start while reporting that nothing is wrong.
+ *
+ * The `TweakValuesDefault` underlay is what stops an old milestone, written by a
+ * client that predates a key, from mismatching on that key: the key comes back
+ * `undefined` on the remote side and the rule below skips it.
+ */
+export function mismatchedKeys(preferred: TweakValues, announced: RemoteDBSettings): string[] {
+    const current = extractObject(TweakValuesTemplate, announced);
+    const remoteSide = extractObject(TweakValuesShouldMatchedTemplate, { ...TweakValuesDefault, ...preferred });
+    const localSide = extractObject(TweakValuesShouldMatchedTemplate, { ...TweakValuesDefault, ...current });
+    return Object.keys(remoteSide)
+        .filter(
+            (key) =>
+                remoteSide[key] !== undefined &&
+                localSide[key] !== undefined &&
+                isObjectDifferent(remoteSide[key], localSide[key]),
+        )
+        .sort();
 }

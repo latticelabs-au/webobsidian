@@ -50,6 +50,7 @@ import { CouchDBPeer, LiveSyncNotReadyError } from './livesync/peer-couchdb.js';
 import { StoragePeer } from './livesync/peer-storage.js';
 import { LiveSyncStateStore } from './livesync/state.js';
 import { combineHealth, type PeerHealth } from './livesync/health.js';
+import type { InboundVerdict } from './livesync/progress.js';
 import {
   createPeerLogger,
   describeError,
@@ -134,6 +135,30 @@ export interface LiveSyncStatus {
   trackedFiles: number;
   /** Cumulative counts for this process, both directions. */
   applied: { pushed: number; pulled: number };
+  /**
+   * What the inbound (CouchDB to vault) direction is actually doing.
+   *
+   * `healthy` above is a boolean; this is the evidence behind it, and it exists
+   * because the two most important states a sync backend can be in used to be
+   * indistinguishable from the outside. An idle peer and a wedged one both
+   * reported `healthy: true`, `connected: true` and an unchanging `applied`,
+   * because nothing in the health path observed whether any work was flowing.
+   * `state` distinguishes them by name; the counters let a reader check the
+   * verdict rather than take it on trust. Null when no pair is running.
+   */
+  inbound: InboundVerdict | null;
+  /**
+   * Unhandled promise rejections observed while this backend was running.
+   *
+   * Reported rather than merely logged because it is the ONLY externally visible
+   * trace of the vendored engine's worst failure mode: `transform-pouch` registers
+   * an async `change` listener whose promise it discards, so a document that fails
+   * to decrypt takes the rejection out of the process entirely, and the engine's
+   * real handler is never called. A rising count here alongside a rising
+   * `inbound.undecodable` is that exact fault, spelled out twice.
+   */
+  unhandledRejections: number;
+  lastUnhandledRejectionAt: string | null;
   lastSyncAt: string | null;
   /** Last failure, redacted. Cleared by a successful pass. */
   lastError: string | null;
@@ -248,6 +273,18 @@ interface Runtime {
 let runtime: Runtime | null = null;
 let lastSyncAt: number | null = null;
 let lastError: string | null = null;
+
+/**
+ * Process-lifetime evidence, not runtime state.
+ *
+ * Deliberately NOT reset when a peer pair is replaced. A rejection or an engine
+ * notice is a thing that happened to this process, and zeroing the counters on
+ * every reconnect would let an automatic restart erase its own evidence: the beat
+ * restarts a wedged pair, the counters go back to zero, and the next reader sees
+ * a clean subsystem that has in fact been failing all morning.
+ */
+let unhandledRejections = 0;
+let lastUnhandledRejectionAt: number | null = null;
 
 const log: LiveSyncLogger = createPeerLogger('backend');
 
@@ -705,6 +742,11 @@ async function connectImpl(): Promise<void> {
  * CouchDB peer: it applies remote changes as they arrive and advances its
  * persisted checkpoint per change. There is nothing for a tick to trigger, and a
  * tick that pretended to pull would be reporting on work it did not do.
+ *
+ * NOT DRIVING A DIRECTION IS NOT A LICENCE TO STAY QUIET ABOUT IT. The pass
+ * therefore reads the CouchDB peer's inbound ledger and reports it, and `ok` is
+ * derived from it rather than from connectivity alone. See the block above the
+ * `ok` assignment for what that changed and why it had to.
  */
 async function syncImpl(opts: LiveSyncPassOptions): Promise<{ ok: boolean; log: string[] }> {
   const lines: string[] = [];
@@ -722,7 +764,7 @@ async function syncImpl(opts: LiveSyncPassOptions): Promise<{ ok: boolean; log: 
     return { ok: false, log: [`Could not start: ${detail}`] };
   }
 
-  const before = { pushed: rt.pushed, pulled: rt.pulled };
+  const before = { pushed: rt.pushed, pulled: rt.pulled, failed: rt.couch.inbound().failed };
   await raceTimeout(rt.couchStarted, CONNECT_WAIT_MS);
 
   const fatal = rt.couch.getFatalReason();
@@ -784,13 +826,56 @@ async function syncImpl(opts: LiveSyncPassOptions): Promise<{ ok: boolean; log: 
   // changes are actually applied, not estimated from a file walk.
   if (pushed || pulled) lines.push(`Applied ${pushed} local and ${pulled} remote change(s) during this pass`);
 
+  /*
+   * THE PULL DIRECTION, REPORTED RATHER THAN OMITTED.
+   *
+   * This function still does not DRIVE the inbound direction, for the structural
+   * reason the header gives, and nothing here pretends otherwise. What changed is
+   * that it no longer stays silent about it either. `ok` used to be
+   * `connected && health.ok`, which is a claim about a socket and a lifecycle
+   * flag: a peer whose feed was attached and delivering nothing satisfied both,
+   * so every tick logged "sync ok", set `lastSyncAt` and CLEARED `lastError`,
+   * actively erasing the last recorded failure while the vault fell further
+   * behind. An operator reading "ok" reasonably concludes it worked.
+   *
+   * So the pass now reports what the inbound ledger actually observed, and `ok`
+   * is derived from it. `inbound.stalled` is the standing condition (nothing is
+   * landing) and `failed` is the per-pass one (something arrived and could not be
+   * written). The second is a delta on purpose: a document that can never be
+   * written would otherwise pin `ok` false forever, and a permanently-false
+   * verdict is as uninformative as a permanently-true one.
+   */
+  const inbound = rt.couch.inbound();
+  const failed = inbound.failed - before.failed;
+  /*
+   * `received` and `delivered` are both reported, and the gap between them is
+   * information rather than noise. `received` counts everything the changes feed
+   * emitted and is what moves the feed cursor; `delivered` counts the note-typed
+   * subset that the engine goes on to decrypt. A remote whose `received` climbs
+   * while `delivered` does not is replicating version, syncinfo or chunk-pack
+   * traffic and no notes, which is a perfectly healthy state that used to be
+   * indistinguishable from a dead feed.
+   */
+  lines.push(
+    `Inbound: ${inbound.state} (${inbound.detail}); ` +
+      `${inbound.received} change(s) received, ${inbound.delivered} of them notes, ` +
+      `${inbound.applied} applied, ${inbound.skipped} ignored, ${inbound.failed} failed since start`,
+  );
+  if (failed > 0) {
+    lines.push(`${failed} remote change(s) could not be written to the vault during this pass`);
+  }
+
   const health = combineHealth(await probePeers(rt));
   if (!health.ok) {
     const detail = health.peers.map((p) => `${p.name}: ${p.detail ?? (p.ok ? 'ok' : 'not ok')}`).join('; ');
     lines.push(`Not fully healthy (${detail})`);
   }
 
-  const ok = connected && health.ok;
+  // `health.ok` already folds in the stall (the CouchDB peer's snapshot consults
+  // the same ledger), so `!inbound.stalled` is redundant today. It is spelled out
+  // anyway: this is the assertion that must not be quietly lost if a future edit
+  // changes what a peer snapshot means, and the cost of stating it is nothing.
+  const ok = connected && health.ok && !inbound.stalled && failed === 0;
   if (ok) {
     lastError = null;
     lastSyncAt = Date.now();
@@ -827,6 +912,10 @@ async function statusImpl(): Promise<LiveSyncStatus> {
     peers: health.peers,
     trackedFiles: rt?.state.trackedCount() ?? 0,
     applied: { pushed: rt?.pushed ?? 0, pulled: rt?.pulled ?? 0 },
+    inbound: rt && !rt.stopped ? rt.couch.inbound() : null,
+    unhandledRejections,
+    lastUnhandledRejectionAt:
+      lastUnhandledRejectionAt === null ? null : new Date(lastUnhandledRejectionAt).toISOString(),
     lastSyncAt: lastSyncAt === null ? null : new Date(lastSyncAt).toISOString(),
     lastError,
     configErrors,
@@ -940,6 +1029,41 @@ function installProcessHooks(): void {
    */
   process.on('unhandledRejection', (reason: unknown) => {
     if (!isRunning()) return; // not ours to explain
+    /*
+     * COUNTED, NOT JUST PRINTED, and that is the change.
+     *
+     * A log line is invisible to every consumer of this subsystem's health: the
+     * status API, the beat, `/healthz/livesync` and the settings panel all read
+     * structured fields, and none of them reads stdout. That mattered because
+     * this handler is where the engine's most damaging failure surfaces. A
+     * document whose decryption throws inside `transform-pouch`'s discarded
+     * listener promise arrives HERE and nowhere else: the feed stays attached,
+     * `watching` stays true, no `error` event fires, and before the inbound
+     * ledger existed the entire observable consequence of losing that document
+     * was this one line.
+     *
+     * The count is now published through `statusImpl`, so "the process is
+     * catching rejections it cannot explain" is a fact an operator can see next
+     * to `inbound.undecodable`, which is the same event measured from the other
+     * side.
+     *
+     * KNOWN GAP, AND IT IS NOT FIXABLE FROM HERE. The engine's OTHER swallowing
+     * path never reaches this handler at all: `EntryManager.getDBEntryFromMeta`
+     * catches its failures, writes "Missing document content!" or "Something went
+     * wrong on reading ..." through octagonal-wheels' `Logger` at NOTICE, and
+     * returns false. Capturing those needs `setGlobalLogFunction`, which the
+     * vendored package does not re-export (`server/vendor/livesync-engine/src/entry.ts`
+     * exports only `Logger` and `defaultLoggerEnv`). Note also that the vendored
+     * `index.d.ts` declares `defaultLoggerEnv.logger`, which does NOT exist at
+     * runtime: octagonal-wheels' `defaultLoggerEnv` carries `minLogLevel` and
+     * nothing else, so assigning that property compiles, does nothing, and would
+     * look exactly like a working sink. Both are vendor-tree fixes. Until then
+     * those lines go to bare stdout uncounted, which is why the inbound ledger
+     * measures the CONSEQUENCE (a document that never settles) rather than
+     * relying on the engine to report the cause.
+     */
+    unhandledRejections += 1;
+    lastUnhandledRejectionAt = Date.now();
     log(`unhandled rejection while syncing (kept alive): ${describeError(reason)}`, 'error');
   });
 

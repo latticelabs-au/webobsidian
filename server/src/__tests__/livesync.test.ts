@@ -382,9 +382,9 @@ describe('HealthTracker', () => {
         vi.useRealTimers();
     });
 
-    /** A snapshot source whose `ok` the test drives directly. */
+    /** A snapshot source whose `ok` and restart veto the test drives directly. */
     function makeSubject(opts: { backendUp?: boolean } = {}) {
-        const state = { ok: false };
+        const state = { ok: false, restartFutile: false };
         const backendUp = { value: opts.backendUp ?? true };
         const probeBackend = vi.fn(() => Promise.resolve(backendUp.value));
         const snapshot = (): PeerHealth => ({
@@ -394,6 +394,7 @@ describe('HealthTracker', () => {
             detail: state.ok ? 'watching' : 'reconnecting',
             backendUp: state.ok,
             restartWorthy: false,
+            restartFutile: state.restartFutile,
         });
         const tracker = new HealthTracker(snapshot, probeBackend);
         return { state, backendUp, probeBackend, tracker };
@@ -456,6 +457,47 @@ describe('HealthTracker', () => {
         expect(verdict.restartWorthy).toBe(true);
         expect(verdict.backendUp).toBe(true);
         expect(verdict.ok).toBe(false);
+    });
+
+    it('F3: a peer that vetoes the restart never becomes restart-worthy, however long it fails', async () => {
+        /*
+         * REGRESSION GUARD FOR F3, at the tracker.
+         *
+         * The three conditions this class already applies (healthy once,
+         * unhealthy since, backend reachable) are all about timing and
+         * reachability, and none of them can see WHY the peer is unhealthy. For
+         * some reasons a restart is a flat no however patient the caller is: a
+         * remote document that will not decrypt, a probe a proxy refuses, a full
+         * vault volume. `routes/livesync.ts` responds to `restartWorthy` by
+         * tearing the peer pair down and rebuilding it, which also runs a full
+         * offline vault scan, so acting on those is that cost repeated every
+         * cooldown for as long as the fault lasts.
+         *
+         * Revert the `restartFutile` gate in `HealthTracker.probe()` and the
+         * second block below fails: the verdict comes back restart-worthy.
+         */
+        const { state, tracker } = makeSubject({ backendUp: true });
+        state.ok = true;
+        await tracker.probe(); // earns "was healthy once"
+
+        state.ok = false;
+        state.restartFutile = true;
+        await tracker.probe(); // stamps the clock
+        vi.advanceTimersByTime(RESTART_GRACE_MS * 10);
+
+        const vetoed = await tracker.probe();
+        expect(vetoed.ok).toBe(false);
+        expect(vetoed.restartWorthy).toBe(false);
+        // Still honest about the backend. Suppressing the restart by claiming
+        // CouchDB is down would be a lie in the one field an operator reads to
+        // decide whether their server is at fault, and it is a lie the
+        // fatal-config path takes on knowingly for a much narrower reason.
+        expect(vetoed.backendUp).toBe(true);
+
+        // Lifting the veto, with nothing else changed, restores the verdict. That
+        // is what proves the veto and not some side effect is doing the work.
+        state.restartFutile = false;
+        expect((await tracker.probe()).restartWorthy).toBe(true);
     });
 
     it('measures the window from the first non-ok PROBE, not from the last check', async () => {

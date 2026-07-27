@@ -21,6 +21,17 @@
  *    to notice that the remote database was rebuilt from scratch and that the
  *    checkpoint therefore means nothing any more.
  *
+ * Plus two the bridge has no equivalent for, both of which exist because they are
+ * facts that must OUTLIVE A RUN:
+ *
+ *  - `nodeId`: see `getNodeId()`. The bridge never registers itself in the
+ *    cluster's milestone document at all, so it never needed a stable identity;
+ *    this port does register, and an identity that changed per boot would grow
+ *    the shared document without bound.
+ *  - `decodedWith`: see `hasDecodedWith()`. The one piece of evidence behind the
+ *    decision to STOP the peer as fatally misconfigured, which therefore cannot
+ *    be a per-run counter.
+ *
  * Storage shape: ONE JSON file under `data/`, per CONTRIBUTING's "do not add a
  * DB engine" rule and matching `data/shares.json`, `data/uistate.json` and
  * friends. But `file-stat-*` is high-cardinality (one entry per vault file) and
@@ -51,6 +62,27 @@ interface PersistedState {
     version: number;
     /** See `namespaceFor`. A mismatch discards everything below it. */
     namespace: string;
+    /**
+     * This server's identity in the CouchDB cluster. See `getNodeId()`.
+     *
+     * Optional in the persisted shape rather than required, so that a state file
+     * written before this field existed still loads (and simply mints one) rather
+     * than reading as corrupt and throwing away a perfectly good checkpoint.
+     * That is also why STATE_VERSION was NOT bumped for it: a bump discards
+     * everything, and the whole point of this field is continuity.
+     */
+    nodeId?: string;
+    /**
+     * The key material fingerprint that last decrypted a remote document. See
+     * `hasDecodedWith()`.
+     *
+     * Optional for the same reason `nodeId` is, and NOT covered by a version
+     * bump for the same reason: a state file written before this field existed
+     * must keep its checkpoint rather than read as corrupt. Its absence is
+     * simply "no decode has been recorded", which is the safe reading (it makes
+     * a total decryption failure fatal, i.e. it errs towards stopping).
+     */
+    decodedWith?: string;
     since: string;
     remoteCreated: string;
     fileStats: Record<string, string>;
@@ -88,6 +120,8 @@ export class LiveSyncStateStore {
 
     private since = '';
     private remoteCreated = '';
+    private nodeId = '';
+    private decodedWith = '';
     private fileStats = new Map<string, string>();
 
     private loaded = false;
@@ -135,6 +169,21 @@ export class LiveSyncStateStore {
      * beginning. That is the safe direction (it re-pushes and re-pulls work that
      * is already in place) whereas the alternative, resuming from "now", loses
      * everything that happened in the gap.
+     *
+     * `nodeId` AND `decodedWith` SURVIVE ALL THREE RESETS, and that is
+     * deliberate in both cases:
+     *
+     *  - `nodeId` is a cluster identity, not a description of this vault's
+     *    contents, so nothing a reset is protecting against is helped by minting
+     *    a new one, and minting one leaves an entry in a shared remote document
+     *    that nothing will ever clean up. See `getNodeId()`.
+     *  - `decodedWith` is a fact about key material and a remote database, and
+     *    it already carries its own identity in the fingerprint, so a reset of
+     *    the vault-scoped state says nothing about it either way. Discarding it
+     *    here would re-open exactly the bug it exists to close: a peer that has
+     *    decrypted for months would, after a state reset, treat the next
+     *    undecryptable document as proof of a wrong passphrase and stop.
+     *    See `hasDecodedWith()`.
      */
     async load(): Promise<StateLoadResult> {
         let raw: string;
@@ -153,6 +202,19 @@ export class LiveSyncStateStore {
             // Deliberately not deleting the file: the next flush overwrites it,
             // and leaving it lets an operator look at what went wrong.
             return { reset: true, reason: 'state file is not valid JSON' };
+        }
+
+        // Salvaged BEFORE the version and namespace gates, for the reason in the
+        // doc comment. Type-checked rather than trusted, because everything else
+        // read out of this file is, and an object here would end up as the key of
+        // a map in a document shared with every other client.
+        if (typeof parsed?.nodeId === 'string' && parsed.nodeId !== '') this.nodeId = parsed.nodeId;
+        // Same treatment, and type-checked for a sharper reason: this value
+        // suppresses the fatal "nothing decrypts" verdict when it MATCHES the
+        // running configuration's fingerprint, so anything that is not a string
+        // must read as "no evidence" rather than as evidence.
+        if (typeof parsed?.decodedWith === 'string' && parsed.decodedWith !== '') {
+            this.decodedWith = parsed.decodedWith;
         }
 
         if (parsed?.version !== STATE_VERSION) {
@@ -219,6 +281,120 @@ export class LiveSyncStateStore {
     setSince(value: string): void {
         if (this.since === value) return;
         this.since = value;
+        this.markDirty();
+    }
+
+    // --- node id ---------------------------------------------------------------
+
+    /**
+     * This server's identity in the CouchDB cluster, minted once and then stable
+     * for the life of the installation.
+     *
+     * WHY IT HAS TO BE STABLE. The identity is a key in two maps inside the
+     * shared milestone document (`accepted_nodes`, `node_chunk_info`, and a third
+     * in `tweak_values`). Nothing in the protocol ever removes a key from those
+     * maps: `ensureRemoteIsCompatible` only ever merges into them. So an identity
+     * that changed per boot would append an entry to a document every client on
+     * the cluster reads, on every restart, forever, and it would do it silently.
+     * Worse, `ensureRemoteIsCompatible` decides whether to WRITE partly on
+     * "is this node absent from the document", so a fresh id would also force a
+     * pointless write, and therefore a revision, on every single start.
+     *
+     * 16 bytes of `randomBytes`, hex. Not a hostname, not a vault path, not a
+     * hash of the CouchDB URL: this string is published to every client on the
+     * cluster in a document nobody encrypts, so it must carry no information
+     * about the host or the operator. Random is the only shape that guarantees
+     * that, and 128 bits makes an accidental collision with another client's id
+     * (which would silently merge two nodes' chunk ranges) not worth reasoning
+     * about.
+     *
+     * Generated lazily rather than in the constructor so that `load()` gets the
+     * chance to supply the persisted one first; the caller is expected to have
+     * awaited `load()` before any peer runs, which every code path here does.
+     */
+    getNodeId(): string {
+        if (this.nodeId === '') {
+            this.nodeId = randomBytes(16).toString('hex');
+            this.markDirty();
+        }
+        return this.nodeId;
+    }
+
+    // --- decode evidence -------------------------------------------------------
+
+    /**
+     * A one-way fingerprint of "this key material, against this database".
+     *
+     * WHAT IT IS FOR. `InboundProgress` stops the peer outright when documents
+     * arrive and NOTHING has ever decrypted, because that is the signature of a
+     * wrong end-to-end passphrase and continuing would publish chunks no other
+     * client can read. "Ever" has to mean more than "since this process started",
+     * or one restart turns a single undecryptable document into a fatal verdict
+     * against a passphrase that works (the sequence is written out in
+     * `InboundProgress.adoptPriorDecodeEvidence`). So the fact is persisted.
+     *
+     * WHY IT IS A FINGERPRINT AND NOT A BOOLEAN. A bare "we decrypted something
+     * once" would survive the operator CHANGING the passphrase to a wrong one,
+     * which is the one case the fatal verdict must still catch: the peer would
+     * report `degraded` forever while the push direction kept writing documents
+     * encrypted with a key nobody else has. Binding the evidence to the key
+     * material means a changed passphrase (or a changed remote) reads as no
+     * evidence at all, and the verdict is fatal again exactly when it should be.
+     *
+     * WHAT IS ACTUALLY STORED. A SHA-256 digest, so nothing is recoverable from
+     * it. That is worth stating precisely because this file's own header says it
+     * holds no credentials: a digest is a verifier, not a credential, and the
+     * passphrase itself already sits in plaintext in `data/settings.json` beside
+     * this file at the same 0600. So this adds no exposure that the settings file
+     * does not already carry, and it deliberately does not become a second place
+     * a secret can leak from.
+     *
+     * The database identity is included as well as the passphrase because
+     * "decryption works" is a claim about a pair. Pointing the same passphrase at
+     * a different CouchDB is a different claim, and one nothing has verified yet.
+     */
+    static decodeEvidenceKey(input: {
+        url: string;
+        database: string;
+        passphrase: string | undefined;
+        obfuscatePassphrase: string | undefined;
+    }): string {
+        const h = createHash('sha256');
+        // A domain separator, then NUL between fields: without it, moving a
+        // character from the end of one field to the start of the next would
+        // produce the same digest, and two different configurations would share
+        // one piece of evidence.
+        h.update('webobsidian-livesync-decode-evidence-v1');
+        for (const part of [input.url, input.database, input.passphrase ?? '', input.obfuscatePassphrase ?? '']) {
+            h.update(' ');
+            h.update(part, 'utf8');
+        }
+        return h.digest('hex');
+    }
+
+    /**
+     * Has a remote document ever decrypted under exactly this fingerprint?
+     *
+     * Exact match, and never a "was anything ever recorded" test: a stored
+     * fingerprint from a previous configuration is evidence about that
+     * configuration and none at all about this one.
+     */
+    hasDecodedWith(fingerprint: string): boolean {
+        return fingerprint !== '' && this.decodedWith === fingerprint;
+    }
+
+    /**
+     * Record that one has.
+     *
+     * Called from the CouchDB peer's interest predicate, i.e. on the proof that a
+     * document survived decryption, and from nowhere else. Overwrites rather than
+     * accumulating: only the configuration currently in use can produce new
+     * evidence, and keeping a list would mean an old passphrase's record could
+     * still suppress the fatal verdict after the operator changed it.
+     */
+    markDecodedWith(fingerprint: string): void {
+        if (fingerprint === '' || this.decodedWith === fingerprint) return;
+        this.decodedWith = fingerprint;
         this.markDirty();
     }
 
@@ -315,6 +491,10 @@ export class LiveSyncStateStore {
         const snapshot: PersistedState = {
             version: STATE_VERSION,
             namespace: this.namespace,
+            // Written even when empty-string, so that a reader can tell "no id
+            // has ever been minted" from "the field predates this version".
+            nodeId: this.nodeId,
+            decodedWith: this.decodedWith,
             since: this.since,
             remoteCreated: this.remoteCreated,
             fileStats: Object.fromEntries(this.fileStats),

@@ -1,7 +1,7 @@
 {
   "commit": "8ed9bcda25e5a6b6386c662e98050214b4b7b1cb",
-  "bytes": 159527,
-  "moduleCount": 38,
+  "bytes": 162854,
+  "moduleCount": 39,
   "modules": [
     "src/entry.ts",
     "upstream/src/API/DirectFileManipulatorV2.ts",
@@ -30,6 +30,7 @@
     "upstream/src/managers/NetworkManager.ts",
     "upstream/src/memory/LRUCache.ts",
     "upstream/src/mods.ts",
+    "upstream/src/pouchdb/LiveSyncDBFunctions.ts",
     "upstream/src/pouchdb/LiveSyncLocalDB.ts",
     "upstream/src/pouchdb/compress.ts",
     "upstream/src/pouchdb/encryption.ts",

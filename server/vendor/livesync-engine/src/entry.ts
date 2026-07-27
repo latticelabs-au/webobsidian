@@ -73,3 +73,47 @@ export type {
     PlainEntry,
     RemoteDBSettings,
 } from "../upstream/src/common/types.ts";
+
+// --- The remote-compatibility handshake --------------------------------------
+//
+// The milestone document (`_local/obsydian_livesync_milestone`) is how every
+// LiveSync client announces its chunk-format range and its tweak values to the
+// rest of the cluster, and how the cluster announces back that it has been
+// locked or cleaned. `DirectFileManipulator` never touches it: grep the whole of
+// `DirectFileManipulatorV2.ts` for "milestone" or "ensure" and there are no hits,
+// because the direct-manipulation API was written for a client joining a database
+// some Obsidian plugin had already initialised.
+//
+// A WebObsidian server is explicitly allowed to be the FIRST client against an
+// empty database, which is the case that API never had to handle, so the
+// handshake has to be driven from our side. It is exported here rather than
+// reimplemented because a hand-rolled milestone that disagreed with the engine's
+// own format would be a worse bug than the one it fixed: the document's shape is
+// a wire contract with every Obsidian client on the cluster.
+//
+// NOTE that `currentVersionRange` (the `{min, max, current}` this call needs) is
+// a module-local const in `upstream/src/replication/couchdb/LiveSyncReplicator.ts`
+// and is NOT exported, so it cannot be re-exported here. Its value is copied into
+// `server/src/services/livesync/peer-couchdb.ts` with a comment marking it as a
+// wire constant, and a test asserts the copy still matches the upstream source.
+export { ensureRemoteIsCompatible } from "../upstream/src/pouchdb/LiveSyncDBFunctions.ts";
+export type { ENSURE_DB_RESULT } from "../upstream/src/pouchdb/LiveSyncDBFunctions.ts";
+export { DEVICE_ID_PREFERRED, MILESTONE_DOCID } from "../upstream/src/common/types.ts";
+export type { ChunkVersionRange, EntryMilestoneInfo, TweakValues } from "../upstream/src/common/types.ts";
+
+// The three templates and the two object helpers that `ensureRemoteIsCompatible`
+// itself uses to reach its MISMATCHED verdict.
+//
+// Exported so the caller can ask WHICH keys mismatched, which the verdict does
+// not say. That question has to be answered, because the template is scoped to
+// the Obsidian plugin and contains keys this server has no option for and cannot
+// make agree; treating those as fatal would refuse a cluster we can sync with.
+// Re-deriving the key set by hand would be the drift-prone way to do it: a key
+// added to the template upstream would silently stop being checked. Using the
+// engine's own templates and comparison means the answer moves with the engine.
+export {
+    TweakValuesDefault,
+    TweakValuesShouldMatchedTemplate,
+    TweakValuesTemplate,
+} from "../upstream/src/common/types.ts";
+export { extractObject, isObjectDifferent } from "../upstream/src/common/utils.ts";

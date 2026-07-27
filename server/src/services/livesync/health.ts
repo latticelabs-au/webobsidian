@@ -38,6 +38,11 @@
  *
  * A single `ok` probe resets the clock completely, so recovery is immediate
  * rather than requiring the peer to out-wait its own bad history.
+ *
+ * One thing here is NOT the bridge's: `restartFutile`, a veto the peer itself
+ * supplies. The three conditions above are all about timing and reachability and
+ * none of them can see what is actually wrong, so a peer that knows a restart
+ * cannot help says so. See `PeerHealth.restartFutile`.
  */
 import type { LiveSyncPeerType } from './types.js';
 
@@ -71,6 +76,30 @@ export interface PeerHealth {
      * `HealthTracker.probe()`.
      */
     restartWorthy: boolean;
+    /**
+     * This peer knows its condition cannot be fixed by restarting it.
+     *
+     * A VETO SUPPLIED BY THE PEER, and the fourth false alarm the three
+     * conditions above do not remove. `restartWorthy` asks "would restarting
+     * plausibly help?" and answers it from outside: healthy once, unhealthy
+     * since, backend reachable. Those three cannot see WHY the peer is
+     * unhealthy, and for some reasons the answer is a flat no however long the
+     * condition has lasted and however reachable the backend is: a document on
+     * the remote that will not decrypt, a vault volume that is full, an
+     * out-of-band probe a proxy refuses. The supervisor's response to
+     * `restartWorthy` is to tear the peer pair down and rebuild it, which
+     * replays the feed and runs a full offline vault scan, so acting on those is
+     * an expensive no-op repeated every cooldown for as long as the fault lasts.
+     *
+     * Distinct from `backendUp: false`, which is the lever the fatal-config case
+     * already uses. That one says CouchDB is unreachable, and saying it while
+     * CouchDB answers would be a lie in the one field an operator would use to
+     * decide whether their server is at fault. This says only what it means.
+     *
+     * Optional because it is a peer-supplied opinion: a peer with nothing to say
+     * (the storage peer) omits it, and the absence reads as "no veto".
+     */
+    restartFutile?: boolean;
 }
 
 /** Cheap synchronous snapshot, supplied by the peer. */
@@ -135,8 +164,18 @@ export class HealthTracker {
         // Stamp on the FIRST non-ok probe only, so the window measures how long
         // the peer has been broken rather than how long since the last check.
         if (this.notOkSince === undefined) this.notOkSince = Date.now();
+        /*
+         * The backend is still probed even when the peer has vetoed a restart,
+         * and that is deliberate rather than an oversight. `backendUp` is
+         * published to the status API and the settings panel, where it answers
+         * "is my CouchDB up?" for an operator staring at an unhealthy peer. A
+         * peer whose vault volume is full has a perfectly healthy CouchDB, and
+         * reporting otherwise to save one request would be the same lie the
+         * fatal-config path takes on knowingly and for a narrower reason.
+         */
         const backendUp = await this.checkBackendUp();
-        const restartWorthy = backendUp && Date.now() - this.notOkSince > this.graceMs;
+        const restartWorthy =
+            base.restartFutile !== true && backendUp && Date.now() - this.notOkSince > this.graceMs;
         return { ...base, backendUp, restartWorthy };
     }
 
