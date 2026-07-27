@@ -27,6 +27,17 @@
  * FIX <n> at its site: 1 (stat.isFile is a method in Node), 2 (utimes must
  * precede the stat baseline), 6 (short writes truncate the file), 8 (content read
  * before the debounce), and 9 (offline deletions were never detected).
+ *
+ * FIX 9 is the one addition the bridge has no counterpart for, and adding it
+ * introduced a hazard of its own: a scan that infers deletions by DIFFERENCE has
+ * to be careful which two sets it is differencing, because this peer runs
+ * concurrently with an inbound replication stream that creates files the whole
+ * time the scan is walking. Two follow-on fixes close that, marked FIX 9a (the
+ * baseline snapshot is taken before the walk, not after) and FIX 9b (a deletion
+ * is dispatched only on positive, freshly re-checked evidence of absence). Both
+ * are argued at length at their sites, because getting this wrong deletes real
+ * notes on every other peer in the cluster and the symptom shows up somewhere
+ * else entirely.
  */
 import { promises as fs } from 'node:fs';
 import type { Dirent, Stats } from 'node:fs';
@@ -224,13 +235,6 @@ export class StoragePeer {
         const startedAt = Date.now();
         try {
             const root = await getVaultRoot();
-            const seen = new Set<string>();
-            const changed: string[] = [];
-
-            for await (const rel of walkVault(root)) {
-                seen.add(rel);
-                if (await this.isChanged(rel)) changed.push(rel);
-            }
 
             /*
              * FIX 9: deletions that happened while we were down.
@@ -245,8 +249,56 @@ export class StoragePeer {
              * The recorded baselines are the missing half of the picture: they
              * name every file we believed existed. Whatever is in that set and not
              * on disk was deleted while we were not looking.
+             *
+             * FIX 9a: THE SNAPSHOT IS TAKEN HERE, BEFORE THE WALK, AND THAT
+             * ORDERING IS THE ENTIRE CORRECTNESS OF THE DELETION CHECK BELOW.
+             *
+             * `seen` describes the tree DURING the walk; `trackedPaths()`
+             * describes our beliefs at the instant it is read. Reading the
+             * baselines AFTER the walk compares two snapshots taken at different
+             * times, and the difference between them is not "files that were
+             * deleted", it is "files that were deleted, PLUS every file that
+             * appeared while the walk was in progress". Nothing about this peer
+             * makes that second set empty. The opposite: this scan runs
+             * concurrently with the CouchDB peer's changes feed by construction
+             * (`ensureRunning` starts both peers without either awaiting the
+             * other, and `onConnected` re-runs the scan on every reconnect), so
+             * the inbound pull is writing files and recording their baselines the
+             * whole time the walk is running. Any file whose baseline lands after
+             * the walk has passed its directory is therefore in `tracked` and not
+             * in `seen`, and was reported as a deletion.
+             *
+             * That is not a cosmetic misreport. `processDelete` dispatches it, the
+             * CouchDB peer soft-deletes the document, and every other client in
+             * the cluster removes the note. Measured against a real vault: a full
+             * pull of 2731 documents into an empty vault dispatched deletes for
+             * the files written during the walk, and a handful of them came back
+             * down the feed after the storage side had already re-pushed and so
+             * overwritten the echo entry that was supposed to suppress them, at
+             * which point the local file was deleted too and nothing ever brought
+             * it back (the feed had moved past that document, and a vault with no
+             * file and no baseline is invisible to every later scan). The
+             * documents were still in CouchDB, undeleted, which is what made it
+             * look like the pull had never delivered them.
+             *
+             * Taking the snapshot first inverts the asymmetry: a file that appears
+             * during the walk is not in the snapshot, so it can never be a
+             * deletion candidate, and a file genuinely deleted before the scan
+             * began is in the snapshot and is still detected. The one case this
+             * ordering gives up is a file deleted DURING the walk, which is
+             * exactly the case the vault watcher already owns and which the next
+             * scan would catch anyway.
              */
             const tracked = this.state.trackedPaths().filter((p) => !isIgnoredVaultPath(p));
+
+            const seen = new Set<string>();
+            const changed: string[] = [];
+
+            for await (const rel of walkVault(root)) {
+                seen.add(rel);
+                if (await this.isChanged(rel)) changed.push(rel);
+            }
+
             let missing = tracked.filter((p) => !seen.has(p));
 
             /*
@@ -548,6 +600,31 @@ export class StoragePeer {
         }
     }
 
+    /**
+     * Is this path definitely absent from the vault right now?
+     *
+     * TRUE only on positive evidence of absence, which is ENOENT and nothing
+     * else. `resolveInVault` tolerates a path that does not exist (it climbs to
+     * the deepest existing ancestor to run its containment and segment rules), so
+     * a throw from it means the path is refused rather than missing, and a refused
+     * path is not evidence that a note was deleted. Every other stat error
+     * (EACCES, EIO, ELOOP, a network mount that has gone away) means we could not
+     * look, which is also not evidence.
+     *
+     * Deliberately narrower than `readFile`, which returns content and a
+     * baseline. The only question here is existence, and asking it this way costs
+     * one stat instead of a whole file read.
+     */
+    private async isGoneFromDisk(rel: string): Promise<boolean> {
+        try {
+            const abs = await resolveInVault(rel);
+            await fs.stat(abs);
+            return false;
+        } catch (e) {
+            return (e as NodeJS.ErrnoException)?.code === 'ENOENT';
+        }
+    }
+
     /** Record "this file is synced as of now", from a fresh stat. */
     private async recordBaseline(rel: string): Promise<void> {
         try {
@@ -610,6 +687,33 @@ export class StoragePeer {
     }
 
     private async processDelete(rel: string): Promise<void> {
+        /*
+         * FIX 9b: never dispatch a deletion on the strength of an old
+         * observation. Ask the filesystem, now.
+         *
+         * The snapshot ordering above removes the systematic source of false
+         * positives, but it cannot remove all of them, because there is still a
+         * gap between the walk finishing and this unit of work actually running:
+         * the scan processes the whole `changed` list first, and every one of
+         * those is a file read plus a network round trip, so the gap is seconds
+         * on a large vault and the inbound pull is writing files throughout it.
+         * The same applies on the watcher path, where `processPath` observed an
+         * ENOENT up to a debounce window ago and an editor's save is a rename
+         * away and a rename back.
+         *
+         * A deletion is the one dispatch that cannot be walked back. It removes
+         * the note from every other peer in the cluster, and CouchDB keeps only a
+         * tombstone plus history, so recovery is a manual remote-side operation.
+         * Every other mistake this peer can make costs a redundant push. So the
+         * rule here is positive evidence only: dispatch the delete when the
+         * filesystem says ENOENT, and in every other case (the file is back, the
+         * path is unreadable, the volume is having a bad day) do nothing and let
+         * the next scan decide with better information.
+         */
+        if (!(await this.isGoneFromDisk(rel))) {
+            this.log(`${rel} is on disk after all; not dispatching a delete for it`, 'debug');
+            return;
+        }
         if (this.echo.isRepeating(rel, false)) return;
         this.log(`${rel} delete detected`, 'debug');
         try {
