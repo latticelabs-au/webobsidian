@@ -1,0 +1,59 @@
+{
+  "name": "livesync-engine",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Node-consumable bundle of vrtmrz/livesync-commonlib, exposing DirectFileManipulator for the WebObsidian Self-hosted LiveSync backend.",
+  "license": "MIT",
+  "main": "./index.js",
+  "types": "./index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./index.js"
+    }
+  },
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "shim.js",
+    "bundle/",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "node build.mjs"
+  },
+  "vendored": {
+    "upstream": "https://github.com/vrtmrz/livesync-commonlib",
+    "commit": "8ed9bcda25e5a6b6386c662e98050214b4b7b1cb",
+    "shortCommit": "8ed9bcd",
+    "license": "MIT",
+    "copyright": "Copyright (c) 2022 vorotamoroz",
+    "licenseFile": "./LICENSE",
+    "sourcePath": "./upstream/src",
+    "note": "upstream/src is an unmodified copy of livesync-commonlib's src/ at the pinned commit. Never edit it in place; to update, re-copy from upstream and rebuild. All Node-specific adaptation lives in build.mjs, shim.js and src/entry.ts.",
+    "xxhashNote": "xxhash-wasm-102 is an npm ALIAS (npm:xxhash-wasm), matching upstream's Deno import map. It is currently unreferenced at runtime by the bundled V2 code path: XXHashHashManager.ts imports only `type XXHashAPI` from it (erased at build time), the actual xxhash comes from octagonal-wheels' own patched copy, and the one real value import lives in DirectFileManipulatorV1.ts which this bundle does not include. It is kept declared so the vendored source still typechecks and so a future switch to V1 resolves rather than failing cryptically.",
+    "sideEffectsNote": "Do NOT add a \"sideEffects\" field. index.js imports shim.js purely for its side effect; marking the package side-effect-free would let a downstream bundler tree-shake the navigator shim away, which fails at runtime rather than at build time."
+  },
+  "dependencies": {
+    "diff-match-patch": "^1.0.5",
+    "fflate": "^0.8.2",
+    "minimatch": "^9.0.5",
+    "octagonal-wheels": "^0.1.39",
+    "pouchdb-adapter-http": "^9.0.0",
+    "pouchdb-core": "^9.0.0",
+    "pouchdb-errors": "^9.0.0",
+    "pouchdb-find": "^9.0.0",
+    "pouchdb-mapreduce": "^9.0.0",
+    "pouchdb-merge": "^9.0.0",
+    "pouchdb-replication": "^9.0.0",
+    "pouchdb-utils": "^9.0.0",
+    "transform-pouch": "^2.0.0",
+    "xxhash-wasm-102": "npm:xxhash-wasm@^1.0.2"
+  },
+  "devDependencies": {
+    "@types/diff-match-patch": "^1.0.36",
+    "@types/pouchdb": "^6.4.2",
+    "esbuild": "^0.24.0"
+  }
+}

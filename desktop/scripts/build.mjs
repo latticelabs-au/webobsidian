@@ -1,7 +1,7 @@
 // Build the desktop app artifacts that electron-builder packages:
-//   1. dist/main.js + dist/preload.js  — the Electron main & preload (esbuild bundles)
-//   2. .gen/server/dist/index.mjs      — the whole Express server as ONE bundled ESM file
-//   3. .gen/server/public/             — the built web SPA (copied from server/public)
+//   1. dist/main.js + dist/preload.js  : the Electron main & preload (esbuild bundles)
+//   2. .gen/server/dist/index.mjs      : the whole Express server as ONE bundled ESM file
+//   3. .gen/server/public/             : the built web SPA (copied from server/public)
 //
 // Prereq: the repo-root `npm run build` must have run first (it produces
 // server/dist + server/public). We bundle the COMPILED server (server/dist/index.js),

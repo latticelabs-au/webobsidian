@@ -5,11 +5,33 @@ import {
   apiErrorMessage,
   sharePasswordError,
   vaultPathError,
+  liveSyncE2eeError,
+  liveSyncToneColor,
+  liveSyncVerdict,
+  secretWillBeSet,
   MIN_PASSWORD_LEN,
+  REDACTED_SECRET,
+  type LiveSyncSecretKey,
+  type LiveSyncStatus,
+  type SecretChange,
 } from '../lib/api';
 import Icon from './Icon';
 
-type Section = 'vault' | 'git' | 'api' | 'sharing' | 'plugins' | 'appearance' | 'account' | 'about';
+// The three literals below (this union, the nav array in Settings() and the
+// `labels` map) are parallel and have to stay in step: the union decides what
+// can be selected, the array decides what is rendered, and the map decides what
+// it is called. A section added to only one or two of them either cannot be
+// reached or renders a blank tab with no label, and nothing warns about it.
+type Section =
+  | 'vault'
+  | 'git'
+  | 'livesync'
+  | 'api'
+  | 'sharing'
+  | 'plugins'
+  | 'appearance'
+  | 'account'
+  | 'about';
 
 export default function Settings() {
   const open = useStore((s) => s.settingsOpen);
@@ -28,7 +50,7 @@ export default function Settings() {
       <div className="modal settings-modal" onClick={(e) => e.stopPropagation()}>
         <div className="settings-layout">
           <div className="settings-nav">
-            {(['vault', 'git', 'api', 'sharing', 'plugins', 'appearance', 'account', 'about'] as Section[]).map((s) => (
+            {(['vault', 'git', 'livesync', 'api', 'sharing', 'plugins', 'appearance', 'account', 'about'] as Section[]).map((s) => (
               <button key={s} className={section === s ? 'active' : ''} onClick={() => setSection(s)}>
                 {labels[s]}
               </button>
@@ -37,6 +59,7 @@ export default function Settings() {
           <div className="settings-content">
             {settings && section === 'vault' && <VaultSettings s={settings} reload={() => api.getSettings().then(setSettings)} />}
             {settings && section === 'git' && <GitSettings s={settings} reload={() => api.getSettings().then(setSettings)} />}
+            {settings && section === 'livesync' && <LiveSyncSettings s={settings} reload={() => api.getSettings().then(setSettings)} />}
             {section === 'api' && <ApiKeys />}
             {section === 'sharing' && <Shares />}
             {section === 'plugins' && <Plugins />}
@@ -53,6 +76,7 @@ export default function Settings() {
 const labels: Record<Section, string> = {
   vault: 'Vault & Files',
   git: 'GitHub Sync',
+  livesync: 'LiveSync (CouchDB)',
   api: 'API Keys',
   sharing: 'Sharing',
   plugins: 'Community Plugins',
@@ -214,6 +238,22 @@ function GitSettings({ s, reload }: { s: any; reload: () => void }) {
   return (
     <div>
       <h2>GitHub Sync</h2>
+      {/*
+        Stated here rather than only on the LiveSync page, because this is the
+        page whose controls stop doing anything. `sync.backend` holds ONE value:
+        git and LiveSync resolve conflicts in incompatible ways (git at commit
+        granularity over a working tree it assumes it alone mutates, LiveSync per
+        document against CouchDB revision history), so two writers over one vault
+        churn between two histories that cannot afterwards be merged. Without
+        this line the checkboxes below read as live settings that are quietly
+        ignored, which is the kind of thing that gets debugged as a server bug.
+      */}
+      {s.sync?.backend === 'livesync' && (
+        <div style={{ color: '#d29922', margin: '6px 0 12px' }}>
+          LiveSync currently owns this vault, so nothing on this page runs. The sync backend is
+          one choice, not a set. Switch it back under LiveSync (CouchDB) to use git again.
+        </div>
+      )}
       <Row name="Enable git sync"><input type="checkbox" checked={g.enabled} onChange={(e) => set('enabled', e.target.checked)} /></Row>
       <Row name="Remote URL" desc="https://github.com/owner/repo.git">
         <input className="text-input" style={{ width: 260 }} value={g.remote} onChange={(e) => set('remote', e.target.value)} />
@@ -250,6 +290,533 @@ function GitSettings({ s, reload }: { s: any; reload: () => void }) {
           ref={logRef}
           readOnly
           value={log.length ? log.join('\n') : 'No git activity yet. Click an action above (Sync now, Pull, Push…) to see logs here.'}
+          style={{
+            width: '100%', height: 200, boxSizing: 'border-box', resize: 'vertical',
+            background: 'var(--bg-primary)', color: 'var(--text-normal)',
+            border: '1px solid var(--bg-modifier-border, #444)', borderRadius: 6, padding: 10,
+            fontFamily: 'var(--font-monospace, monospace)', fontSize: 12, lineHeight: 1.5, whiteSpace: 'pre',
+          }}
+        />
+      </div>
+    </div>
+  );
+}
+
+/**
+ * The three LiveSync credential fields, in the order they are rendered.
+ *
+ * Kept as data rather than three copies of the same JSX because all three obey
+ * the identical, and easy to get wrong, round-trip rule described on
+ * `SecretRow`: the server serves a mask in place of a stored secret and treats
+ * that mask coming back as "unchanged". Writing the rule once, next to the list
+ * of fields it applies to, is what keeps a fourth field from being added later
+ * with a plain `<input>` that wipes the credential on the next save.
+ */
+const LIVESYNC_SECRETS: { key: LiveSyncSecretKey; name: string; desc: string }[] = [
+  {
+    key: 'password',
+    name: 'CouchDB password',
+    desc: 'Stored server-side, never sent back to this page.',
+  },
+  {
+    key: 'passphrase',
+    name: 'Encryption passphrase',
+    desc: 'End-to-end encryption. Must match every other peer on this database, exactly, including any spaces.',
+  },
+  {
+    key: 'obfuscatePassphrase',
+    name: 'Path obfuscation passphrase',
+    desc: 'Hashes document ids in CouchDB. Requires the encryption passphrase above.',
+  },
+];
+
+/**
+ * One credential input, plus the two affordances the round-trip rule needs.
+ *
+ * The server sends `REDACTED_SECRET` in place of a stored secret and reads that
+ * same string back as "the client did not change this" (see `readSecret` in
+ * server/src/routes/settings.ts). That makes a naive password box actively
+ * dangerous in two directions, and both are handled here:
+ *
+ *  - Typing INTO the mask. The box is rendered holding eight bullet characters,
+ *    so an operator who clicks at the end and types their passphrase submits
+ *    "••••••••hunter2", which is not the mask, so the server stores it verbatim
+ *    as the passphrase. Nothing reports an error: the vault is simply encrypted
+ *    under a key that exists nowhere else, and it is discovered as an entire
+ *    remote database that no other peer can decrypt. The mask is therefore
+ *    cleared on first focus, once, so an edit always starts from empty.
+ *  - No way to REMOVE a secret. Blank means "leave it alone" (a password box is
+ *    conventionally blank even when a value is stored, so a blank field is the
+ *    normal state of a save that was not about the credential), which leaves an
+ *    instance holding an obfuscation passphrase and no encryption passphrase
+ *    with no way out: every save is refused by the pairing check, and the one
+ *    field that has to change cannot be changed. `Clear` sends an explicit JSON
+ *    null, which is the server's documented signal and one no text input can
+ *    produce by accident.
+ */
+function SecretRow({
+  name,
+  desc,
+  value,
+  stored,
+  cleared,
+  onFocus,
+  onChange,
+  onToggleClear,
+}: {
+  name: string;
+  desc: string;
+  value: string;
+  stored: boolean;
+  cleared: boolean;
+  onFocus: () => void;
+  onChange: (v: string) => void;
+  onToggleClear: () => void;
+}) {
+  const state = cleared
+    ? 'Will be removed when you save.'
+    : stored
+      ? 'A value is stored. Leave blank to keep it.'
+      : 'Not set.';
+  return (
+    <Row name={name} desc={`${desc} ${state}`}>
+      <span style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+        <input
+          className="text-input"
+          type="password"
+          style={{ width: 200 }}
+          autoComplete="new-password"
+          disabled={cleared}
+          value={cleared ? '' : value}
+          onFocus={onFocus}
+          onChange={(e) => onChange(e.target.value)}
+        />
+        {(stored || cleared) && (
+          <button className="btn secondary" style={{ padding: '2px 8px' }} onClick={onToggleClear}>
+            {cleared ? 'Keep' : 'Clear'}
+          </button>
+        )}
+      </span>
+    </Row>
+  );
+}
+
+/**
+ * Replace one key of a per-secret record, keeping the record's exact key set.
+ *
+ * A one-liner with a signature, rather than an inline spread at each of the six
+ * call sites, so the three parallel records (value, touched, cleared) can only
+ * ever be updated in the same shape and a typo in a computed key is a type error
+ * instead of a fourth, silently ignored entry.
+ */
+function withSecret<T>(
+  base: Record<LiveSyncSecretKey, T>,
+  key: LiveSyncSecretKey,
+  value: T,
+): Record<LiveSyncSecretKey, T> {
+  return { ...base, [key]: value };
+}
+
+/** True for the `{ ok, log }` shape that `POST /api/livesync/sync` answers with. */
+function isSyncResult(r: unknown): r is { ok: boolean; log: string[] } {
+  return typeof r === 'object' && r !== null && Array.isArray((r as { log?: unknown }).log);
+}
+
+/**
+ * The LiveSync (CouchDB) backend panel, built on GitSettings' shape: the same
+ * `Row` helper, the same append-only timestamped log, the same action-button
+ * row. Two operators looking at the two sync backends should not have to learn
+ * two pages.
+ *
+ * What is different is that this backend can be running, wedged or refusing to
+ * start, and those are three different things. Git's status is a question about
+ * a working tree and is answered by looking; a replication peer that has gone
+ * silent looks exactly like a replication peer with nothing to do. So the panel
+ * polls `GET /api/livesync/status` and renders the verdict, rather than only
+ * showing what the last button press returned.
+ */
+function LiveSyncSettings({ s, reload }: { s: any; reload: () => void }) {
+  const [backend, setBackend] = useState<'none' | 'git' | 'livesync'>(s.sync?.backend ?? 'none');
+  const [cfg, setCfg] = useState({
+    // The URI arrives already masked by redactUrlCreds() in case a hand-edited
+    // settings.json embedded credentials in it. Round-tripping that mask is
+    // safe: the settings PUT recognises "the masked form of what is stored" as
+    // "unchanged" and leaves the stored URL alone, precisely so a form that
+    // shows what it read cannot replace a working URL with a broken one.
+    uri: s.livesync?.uri ?? '',
+    database: s.livesync?.database ?? '',
+    username: s.livesync?.username ?? '',
+    liveMode: Boolean(s.livesync?.liveMode),
+    intervalSec: Number(s.livesync?.intervalSec ?? 30),
+  });
+  const includeInternal: string[] = s.livesync?.includeInternal ?? [];
+  const blank: Record<LiveSyncSecretKey, boolean> = {
+    password: false,
+    passphrase: false,
+    obfuscatePassphrase: false,
+  };
+  // What the server sent for each secret: the mask when a value is stored, the
+  // empty string when it is not. Rendered as-is, so "configured" and "not
+  // configured" stay visibly different states.
+  const [sec, setSec] = useState<Record<LiveSyncSecretKey, string>>({
+    password: s.livesync?.password ?? '',
+    passphrase: s.livesync?.passphrase ?? '',
+    obfuscatePassphrase: s.livesync?.obfuscatePassphrase ?? '',
+  });
+  const [stored, setStored] = useState<Record<LiveSyncSecretKey, boolean>>({
+    password: s.livesync?.password === REDACTED_SECRET,
+    passphrase: s.livesync?.passphrase === REDACTED_SECRET,
+    obfuscatePassphrase: s.livesync?.obfuscatePassphrase === REDACTED_SECRET,
+  });
+  const [touched, setTouched] = useState<Record<LiveSyncSecretKey, boolean>>(blank);
+  const [cleared, setCleared] = useState<Record<LiveSyncSecretKey, boolean>>(blank);
+  const [status, setStatus] = useState<LiveSyncStatus | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [log, setLog] = useState<string[]>([]);
+  const logRef = useRef<HTMLTextAreaElement>(null);
+
+  const append = (lines: string[]) => {
+    const ts = new Date().toLocaleTimeString();
+    setLog((prev) => [...prev, ...lines.map((l, i) => (i === 0 ? `[${ts}] ${l}` : `         ${l}`))]);
+  };
+  useEffect(() => {
+    if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
+  }, [log]);
+
+  /**
+   * What this save will do to one stored secret, in the settings API's own three
+   * cases. `touched` matters: an untouched field still holds the mask, and the
+   * mask is never a new value.
+   */
+  const changeOf = (k: LiveSyncSecretKey): SecretChange => {
+    if (cleared[k]) return 'clear';
+    return touched[k] && sec[k] ? 'set' : 'keep';
+  };
+
+  const refresh = async () => {
+    try {
+      setStatus(await api.liveSyncStatus());
+    } catch (e) {
+      setStatus(null);
+      append([`Error: ${apiErrorMessage(e, 'Could not read the LiveSync status')}`]);
+    }
+  };
+  // Polled while the panel is open, not only after a button press. Connecting is
+  // asynchronous by design (the connect call returns once the FIRST attempt has
+  // settled, with the supervised retry loop continuing behind it), so a panel
+  // that only refreshed on demand would show "not started" for a peer that came
+  // up two seconds later, and the operator would press Connect again.
+  useEffect(() => {
+    let alive = true;
+    const tick = async () => {
+      if (!alive) return;
+      try {
+        const next = await api.liveSyncStatus();
+        if (alive) setStatus(next);
+      } catch {
+        /* a transient failure is reported by the explicit actions, not by the poll */
+      }
+    };
+    void tick();
+    const id = setInterval(tick, 10000);
+    return () => {
+      alive = false;
+      clearInterval(id);
+    };
+  }, []);
+
+  const save = async () => {
+    // Refused here as well as at the server, because the server's 400 for this
+    // arrives as a paragraph under a Save button with no indication of which of
+    // the two fields to change, and because the rule itself is counter-intuitive
+    // enough that stating it before the round trip is worth the duplication. The
+    // server remains the gate: it applies the identical rule to the merged draft
+    // and the backend refuses to start on it regardless of what this page thinks.
+    const e2ee = liveSyncE2eeError(
+      { stored: stored.passphrase, change: changeOf('passphrase') },
+      { stored: stored.obfuscatePassphrase, change: changeOf('obfuscatePassphrase') },
+    );
+    if (e2ee) {
+      append([`Not saved: ${e2ee}`]);
+      return;
+    }
+    // Same bound the settings PUT applies, and for the same reason: at 0 or a
+    // negative value the poll timer degenerates into a hot loop against CouchDB,
+    // and the value is persisted, so the damage survives a restart.
+    if (!Number.isInteger(cfg.intervalSec) || cfg.intervalSec < 1) {
+      append(['Not saved: interval must be a whole number of seconds, at least 1']);
+      return;
+    }
+    const livesync: Record<string, unknown> = {
+      uri: cfg.uri,
+      database: cfg.database,
+      username: cfg.username,
+      liveMode: cfg.liveMode,
+      intervalSec: cfg.intervalSec,
+    };
+    const changes: Record<LiveSyncSecretKey, SecretChange> = {
+      password: changeOf('password'),
+      passphrase: changeOf('passphrase'),
+      obfuscatePassphrase: changeOf('obfuscatePassphrase'),
+    };
+    for (const { key } of LIVESYNC_SECRETS) {
+      // 'keep' sends nothing at all. The mask would be ignored by the server
+      // anyway, but omitting the key says what is meant and keeps the mask out
+      // of the request body entirely.
+      if (changes[key] === 'set') livesync[key] = sec[key];
+      else if (changes[key] === 'clear') livesync[key] = null;
+    }
+    try {
+      await api.putSettings({ sync: { backend }, livesync });
+    } catch (e) {
+      append([`Error: ${apiErrorMessage(e, 'Could not save the LiveSync settings')}`]);
+      return;
+    }
+    // Re-derive the credential editors from what was just applied rather than
+    // from a re-read, because a re-read cannot tell us anything the request did
+    // not already decide (the server either applied exactly this patch or threw)
+    // and the props this component was built from do not update in place.
+    const nextStored = { ...stored };
+    const nextSec = { ...sec };
+    for (const { key } of LIVESYNC_SECRETS) {
+      nextStored[key] = secretWillBeSet(stored[key], changes[key]);
+      nextSec[key] = nextStored[key] ? REDACTED_SECRET : '';
+    }
+    setStored(nextStored);
+    setSec(nextSec);
+    setTouched(blank);
+    setCleared(blank);
+    reload();
+    append(['Saved LiveSync settings']);
+    await refresh();
+  };
+
+  const run = async (fn: () => Promise<unknown>, label: string) => {
+    if (busy) return;
+    setBusy(true);
+    append([`${label}…`]);
+    try {
+      const r = await fn();
+      // sync answers { ok, log } exactly as the git backend does; connect and
+      // disconnect answer a status snapshot that is stale the moment it is taken
+      // (see the note in lib/api.ts), so it is deliberately not rendered. The
+      // refresh below is the honest answer to "what happened".
+      append(
+        isSyncResult(r)
+          ? [`${label} ${r.ok ? 'ok' : 'NOT ok'}`, ...r.log].flatMap((l) => String(l).split('\n'))
+          : [`${label} requested`],
+      );
+    } catch (e) {
+      append([`Error: ${apiErrorMessage(e, `${label} failed`)}`]);
+    } finally {
+      setBusy(false);
+      await refresh();
+    }
+  };
+
+  /** Drop a ported bridge config's `includeInternal` list. See the row below. */
+  const clearIncludeInternal = async () => {
+    try {
+      await api.putSettings({ livesync: { includeInternal: [] } });
+    } catch (e) {
+      append([`Error: ${apiErrorMessage(e, 'Could not clear the internal-files list')}`]);
+      return;
+    }
+    reload();
+    append(['Cleared livesync.includeInternal']);
+    await refresh();
+  };
+
+  const verdict = status ? liveSyncVerdict(status) : null;
+
+  return (
+    <div>
+      <h2>LiveSync (CouchDB)</h2>
+      <p style={{ color: 'var(--text-muted)' }}>
+        Replicate this vault into a Self-hosted LiveSync CouchDB database, as a peer alongside the
+        Obsidian plugin on your other devices.
+      </p>
+      {/*
+        The mutual exclusivity is a data-integrity rule, not a UI simplification,
+        so it is stated where the choice is made. Git resolves conflicts at commit
+        granularity over a working tree it assumes it alone mutates; LiveSync
+        resolves them per document against CouchDB revision history. Run both and
+        each reads the other's writes as an unexplained local edit: a checkout
+        reverts a replicated change, LiveSync replicates the revert back out, the
+        next tick reverts it again, and there is no merge that repairs it
+        afterwards. The settings model makes the bad state unrepresentable (one
+        enum, no "both"), and this select is that enum.
+      */}
+      <Row
+        name="Sync backend"
+        desc="Which backend owns this vault. One at a time: git and LiveSync have incompatible conflict models, and running both over one vault corrupts it."
+      >
+        <select
+          className="text-input"
+          style={{ width: 220 }}
+          value={backend}
+          onChange={(e) => setBackend(e.target.value as 'none' | 'git' | 'livesync')}
+        >
+          <option value="none">No sync</option>
+          <option value="git">Git</option>
+          <option value="livesync">LiveSync (CouchDB)</option>
+        </select>
+      </Row>
+      <Row name="CouchDB URL" desc="Base URL without the database name, e.g. https://couchdb.example:6984">
+        <input
+          className="text-input"
+          style={{ width: 260 }}
+          value={cfg.uri}
+          onChange={(e) => setCfg((p) => ({ ...p, uri: e.target.value }))}
+        />
+      </Row>
+      <Row name="Database" desc="Lowercase, starting with a letter. The same database the other peers use.">
+        <input
+          className="text-input"
+          style={{ width: 200 }}
+          value={cfg.database}
+          onChange={(e) => setCfg((p) => ({ ...p, database: e.target.value }))}
+        />
+      </Row>
+      <Row name="Username">
+        <input
+          className="text-input"
+          style={{ width: 200 }}
+          value={cfg.username}
+          onChange={(e) => setCfg((p) => ({ ...p, username: e.target.value }))}
+        />
+      </Row>
+      {LIVESYNC_SECRETS.map((f) => (
+        <SecretRow
+          key={f.key}
+          name={f.name}
+          desc={f.desc}
+          value={sec[f.key]}
+          stored={stored[f.key]}
+          cleared={cleared[f.key]}
+          onFocus={() => {
+            if (touched[f.key] || cleared[f.key]) return;
+            setTouched((p) => withSecret(p, f.key, true));
+            setSec((p) => withSecret(p, f.key, ''));
+          }}
+          onChange={(v) => setSec((p) => withSecret(p, f.key, v))}
+          onToggleClear={() => {
+            const next = !cleared[f.key];
+            setCleared((p) => withSecret(p, f.key, next));
+            // Leaving a half-typed value behind a "will be removed" flag is
+            // ambiguous about what the save will do, so the editor resets.
+            if (next) {
+              setTouched((p) => withSecret(p, f.key, false));
+              setSec((p) => withSecret(p, f.key, stored[f.key] ? REDACTED_SECRET : ''));
+            }
+          }}
+        />
+      ))}
+      {/*
+        Off by default and NOT interval polling's default, deliberately: live mode
+        holds an open changes feed and applies remote writes into the vault the
+        moment they arrive, so a mistyped database name is discovered by having
+        someone else's vault written over this one in real time. Interval polling
+        reaches the same steady state one tick later, with a window in which the
+        mistake can still be noticed.
+      */}
+      <Row name="Live mode" desc="Continuous replication. Turn it on once the pairing is proven.">
+        <input
+          type="checkbox"
+          checked={cfg.liveMode}
+          onChange={(e) => setCfg((p) => ({ ...p, liveMode: e.target.checked }))}
+        />
+      </Row>
+      <Row name="Interval (sec)" desc="Poll interval when live mode is off">
+        <input
+          className="text-input"
+          type="number"
+          min={1}
+          style={{ width: 90 }}
+          value={cfg.intervalSec}
+          onChange={(e) => setCfg((p) => ({ ...p, intervalSec: Number(e.target.value) }))}
+        />
+      </Row>
+      {/*
+        Read-only on purpose, and shown at all only so an operator who ported a
+        bridge config can see why their backend refuses to start. The reference
+        bridge's implementation of this feature strips the base directory BEFORE
+        adding the `i:` prefix (mangling the stored name) and never re-adds the
+        prefix on the way back out (producing a second, divergent document), and
+        WebObsidian's own watcher deliberately ignores .obsidian/ because desktop
+        Obsidian rewrites those files constantly. So the backend treats a
+        non-empty list as a configuration error rather than shipping the defect.
+        There is no control to switch it on because there is nothing here worth
+        switching on.
+      */}
+      <Row
+        name="Internal files"
+        desc="Replicating .obsidian internals is not supported; a non-empty list stops the backend from starting."
+      >
+        <span style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+          <span style={{ color: includeInternal.length ? '#e5534b' : 'var(--text-faint)' }}>
+            {includeInternal.length ? includeInternal.join(' ') : 'none'}
+          </span>
+          {includeInternal.length > 0 && (
+            <button className="btn secondary" style={{ padding: '2px 8px' }} onClick={clearIncludeInternal}>
+              Clear
+            </button>
+          )}
+        </span>
+      </Row>
+      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 12 }}>
+        <button className="btn" onClick={save}>Save</button>
+        <button className="btn secondary" disabled={busy} onClick={() => run(api.liveSyncConnect, 'Connect')}>
+          Connect
+        </button>
+        <button className="btn" disabled={busy} onClick={() => run(api.liveSyncSync, 'Sync')}>
+          Sync now
+        </button>
+        <button className="btn secondary" disabled={busy} onClick={() => run(api.liveSyncDisconnect, 'Disconnect')}>
+          Disconnect
+        </button>
+        <button className="btn secondary" onClick={() => void refresh()}>
+          Refresh status
+        </button>
+      </div>
+      {verdict && status && (
+        <div
+          style={{
+            border: '1px solid var(--bg-modifier-border, #444)',
+            borderRadius: 6,
+            padding: 10,
+            marginTop: 12,
+          }}
+        >
+          <div style={{ color: liveSyncToneColor(verdict.tone), fontWeight: 600 }}>{verdict.text}</div>
+          {/*
+            pre-wrap because the verdict's detail carries one line per peer and
+            per error. Those lines are the whole point of the three-valued health
+            model: "vault (storage): syncing" next to "couchdb (couchdb): not
+            syncing, connecting" is what separates idle from wedged at a glance.
+          */}
+          <div style={{ whiteSpace: 'pre-wrap', color: 'var(--text-muted)', fontSize: 12, marginTop: 4 }}>
+            {verdict.detail}
+          </div>
+          <div style={{ color: 'var(--text-faint)', fontSize: 12, marginTop: 6 }}>
+            backend {status.backend} · {status.running ? 'running' : 'stopped'} ·{' '}
+            {status.connected ? 'connected' : 'not connected'} ·{' '}
+            {status.liveMode ? 'live' : `every ${status.intervalSec}s`} · {status.trackedFiles} tracked ·
+            ↑{status.applied?.pushed ?? 0} ↓{status.applied?.pulled ?? 0}
+          </div>
+        </div>
+      )}
+      <div style={{ marginTop: 12 }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
+          <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>Sync log</span>
+          {log.length > 0 && (
+            <button className="btn secondary" style={{ padding: '2px 8px' }} onClick={() => setLog([])}>Clear</button>
+          )}
+        </div>
+        <textarea
+          ref={logRef}
+          readOnly
+          value={log.length ? log.join('\n') : 'No LiveSync activity yet. Save, then Connect, then Sync now.'}
           style={{
             width: '100%', height: 200, boxSizing: 'border-box', resize: 'vertical',
             background: 'var(--bg-primary)', color: 'var(--text-normal)',

@@ -21,6 +21,12 @@ import { filesRouter } from './routes/files.js';
 import { searchRouter } from './routes/search.js';
 import { settingsRouter } from './routes/settings.js';
 import { gitRouter } from './routes/git.js';
+import {
+  livesyncRouter,
+  livesyncHealthHandler,
+  livesyncHealthSummary,
+  startLiveSyncHealthBeat,
+} from './routes/livesync.js';
 import { keysRouter } from './routes/keys.js';
 import { pluginsRouter } from './routes/plugins.js';
 import { agentRouter } from './routes/agent.js';
@@ -33,6 +39,7 @@ import { buildFileIndex, indexFile, unindexFile } from './services/fileindex.js'
 import { setBroadcaster, broadcast } from './services/realtime.js';
 import { getVaultRoot, ensureVault, invalidateStat } from './services/vault.js';
 import { startAutoSync } from './services/autosync.js';
+import { onVaultEvent as liveSyncVaultEvent } from './services/livesync.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -129,8 +136,31 @@ async function main() {
     );
   }
 
-  // Health (no auth): for docker healthcheck
-  app.get('/healthz', (_req, res) => res.json({ ok: true }));
+  // Health (no auth): for docker healthcheck.
+  //
+  // `ok` is UNCONDITIONALLY true and must stay that way. This endpoint is what
+  // the container healthcheck (see docker-compose) uses to decide whether to kill
+  // and recreate the whole app, so anything that can make it fail is something
+  // that can take the editor, the search index and every open WebSocket down with
+  // it. A sync backend that cannot reach its remote is not a reason to restart a
+  // web server; it is a reason to say so, loudly, somewhere that is not a
+  // liveness probe.
+  //
+  // The LiveSync summary rides along for exactly that reason: an operator who
+  // curls /healthz should be able to see that the sync side is unhappy without
+  // that fact being able to end the process. The detailed, status-code-bearing
+  // report is /healthz/livesync below. See routes/livesync.ts for what each field
+  // means and why `healthy` there is stricter than `restartWorthy`.
+  app.get('/healthz', (_req, res) => res.json({ ok: true, livesync: livesyncHealthSummary() }));
+
+  // LiveSync liveness (no auth, same reasoning as /healthz: a probe that needs a
+  // session is a probe nobody wires up). 200 when the backend is syncing or is
+  // not selected at all, 503 when it is selected and is not syncing, including
+  // when the health beat itself has stopped being serviced. KICKOFF's acceptance
+  // criterion 5 ("CouchDB unreachable ... leaves the process alive and REPORTING
+  // unhealthy") is what this endpoint answers; the payload is deliberately
+  // credential-free and vault-structure-free because it is unauthenticated.
+  app.get('/healthz/livesync', livesyncHealthHandler);
 
   // Routes. NOTE: specific /api/* routers must be registered BEFORE the broad
   // '/api' search router, whose router-level requireAuth middleware would
@@ -140,6 +170,15 @@ async function main() {
   app.use('/api/files', filesRouter);
   app.use('/api/settings', settingsRouter);
   app.use('/api/git', gitRouter);
+  // The sibling of /api/git, and it must be registered here for the same reason
+  // every other specific router is: the broad '/api' search router below applies
+  // requireAuth at the ROUTER level, so anything mounted after it is gated by
+  // prefix rather than by its own middleware. livesyncRouter carries its own
+  // requireAuth, so the practical effect of getting this wrong would be an
+  // authenticated route authenticated twice; the reason to keep the ordering
+  // anyway is that the rule is uniform, and a router that relies on the broad one
+  // is a router that silently loses its auth the day it moves.
+  app.use('/api/livesync', livesyncRouter);
   app.use('/api/keys', keysRouter);
   app.use('/api/plugins', pluginsRouter);
   app.use('/api/uistate', uiStateRouter);
@@ -171,6 +210,13 @@ async function main() {
   setupWebsocket(server, resolveUpgradeOriginAllowlist(devCorsOrigin));
   await setupWatcher();
   startAutoSync();
+  // The LiveSync liveness beat. Started unconditionally, including on instances
+  // that use git or no sync at all: while LiveSync is not the selected backend a
+  // beat is a cached settings read and a pure config validation, so it costs a
+  // timer, and it means /healthz/livesync is already live and already fresh the
+  // moment an operator switches the backend on. See routes/livesync.ts for why
+  // this is a self-scheduling chain rather than a setInterval.
+  startLiveSyncHealthBeat();
 
   server.listen(config.port, config.host, () => {
     console.log(`\n  WebObsidian server → http://${config.host}:${config.port}`);
@@ -1019,6 +1065,10 @@ function startWatcher(root: string, usePolling: boolean) {
     else if (type === 'unlink') unindexFile(rel);
     // Drop the cached mtime/ctime so the next listTree re-stats just this file.
     invalidateStat(rel);
+    // Feed the LiveSync storage peer from THIS watcher. See forwardToLiveSync().
+    // Placed before the markdown indexing below, which reads and parses the file
+    // and can take a while, so a local edit is not queued behind it.
+    forwardToLiveSync(rel, type);
     if (/\.(md|markdown)$/i.test(rel)) {
       // Update only the changed file in the search + link indexes (O(1)): a full
       // buildLinkGraph() re-reads every note in the vault and was the main CPU sink
@@ -1039,6 +1089,55 @@ function startWatcher(root: string, usePolling: boolean) {
     .on('unlink', (p) => onChange(p, 'unlink'))
     .on('addDir', (p) => onChange(p, 'addDir'))
     .on('unlinkDir', (p) => onChange(p, 'unlinkDir'));
+}
+
+/**
+ * Hand one filesystem event to the LiveSync storage peer.
+ *
+ * WHY THIS EXISTS RATHER THAN A SECOND WATCHER. The reference bridge's storage
+ * peer owns its own chokidar instance, and porting that faithfully would mean two
+ * independent watchers over one vault: two debounce windows over the same write,
+ * twice the inotify budget on a host whose `max_user_watches` is already the
+ * thing `startWatcher` self-heals around, and two places to fix the next watcher
+ * bug. `onChange` above is this server's single fanout point for filesystem
+ * events (search index, link graph, file index, WebSocket broadcast); the sync
+ * backend becomes one more consumer of it, which is the seam KICKOFF section 5.4
+ * asks about. It also means the peer inherits this watcher's ignore list and its
+ * `awaitWriteFinish` window for free, and the ignore list is load-bearing: the
+ * bridge's watcher has none, so a faithful port would have replicated `.git` and
+ * `.obsidian` into CouchDB.
+ *
+ * SYNCHRONOUS, VOID-RETURNING AND NON-THROWING, because it is called from that
+ * fanout's hot path. The settings read is async (cache-backed, so it resolves on
+ * a microtask after boot) and is therefore detached rather than awaited: making
+ * `onChange` wait on it would put a settings lookup in front of the search index
+ * update for every event, on every instance, including the ones that will never
+ * enable this backend.
+ *
+ * The `sync.backend` gate is belt to the service's braces. `onVaultEvent` already
+ * no-ops unless a peer pair is running and live mode is on, and a pair only
+ * exists when the backend is 'livesync'. The explicit check is here anyway
+ * because backends are mutually exclusive BY DESIGN (KICKOFF section 5.3: two
+ * writers over one vault with different conflict models would corrupt it), and a
+ * rule that important should be visible at the point where events are actually
+ * handed over, not only inferable from the state of an object three modules away.
+ */
+function forwardToLiveSync(rel: string, type: string): void {
+  void (async () => {
+    try {
+      const s = await getSettings();
+      if (s.sync.backend !== 'livesync') return;
+      liveSyncVaultEvent(rel, type);
+    } catch (err) {
+      // A failure here must never escape into the watcher's fanout: an unhandled
+      // rejection from this path would be logged by the process-wide handler at
+      // the top of this file with nothing to say which subsystem produced it, and
+      // the event that caused it would be indistinguishable from one that was
+      // delivered. Log it locally and let the reconciliation scan catch the file
+      // up, which is exactly what that scan is for.
+      console.error('[livesync] could not forward a watcher event:', err);
+    }
+  })();
 }
 
 async function dirExists(p: string): Promise<boolean> {
