@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import { useStore } from '../lib/store';
+import { useEscapeToClose } from '../lib/useEscapeToClose';
 import { api, type TrashItem } from '../lib/api';
 import Icon from './Icon';
 
@@ -27,6 +28,20 @@ export default function TrashView() {
   useEffect(() => {
     if (open) refresh();
   }, [open, refresh]);
+
+  /*
+   * Escape closes. Touch was never trapped here: .trash-view is not one of the
+   * dialogs the narrow-screen media query promotes to `position: fixed;
+   * inset: 0`, so it keeps `max-width: 92vw` inside a backdrop that is padded
+   * 14vh from the top, leaving plenty of .modal-bg to tap. On top of that the
+   * header ✕ and the footer "Close" both live in non-scrolling flex children
+   * (.trash-body is the only `flex: 1` child), so neither scrolls away. Escape
+   * was the one missing dismissal, and it is what the rest of the dialogs do.
+   *
+   * Via the shared hook rather than a local window listener, so that Escape
+   * dismisses only the topmost dialog. See lib/useEscapeToClose.ts.
+   */
+  useEscapeToClose(open, () => close(false));
 
   if (!open) return null;
 
@@ -93,10 +108,15 @@ export default function TrashView() {
           <Icon name="trash" size={16} />
           <div className="vh-title">Trash</div>
           <div className="vh-path">{items.length} item(s)</div>
-          <button className="tool-btn" title="Refresh" onClick={refresh}>
+          <button className="tool-btn" aria-label="Refresh trash" title="Refresh" onClick={refresh}>
             <Icon name="refresh-cw" size={16} />
           </button>
-          <button className="tool-btn" title="Close" onClick={() => close(false)}>
+          <button
+            className="tool-btn"
+            onClick={() => close(false)}
+            aria-label="Close trash"
+            title="Close trash (Esc)"
+          >
             <Icon name="x" size={16} />
           </button>
         </div>

@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useStore } from '../lib/store';
+import { useEscapeToClose } from '../lib/useEscapeToClose';
 import { api, type TreeNode } from '../lib/api';
 
 interface Cmd {
@@ -92,6 +93,20 @@ export default function CommandPalette() {
   useEffect(() => {
     if (!open) setQ('');
   }, [open]);
+
+  /*
+   * On the shared Escape stack, not because the palette was ever trapped (its
+   * input handles Escape and the backdrop is reachable) but because the stack
+   * only works if every dialog is on it. The palette opens ON TOP of the other
+   * dialogs, so if it stayed off the stack, Escape would reach whatever is
+   * underneath and dismiss that instead while the palette stayed open.
+   *
+   * The input's own handler below is kept as well: it is what makes Escape work
+   * while focus is inside the field on a browser that swallows the capture-phase
+   * listener, and running both is harmless because the second call closes an
+   * already-closed dialog.
+   */
+  useEscapeToClose(open, () => setOpen(false));
 
   if (!open) return null;
 

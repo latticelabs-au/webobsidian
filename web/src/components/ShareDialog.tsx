@@ -1,5 +1,6 @@
 import { useEffect } from 'react';
 import { useStore } from '../lib/store';
+import { useEscapeToClose } from '../lib/useEscapeToClose';
 import { api, apiErrorMessage, sharePasswordError, MIN_PASSWORD_LEN } from '../lib/api';
 import Icon from './Icon';
 
@@ -18,6 +19,26 @@ export default function ShareDialog() {
   useEffect(() => {
     if (path) loadShares();
   }, [path, loadShares]);
+
+  /*
+   * Escape closes, and the header ✕ added below is the touch half of the same
+   * fix. "Done" in the footer used to be the only in-dialog way out, and it is
+   * not reliably reachable: .modal is `overflow: hidden` with `max-height:
+   * 70vh` and this dialog puts its rows straight into that flex column with no
+   * scroll container, so anything past 70vh is clipped with no way to scroll it
+   * back. On a short phone the head plus three stacked .setting-row blocks
+   * (the media query turns each into a two-line column) plus a long path that
+   * wraps over several lines already gets close to that, and the first thing
+   * off the bottom edge is the footer. Tapping the backdrop still worked, but
+   * that leaves ~12px of exposed .modal-bg either side on a phone, which is not
+   * a control anybody should have to find.
+   *
+   * Via the shared hook rather than a local window listener: every dialog owning
+   * its own listener meant one Escape dismissed all of them at once, so opening
+   * the command palette over this dialog and backing out of the palette closed
+   * this too. See lib/useEscapeToClose.ts.
+   */
+  useEscapeToClose(Boolean(path), () => setShareDialog(null));
 
   if (!path) return null;
   const close = () => setShareDialog(null);
@@ -100,63 +121,80 @@ export default function ShareDialog() {
   return (
     <div className="modal-bg" onClick={close}>
       <div className="modal share-dialog" onClick={(e) => e.stopPropagation()}>
+        {/*
+          The head is pinned (`flex-shrink: 0`) and carries the close control,
+          so the one way out of this dialog sits in the one element that is
+          always on screen. Everything that can grow with the vault (the path,
+          the share rows) is inside .share-dialog-body, which is the only part
+          that scrolls.
+        */}
         <div className="share-dialog-head">
           <Icon name="globe" size={18} />
-          <div>
+          <div className="share-dialog-heading">
             <div className="share-dialog-title">{/\.canvas$/i.test(path) ? 'Share canvas' : 'Share note'}</div>
             <div className="share-dialog-path">{path}</div>
           </div>
+          <button
+            className="tool-btn"
+            onClick={close}
+            aria-label="Close share dialog"
+            title="Close share dialog (Esc)"
+          >
+            <Icon name="x" size={16} />
+          </button>
         </div>
 
-        {!share && (
-          <>
-            <p className="share-dialog-hint">
-              Create a public link so <b>anyone with the URL</b> can read this note without login.
-            </p>
-            <button className="btn" onClick={create}>
-              <Icon name="globe" size={14} /> Create public link
-            </button>
-          </>
-        )}
-
-        {share && (
-          <>
-            <div className="setting-row">
-              <div className="info">
-                <div className="name">Public link</div>
-                <div className="desc">{share.enabled ? 'Anyone with the URL can view this note' : 'Sharing is paused: the URL returns 404'}</div>
-              </div>
-              <button className={`graph-switch ${share.enabled ? 'on' : ''}`} onClick={toggle} aria-label="Toggle public link">
-                <span className="graph-knob" />
+        <div className="share-dialog-body">
+          {!share && (
+            <>
+              <p className="share-dialog-hint">
+                Create a public link so <b>anyone with the URL</b> can read this note without login.
+              </p>
+              <button className="btn" onClick={create}>
+                <Icon name="globe" size={14} /> Create public link
               </button>
-            </div>
+            </>
+          )}
 
-            {share.enabled && (
-              <div className="share-url">
-                <input className="text-input" readOnly value={url} onFocus={(e) => e.currentTarget.select()} />
-                <button className="btn" onClick={copy}><Icon name="link" size={14} /> Copy</button>
+          {share && (
+            <>
+              <div className="setting-row">
+                <div className="info">
+                  <div className="name">Public link</div>
+                  <div className="desc">{share.enabled ? 'Anyone with the URL can view this note' : 'Sharing is paused: the URL returns 404'}</div>
+                </div>
+                <button className={`graph-switch ${share.enabled ? 'on' : ''}`} onClick={toggle} aria-label="Toggle public link">
+                  <span className="graph-knob" />
+                </button>
               </div>
-            )}
 
-            <div className="setting-row">
-              <div className="info">
-                <div className="name">Password protection</div>
-                <div className="desc">{share.hasPassword ? 'Visitors must enter a password' : 'Anyone with the link can open it'}</div>
-              </div>
-              <button className="btn secondary" onClick={password}>
-                {share.hasPassword ? 'Change…' : 'Set password…'}
-              </button>
-            </div>
+              {share.enabled && (
+                <div className="share-url">
+                  <input className="text-input" readOnly value={url} onFocus={(e) => e.currentTarget.select()} />
+                  <button className="btn" onClick={copy}><Icon name="link" size={14} /> Copy</button>
+                </div>
+              )}
 
-            <div className="setting-row">
-              <div className="info">
-                <div className="name">Delete link</div>
-                <div className="desc">Revokes the URL permanently</div>
+              <div className="setting-row">
+                <div className="info">
+                  <div className="name">Password protection</div>
+                  <div className="desc">{share.hasPassword ? 'Visitors must enter a password' : 'Anyone with the link can open it'}</div>
+                </div>
+                <button className="btn secondary" onClick={password}>
+                  {share.hasPassword ? 'Change…' : 'Set password…'}
+                </button>
               </div>
-              <button className="btn danger" onClick={remove}>Delete</button>
-            </div>
-          </>
-        )}
+
+              <div className="setting-row">
+                <div className="info">
+                  <div className="name">Delete link</div>
+                  <div className="desc">Revokes the URL permanently</div>
+                </div>
+                <button className="btn danger" onClick={remove}>Delete</button>
+              </div>
+            </>
+          )}
+        </div>
 
         <div className="share-dialog-foot">
           <button className="btn secondary" onClick={close}>Done</button>

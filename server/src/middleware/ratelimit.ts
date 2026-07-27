@@ -1,6 +1,11 @@
 import { createHash } from 'node:crypto';
 import type { Request, RequestHandler } from 'express';
 import { config } from '../config.js';
+import {
+  peekSettings,
+  LOGIN_RATE_LIMIT_DEFAULTS,
+  type LoginRateLimit,
+} from '../services/settings.js';
 
 /**
  * In-memory sliding-window throttling. Single-process app (no DB), so a
@@ -31,9 +36,30 @@ import { config } from '../config.js';
  * stores also keep each limiter's key space independently bounded.
  */
 
-/** Login guard: 10 attempts per 15 minutes. */
-const LOGIN_WINDOW_MS = 15 * 60 * 1000;
-const LOGIN_MAX_ATTEMPTS = 10;
+/**
+ * The login throttle as the operator has configured it, or the shipped defaults.
+ *
+ * Read fresh on EVERY resolution rather than captured once, which is what makes a
+ * settings change take effect without a process restart. `peekSettings()` returns
+ * the live cache and `updateSettings()` replaces that cache wholesale, so holding
+ * onto the object would pin the limiter to whatever was configured at boot: a
+ * setting that silently needs a restart is exactly the failure this repo keeps
+ * calling out, and it is worse here than elsewhere because the symptom (the old
+ * limit still applying) is indistinguishable from the new limit simply not being
+ * reached yet.
+ *
+ * Falling back to LOGIN_RATE_LIMIT_DEFAULTS covers one real window and one
+ * impossible one. The real one is a login that arrives before the first
+ * `loadSettings()` has resolved, where the cache is still null: server/src/index.ts
+ * loads settings during boot so this is measured in milliseconds, but "the first
+ * request after a restart is unthrottled" is not a thing to leave to timing. The
+ * impossible one is a cache holding an `auth.rateLimit` that is not there at all,
+ * which the schema's `.default({})` rules out; the `??` costs nothing and means
+ * this function has no way to return undefined.
+ */
+export function loginRateLimitSettings(): LoginRateLimit {
+  return peekSettings()?.auth.rateLimit ?? LOGIN_RATE_LIMIT_DEFAULTS;
+}
 
 /**
  * Hard cap on distinct keys tracked by a single store. A store's memory is
@@ -285,7 +311,44 @@ interface WindowStore {
   maybeSweep(now: number): void;
 }
 
-function createWindowStore(windowMs: number): WindowStore {
+/**
+ * Build a store whose window length is resolved per call.
+ *
+ * `getWindowMs` rather than a number, so that an operator changing
+ * `auth.rateLimit` takes effect on the next request instead of the next restart.
+ * The STORE ITSELF is built once and never rebuilt, and that distinction is the
+ * whole design: the Map holds the hit history, so discarding it on a settings
+ * change (or, worse, per request) would hand every key a clean slate and leave
+ * the limiter counting nothing at all. Only the cutoff arithmetic moves.
+ *
+ * WHAT HAPPENS TO THE EXISTING BUCKETS WHEN THE WINDOW CHANGES, stated in full
+ * because it is the question a reader will have and the answer is not symmetric:
+ *
+ *  - SHORTENED. The next `live()` on a key immediately drops every timestamp
+ *    older than the new, nearer cutoff, so a key part-way through a lockout is
+ *    released early: on its own next touch, or at the next `sweep()` for a key
+ *    nobody touches again. The sweep cadence follows the new window too, so
+ *    idle keys are reclaimed sooner rather than lingering on the old schedule.
+ *  - LENGTHENED. Timestamps that were already pruned are gone: pruning is
+ *    destructive (both `live()` and `sweep()` rewrite `bucket.hits`), so a longer
+ *    window cannot resurrect attempts the store has forgotten. Timestamps still
+ *    held are simply held longer, so a client currently mid-lockout stays locked
+ *    for the remainder of the NEW window measured from its own oldest surviving
+ *    hit, which can be longer than it was promised by the Retry-After it already
+ *    received.
+ *
+ * Both directions therefore take effect from the next request onward and neither
+ * invents history. That is the safe asymmetry to have: the lengthening case can
+ * hold someone slightly longer than they were told, which is a throttle being a
+ * throttle, while the shortening case releases immediately, which is what an
+ * operator digging themselves out of a too-tight setting needs it to do.
+ *
+ * `record()` still cannot push a bucket past the `max` in force at the moment it
+ * runs, so the memory bound at the top of this file holds. A `max` that SHRINKS
+ * can leave a bucket temporarily longer than the new cap, which only makes that
+ * key refuse sooner and drains as its timestamps expire.
+ */
+function createWindowStore(getWindowMs: () => number): WindowStore {
   /** key -> bucket. */
   const buckets = new Map<string, Bucket>();
   let lastSweep = Date.now();
@@ -298,7 +361,7 @@ function createWindowStore(windowMs: number): WindowStore {
    * entries that the per-request path re-scans every time.
    */
   function sweep(now: number): void {
-    const cutoff = now - windowMs;
+    const cutoff = now - getWindowMs();
     for (const [key, bucket] of buckets) {
       const live = dropExpired(bucket.hits, cutoff);
       // An empty bucket carries no lockout, so dropping it loses nothing, and
@@ -344,7 +407,7 @@ function createWindowStore(windowMs: number): WindowStore {
     live(key, now) {
       const bucket = buckets.get(key);
       if (!bucket) return NO_HITS;
-      const hits = dropExpired(bucket.hits, now - windowMs);
+      const hits = dropExpired(bucket.hits, now - getWindowMs());
       if (hits.length === 0) {
         buckets.delete(key);
         return NO_HITS;
@@ -379,7 +442,7 @@ function createWindowStore(windowMs: number): WindowStore {
       // while requests are arriving. The size trigger is safe to leave hot
       // because sweep() evicts down to EVICT_DOWN_TO_KEYS, so it cannot re-fire
       // until ~1,000 further distinct keys arrive.
-      if (buckets.size > MAX_TRACKED_KEYS || now - lastSweep >= windowMs) {
+      if (buckets.size > MAX_TRACKED_KEYS || now - lastSweep >= getWindowMs()) {
         lastSweep = now;
         sweep(now);
       }
@@ -397,9 +460,11 @@ function createWindowStore(windowMs: number): WindowStore {
  * expired and the limiter never fires again while still looking installed.
  * Silently correcting either one would hide an operator error behind a limiter
  * that no longer does its job; a startup crash naming the bad value is loud and
- * fixable. All current call sites pass literals, so this can only fire for a
- * future caller that wires a user-editable value (settings.api.rateLimitPerMin
- * is the obvious candidate) into it, which is exactly when the guard is needed.
+ * fixable. Most call sites pass literals; the login limiters now pass resolvers
+ * over `settings.auth.rateLimit`, which is exactly the "user-editable value wired
+ * into a limiter" case this guard was written in anticipation of, and is why
+ * `createLiveWindow` below re-applies the same two predicates on every read
+ * rather than trusting the one check at construction.
  */
 function validateWindow(label: string, windowMs: number, max: number, minMax: number): void {
   if (!Number.isSafeInteger(windowMs) || windowMs <= 0) {
@@ -410,11 +475,114 @@ function validateWindow(label: string, windowMs: number, max: number, minMax: nu
   }
 }
 
+/**
+ * A limiter bound: a fixed number, or a function called once per use.
+ *
+ * The function form is what makes a limit operator-configurable without a
+ * restart. It must be cheap and synchronous, because it runs on the request path
+ * inside a `RequestHandler` that cannot await; `loginRateLimitSettings()` above is
+ * a Map-free property read off the settings cache.
+ */
+export type LimiterBound = number | (() => number);
+
+/** The two bounds of a limiter, re-resolved and re-validated per use. */
+interface LiveWindow {
+  /** Window length in ms for THIS call. Always a positive safe integer. */
+  windowMs(): number;
+  /** Cap for THIS call. Always a safe integer >= the layer's minimum. */
+  max(): number;
+}
+
+/**
+ * Wrap a limiter's two bounds so they can move at runtime while keeping every
+ * guarantee `validateWindow` gives a limiter built from literals.
+ *
+ * TWO TIERS, and the split is deliberate.
+ *
+ * At CONSTRUCTION the bounds are resolved once and `validateWindow` runs on the
+ * result, throwing exactly as before. That preserves the loud startup crash for
+ * every existing call site (all of which pass literals, so nothing about their
+ * behaviour changes) and it means a resolver that is broken from the very first
+ * read takes the process down at boot with a message naming the value, rather
+ * than at 3am on a login attempt.
+ *
+ * At USE the bounds are resolved again and the SAME two predicates are re-applied
+ * non-fatally, falling back to the pair validated at construction. Throwing here
+ * would be the wrong answer, and this is the one place in this file where a throw
+ * is worse than a heal: the exception would escape from a synchronous
+ * `RequestHandler` mounted in front of `POST /auth/login`, so an unusable settings
+ * value would turn every login into a 500. That is the same total lockout the
+ * floors in services/settings.ts exist to prevent, arrived at through a different
+ * door. A limiter that keeps enforcing the last known-good numbers is strictly
+ * better than a login endpoint that answers nothing at all.
+ *
+ * This is belt and braces rather than the control: `auth.rateLimit` is bounded by
+ * the zod schema (which heals) and by routes/settings.ts (which answers 400), so
+ * a resolver reading it cannot legitimately produce a bad number. The guard is
+ * here because "cannot happen" is a claim about code in three other files, and
+ * the cost of being wrong about it is the login door.
+ *
+ * The warning latches after the first occurrence. Unthrottled logging on this
+ * path would be a log flood an unauthenticated client controls, which is the
+ * cheap denial of service the store's own memory bounds are written to avoid; one
+ * line naming the label and the value is enough to diagnose it, and the condition
+ * is a persistent configuration state rather than a transient event.
+ */
+function createLiveWindow(
+  label: string,
+  windowMs: LimiterBound,
+  max: LimiterBound,
+  minMax: number,
+): LiveWindow {
+  const resolveWindowMs = typeof windowMs === 'function' ? windowMs : () => windowMs;
+  const resolveMax = typeof max === 'function' ? max : () => max;
+
+  const bootWindowMs = resolveWindowMs();
+  const bootMax = resolveMax();
+  validateWindow(label, bootWindowMs, bootMax, minMax);
+
+  let warned = false;
+  function heal(what: string, bad: number, fallback: number): number {
+    if (!warned) {
+      warned = true;
+      console.warn(
+        `[ratelimit] ${label}: refusing a resolved ${what} of ${String(bad)}; falling back to ` +
+          `${fallback}. Further occurrences are not logged.`,
+      );
+    }
+    return fallback;
+  }
+
+  return {
+    windowMs() {
+      const value = resolveWindowMs();
+      // NaN is the dangerous one and the reason this is not a `< 1` test: it
+      // makes `cutoff` NaN, every comparison false, every timestamp read as
+      // expired, and the limiter never fires again while still looking installed.
+      if (!Number.isSafeInteger(value) || value <= 0) return heal('windowMs', value, bootWindowMs);
+      return value;
+    },
+    max() {
+      const value = resolveMax();
+      // Below the layer's minimum, `hits.length >= max` is true on the first
+      // request and the surface is locked out entirely, operator included.
+      if (!Number.isSafeInteger(value) || value < minMax) return heal('max', value, bootMax);
+      return value;
+    },
+  };
+}
+
 export interface RateLimiterOptions {
-  /** Sliding window length in milliseconds. Must be a positive integer. */
-  windowMs: number;
-  /** Maximum allowed requests per key per window. Must be a non-negative integer (0 blocks everything). */
-  max: number;
+  /**
+   * Sliding window length in milliseconds, or a function returning one. Must
+   * resolve to a positive integer.
+   */
+  windowMs: LimiterBound;
+  /**
+   * Maximum allowed requests per key per window, or a function returning one.
+   * Must resolve to a non-negative integer (0 blocks everything).
+   */
+  max: LimiterBound;
   /**
    * Bucket key. Defaults to the network-identity rule (see `clientIp`).
    *
@@ -438,10 +606,10 @@ export interface RateLimiterOptions {
  * (see `ThrottleKeySource`).
  */
 export function createRateLimiter(opts: RateLimiterOptions): RequestHandler {
-  const { windowMs, max, keyFn = clientIp, message = 'Too many requests. Try again later.' } = opts;
+  const { keyFn = clientIp, message = 'Too many requests. Try again later.' } = opts;
 
   // `max: 0` stays legal here as a documented kill switch for a surface.
-  validateWindow('createRateLimiter', windowMs, max, 0);
+  const bounds = createLiveWindow('createRateLimiter', opts.windowMs, opts.max, 0);
   if (typeof keyFn !== 'function') {
     throw new TypeError('createRateLimiter: keyFn must be a function');
   }
@@ -449,10 +617,17 @@ export function createRateLimiter(opts: RateLimiterOptions): RequestHandler {
     throw new TypeError('createRateLimiter: message must be a non-empty string');
   }
 
-  const store = createWindowStore(windowMs);
+  const store = createWindowStore(bounds.windowMs);
 
   return function rateLimit(req, res, next): void {
     const now = Date.now();
+    // Resolved once for the whole request so the cutoff the store applies, the
+    // cap compared against and the Retry-After reported are provably the same
+    // numbers. Nothing can change them mid-handler in any case (this body is
+    // synchronous and updateSettings only swaps the cache from an async
+    // continuation), but reading them once says so rather than relying on it.
+    const windowMs = bounds.windowMs();
+    const max = bounds.max();
     const key = boundKey(keyFn(req));
     const hits = store.live(key, now);
 
@@ -480,10 +655,16 @@ export function createRateLimiter(opts: RateLimiterOptions): RequestHandler {
 }
 
 export interface FailureLimiterOptions {
-  /** Sliding window length in milliseconds. Must be a positive integer. */
-  windowMs: number;
-  /** Failures tolerated per identity per window. Must be an integer >= 1. */
-  max: number;
+  /**
+   * Sliding window length in milliseconds, or a function returning one. Must
+   * resolve to a positive integer.
+   */
+  windowMs: LimiterBound;
+  /**
+   * Failures tolerated per identity per window, or a function returning one.
+   * Must resolve to an integer >= 1.
+   */
+  max: LimiterBound;
   /**
    * Optional convenience mapping from a request to the identity key, used by
    * `keyFor`. Defaults to `clientIp`, which degrades this back to network
@@ -548,25 +729,33 @@ export interface FailureLimiter {
  * into a place that cannot make it.
  */
 export function createFailureLimiter(opts: FailureLimiterOptions): FailureLimiter {
-  const { windowMs, max, keyFn = clientIp } = opts;
+  const { keyFn = clientIp } = opts;
 
   // `max: 0` is rejected here, unlike in Layer 1. There it is a useful kill
   // switch for a whole surface; here it would mean "every identity is locked
   // out permanently and no success can clear it", which is a footgun with no
   // legitimate use: disabling a surface is Layer 1's job.
-  validateWindow('createFailureLimiter', windowMs, max, 1);
+  const bounds = createLiveWindow('createFailureLimiter', opts.windowMs, opts.max, 1);
   if (typeof keyFn !== 'function') {
     throw new TypeError('createFailureLimiter: keyFn must be a function');
   }
 
-  const store = createWindowStore(windowMs);
+  const store = createWindowStore(bounds.windowMs);
 
+  // Every method below resolves `max` for itself rather than closing over one
+  // value, for the same reason the store resolves its window per call: the
+  // caller drives this across several turns (check, then the credential work,
+  // then reset or recordFailure) and an operator can change the setting between
+  // them. Each turn asking independently means the worst a mid-sequence change
+  // can do is decide one turn under the old number and the next under the new
+  // one, which is exactly what "takes effect immediately" means; caching it in
+  // the closure instead would freeze the value at process start.
   return {
     keyFor(req) {
       return keyFn(req);
     },
     check(key) {
-      return store.live(boundKey(key), Date.now()).length < max;
+      return store.live(boundKey(key), Date.now()).length < bounds.max();
     },
     recordFailure(key) {
       const now = Date.now();
@@ -574,7 +763,7 @@ export function createFailureLimiter(opts: FailureLimiterOptions): FailureLimite
       const hits = store.live(bounded, now);
       // Already locked: refuse without recording, so the attacker cannot extend
       // someone else's lockout by continuing to guess. See the note above.
-      if (hits.length >= max) return;
+      if (hits.length >= bounds.max()) return;
       store.record(bounded, now);
       store.maybeSweep(now);
     },
@@ -584,17 +773,27 @@ export function createFailureLimiter(opts: FailureLimiterOptions): FailureLimite
     retryAfterSeconds(key) {
       const now = Date.now();
       const hits = store.live(boundKey(key), now);
-      if (hits.length < max) return 0;
+      if (hits.length < bounds.max()) return 0;
       // hits[0] is inside the window by construction, so this is always >= 1.
-      return Math.ceil((hits[0] + windowMs - now) / 1000);
+      return Math.ceil((hits[0] + bounds.windowMs() - now) / 1000);
     },
   };
 }
 
 /**
- * Brute-force guard for `POST /auth/login`: 10 attempts per 15 minutes per
- * network key. Behaviour and response shape are unchanged from the original
- * dedicated implementation.
+ * Brute-force guard for `POST /auth/login`, defaulting to 10 attempts per 15
+ * minutes per network key. Behaviour and response shape are unchanged from the
+ * original dedicated implementation.
+ *
+ * The two numbers are now operator configuration (`auth.rateLimit` in
+ * services/settings.ts) rather than literals, because the shipped pair is
+ * sensible and still wrong for somebody: a single-user instance behind a VPN
+ * wants them loose, a public instance wants them tight, and an operator running
+ * an automated client can exhaust this layer with no recourse short of editing
+ * the source. They are passed as RESOLVERS, not as values read once, so a save
+ * takes effect on the next request rather than at the next restart; the store
+ * behind them is built once and survives the change, so the limiter keeps
+ * counting across it. See `createLiveWindow` and `createWindowStore` above.
  *
  * This is Layer 1 only, and on its own it is coarse: under the default
  * `trust proxy` it is one bucket for the whole instance. The route should pair
@@ -605,7 +804,7 @@ export function createFailureLimiter(opts: FailureLimiterOptions): FailureLimite
  * exists.
  */
 export const loginRateLimit: RequestHandler = createRateLimiter({
-  windowMs: LOGIN_WINDOW_MS,
-  max: LOGIN_MAX_ATTEMPTS,
+  windowMs: () => loginRateLimitSettings().loginWindowSec * 1000,
+  max: () => loginRateLimitSettings().loginMaxAttempts,
   message: 'Too many login attempts. Try again later.',
 });

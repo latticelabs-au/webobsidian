@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { useStore } from '../lib/store';
+import { useEscapeToClose } from '../lib/useEscapeToClose';
 import { api, type GitCommit } from '../lib/api';
 import Icon from './Icon';
 
@@ -42,6 +43,23 @@ export default function VersionHistory() {
       .catch(() => setPreview('(could not load this version)'));
   }, [path, selected]);
 
+  /*
+   * Escape closes, the keyboard half of the mobile dead-end fix. The narrow
+   * screen media query promotes .version-history to `position: fixed; inset: 0`,
+   * which covers the .modal-bg backdrop completely, so the click-outside
+   * dismissal every other dialog leans on simply does not exist on a phone.
+   * Touch is already covered here, unlike Settings was: both the header ✕ and
+   * the footer "Close" sit in non-scrolling flex children of the modal
+   * (.vh-body is the only `flex: 1` child and owns all the scrolling), so
+   * neither control can be scrolled out of reach at any viewport height. No
+   * third close control is added for that reason. What was missing was Escape,
+   * which Settings, the command palette and the context menu all honour.
+   *
+   * Via the shared hook rather than a local window listener, so that Escape
+   * dismisses only the topmost dialog. See lib/useEscapeToClose.ts.
+   */
+  useEscapeToClose(Boolean(path), () => close(null));
+
   if (!path) return null;
 
   const restore = async () => {
@@ -69,7 +87,12 @@ export default function VersionHistory() {
           <Icon name="clock" size={16} />
           <div className="vh-title">Version history</div>
           <div className="vh-path">{path}</div>
-          <button className="tool-btn" title="Close" onClick={() => close(null)}>
+          <button
+            className="tool-btn"
+            onClick={() => close(null)}
+            aria-label="Close version history"
+            title="Close version history (Esc)"
+          >
             <Icon name="x" size={16} />
           </button>
         </div>

@@ -11,7 +11,12 @@ import {
   MIN_PASSWORD_LEN,
   type OwnerSession,
 } from '../services/auth.js';
-import { loginRateLimit, createFailureLimiter, createRateLimiter } from '../middleware/ratelimit.js';
+import {
+  loginRateLimit,
+  loginRateLimitSettings,
+  createFailureLimiter,
+  createRateLimiter,
+} from '../middleware/ratelimit.js';
 import {
   buildAuthorizationUrl,
   handleCallback,
@@ -45,10 +50,25 @@ export const authRouter = Router();
  * attacker can still accumulate failures against it. What it guarantees is that the
  * owner's own correct password is never rejected on account of someone else's failures,
  * which is precisely the availability property Layer 1 gave up.
+ *
+ * The budget defaults to the 25 failures per 15 minutes that used to be literals here
+ * and is now `auth.rateLimit.loginFailure*` in services/settings.ts, for the same reason
+ * Layer 1's numbers moved: the shipped pair is right for most deployments and is still a
+ * dead end for the ones it is wrong for. It is deliberately LOOSER than Layer 1's default
+ * because the two layers meter different things. Layer 1 charges every attempt and, under
+ * the shipped `trust proxy`, charges them all to one shared bucket; Layer 2 charges only
+ * this account's own failures. An operator retuning them should keep that relationship in
+ * mind rather than setting them to the same number by symmetry.
+ *
+ * Passed as resolvers rather than values so a change applies without a restart. The store
+ * is built once inside createFailureLimiter and is NOT rebuilt when the numbers move, so
+ * an accumulated lockout survives the edit instead of being handed a clean slate; see the
+ * note on createWindowStore for exactly what a window change does to the buckets already
+ * in flight.
  */
 const loginFailureLimit = createFailureLimiter({
-  windowMs: 15 * 60 * 1000,
-  max: 25,
+  windowMs: () => loginRateLimitSettings().loginFailureWindowSec * 1000,
+  max: () => loginRateLimitSettings().loginFailureMaxAttempts,
   keyFn: () => 'owner',
 });
 

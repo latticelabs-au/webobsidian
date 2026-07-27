@@ -670,6 +670,313 @@ const OidcBlockSchema = z.object({
   allowPasswordLogin: z.boolean().default(true).catch(true),
 });
 
+/** ---- The login throttle, as operator configuration ---------------------- */
+
+/**
+ * The four numbers behind `POST /auth/login`, in the units an operator thinks in.
+ *
+ * `loginWindowSec` / `loginMaxAttempts` drive Layer 1, the NETWORK-keyed limiter
+ * that charges every attempt. `loginFailureWindowSec` /
+ * `loginFailureMaxAttempts` drive Layer 2, the IDENTITY-keyed limiter that
+ * charges only failures and is cleared by a success. See the header of
+ * middleware/ratelimit.ts for why there are two layers rather than one.
+ */
+export interface LoginRateLimit {
+  loginWindowSec: number;
+  loginMaxAttempts: number;
+  loginFailureWindowSec: number;
+  loginFailureMaxAttempts: number;
+}
+
+/**
+ * Exactly the values that were hardcoded in middleware/ratelimit.ts and
+ * routes/auth.ts before this block existed, so an install that has never touched
+ * the setting behaves identically to one running the previous build.
+ *
+ * Exported because middleware/ratelimit.ts needs them as the answer for the
+ * window in which the settings file has not been read yet (a login arriving
+ * before the first `loadSettings()` resolves) and as the known-good fallback if a
+ * resolved value is ever unusable. One definition, so the "no existing deployment
+ * changes behaviour" claim is checkable rather than asserted in two places.
+ */
+export const LOGIN_RATE_LIMIT_DEFAULTS: LoginRateLimit = {
+  loginWindowSec: 900,
+  loginMaxAttempts: 10,
+  loginFailureWindowSec: 900,
+  loginFailureMaxAttempts: 25,
+};
+
+/**
+ * The floor on both attempt counts, and the single most important number in this
+ * block. Read the whole note before changing it.
+ *
+ * A limit of 0 or a negative number does NOT mean "unlimited". Both limiters test
+ * `hits.length >= max`, and an empty array satisfies that on the very first
+ * request when `max <= 0`, so the login endpoint answers 429 to everybody,
+ * permanently, from the moment the value is saved. That includes the operator who
+ * has to fix it, and the fix lives behind the door that is now locked: the
+ * settings API is mounted behind `requireAuth`, so there is no way back in
+ * through the product. The only remedies left are hand-editing settings.json
+ * (which needs filesystem access to a machine the operator may only reach through
+ * this app) or the WEBOBSIDIAN_PASSWORD recovery override, which does not help
+ * because the throttle runs BEFORE any credential is checked. Neither of those is
+ * a recovery path for the people most likely to hit this.
+ *
+ * So the value is refused rather than healed on the way in (routes/settings.ts
+ * answers 400) and healed loudly rather than honoured on the way up from disk
+ * (the `.catch()` below). Silently correcting an API request would be the worse
+ * half of that pair: a security parameter that reads back as something other than
+ * what was submitted means the operator believes the door is tighter or looser
+ * than it is, which is the same failure mode already documented on `oidc.pkce`.
+ *
+ * WHY 3 AND NOT 1. A floor of 1 is enough to make "permanently locked out" false
+ * and not enough to make "can actually get back in" true. The recovery sequence
+ * an operator has to be able to complete is at minimum one attempt that may fail
+ * because they mistyped, then one that succeeds. On top of that, under the
+ * shipped `trust proxy` default every client behind a reverse proxy shares ONE
+ * Layer 1 bucket (see ThrottleKeySource in middleware/ratelimit.ts), so a second
+ * browser tab, a phone left on the login screen, or the Electron shell's
+ * automatic WEBOBSIDIAN_PASSWORD login can consume an attempt before the operator
+ * reaches the form. Three is the smallest number that survives all three of those
+ * at once. It is a floor, not a guarantee: an operator who sets 3 on a busy
+ * shared-bucket instance can still meet a 429. What the floor guarantees is that
+ * no saved value is self-evidently unusable, which is the only thing a bound can
+ * honestly promise.
+ *
+ * The same floor applies to Layer 2 for a different reason with the same shape:
+ * `createFailureLimiter` already refuses `max: 0`, but `max: 1` means one
+ * mistyped password locks the owner out for the whole window, and only a SUCCESS
+ * clears the counter, which is precisely what they can no longer do.
+ */
+const MIN_LOGIN_ATTEMPTS = 3;
+
+/**
+ * The ceiling on both attempt counts, and yes, an upper bound is needed. The
+ * argument is different from the floor's and weaker, so it is stated rather than
+ * assumed.
+ *
+ * A very large `max` cannot lock anybody out: it weakens the throttle towards
+ * "off", which is a choice an operator is entitled to make (a single-user
+ * instance on a VPN is the motivating case for this whole block). On its own that
+ * would be an argument for no ceiling at all.
+ *
+ * What makes one necessary is the memory bound middleware/ratelimit.ts publishes
+ * at the top of the file: a store costs `MAX_TRACKED_KEYS * (max timestamps +
+ * MAX_KEY_LENGTH characters)`, and that sentence is only true while `max` is
+ * bounded. `record()` appends to a bucket until it holds `max` timestamps, so an
+ * unbounded `max` makes an unbounded bucket, and the module's stated worst case
+ * ("a few megabytes even for a generous limiter") silently stops holding. An
+ * attacker pays one request per timestamp so this is not a cheap denial of
+ * service, but a settings value that quietly voids a documented invariant is
+ * worth one comparison to close.
+ *
+ * A million is chosen because it is far past any honest deployment (an operator
+ * who wants the limiter effectively disabled gets exactly that at a million) and
+ * because a million 8-byte timestamps in one bucket is single-digit megabytes,
+ * which keeps the published bound in the same order of magnitude it claims.
+ */
+const MAX_LOGIN_ATTEMPTS = 1_000_000;
+
+/**
+ * Bounds on both window lengths. The hazard here points the OPPOSITE way from the
+ * attempt counts, which is why the floor is only the mechanical one.
+ *
+ * A window that is too SHORT does not lock anyone out, it weakens the throttle:
+ * at one second an attacker simply paces their guessing. That is an operator's
+ * decision to make badly, and refusing it would be paternalism. The floor of 1 is
+ * therefore arithmetic rather than policy: `validateWindow` requires a positive
+ * safe integer of MILLISECONDS, and seconds are multiplied by 1000, so anything
+ * below 1 second is either 0 (which throws at construction) or fractional (which
+ * `.int()` refuses anyway).
+ *
+ * A window that is too LONG is a lockout, and that is what the ceiling is for.
+ * The sliding window releases a timestamp only once `windowMs` has passed, so a
+ * window of a year is not a throttle, it is a ban: `loginMaxAttempts` attempts
+ * ever, and on Layer 1 those are ATTEMPTS rather than failures, so a successful
+ * login costs one too and the instance simply stops accepting logins. 24 hours is
+ * the point past which "come back later" stops being a throttle and starts being
+ * an outage.
+ *
+ * The ceiling is also load-bearing arithmetic. `validateWindow` requires
+ * `Number.isSafeInteger(windowMs)`, and a resolver that multiplies seconds by
+ * 1000 would blow past 2^53 for an absurd input; at 86400 the product is 86.4
+ * million, five orders of magnitude inside the safe range, so the conversion can
+ * never be the thing that breaks.
+ */
+const MIN_LOGIN_WINDOW_SEC = 1;
+/**
+ * One hour, not one day, and the earlier 86400 was a lockout dressed as a cap.
+ *
+ * THE WINDOW IS THE LOCKOUT DURATION. That is the whole argument. Once a bucket
+ * is full the sliding window does not release until the oldest hit ages out, so
+ * whatever this number is, it is the longest a legitimate operator can be shut
+ * out of their own vault. "24 hours is the point past which a throttle becomes
+ * an outage" was the wrong way round: at 24 hours it IS the outage.
+ *
+ * Two configurations, both accepted with a 200 before this was lowered, both
+ * reproduced by execution:
+ *
+ *  - Layer 2 at 86400s / 3 attempts. That layer is keyed `() => 'owner'`, one
+ *    global bucket, checked BEFORE authenticatePassword. Three unauthenticated
+ *    wrong-password POSTs locked the owner out for 24 hours, the recovery
+ *    password included, and any stranger could renew it indefinitely for three
+ *    requests a day.
+ *  - Layer 1 at 86400s / 3 attempts. That layer charges EVERY attempt including
+ *    successful ones, and under the shipped `trust proxy` default it is one
+ *    bucket for the instance. Two browser tabs plus the Electron shell's
+ *    automatic login is three sign-ins, and the instance then refused every
+ *    login for a day.
+ *
+ * An hour is still long enough to be a serious throttle and short enough that
+ * waiting it out is a recovery rather than an incident.
+ */
+const MAX_LOGIN_WINDOW_SEC = 3_600;
+
+/**
+ * The joint constraint, and the reason a per-field floor was not enough.
+ *
+ * Each field was validated on its own, and the quantity that actually decides
+ * whether a configuration is usable is the PAIR: seconds of window divided by
+ * attempts allowed is how long a user waits per attempt they are permitted. A
+ * legal floor on the count and a legal ceiling on the window multiplied into an
+ * illegal combination, which is how both lockouts above passed validation.
+ *
+ * Five minutes per attempt is the loosest that still leaves a locked-out
+ * operator a way back in within a coffee break. It makes the shipped defaults
+ * (900s / 10 and 900s / 25) comfortably legal, since both need only 3, and it
+ * refuses 3600s / 3 by requiring 12.
+ */
+const MAX_SECONDS_PER_ATTEMPT = 300;
+
+/**
+ * The smallest attempt count that makes `windowSec` a throttle rather than a
+ * lockout. Never below MIN_LOGIN_ATTEMPTS, so the floor still applies.
+ */
+export function minAttemptsForWindow(windowSec: number): number {
+  return Math.max(MIN_LOGIN_ATTEMPTS, Math.ceil(windowSec / MAX_SECONDS_PER_ATTEMPT));
+}
+
+/**
+ * The bounds, exported as data so routes/settings.ts refuses exactly what this
+ * schema heals and the web UI can say the same numbers back to the operator.
+ *
+ * Three doors have to agree on these: the API (a loud 400), this schema (a loud
+ * heal, for a file that arrived by hand edit or restored backup) and the panel in
+ * web/src/components/Settings.tsx. Two of them import this constant; the third
+ * cannot, because no module is shared across the server/web workspace boundary,
+ * and it carries a copy with a note saying so.
+ */
+export const LOGIN_RATE_LIMIT_BOUNDS = {
+  minWindowSec: MIN_LOGIN_WINDOW_SEC,
+  maxWindowSec: MAX_LOGIN_WINDOW_SEC,
+  minAttempts: MIN_LOGIN_ATTEMPTS,
+  maxAttempts: MAX_LOGIN_ATTEMPTS,
+} as const;
+
+/**
+ * One bounded integer field of the login throttle, healing loudly rather than
+ * failing the parse.
+ *
+ * `.catch()` rather than a throw for the reason repeated all over this file:
+ * loadSettingsImpl treats ANY parse failure as "file is unusable" and rewrites
+ * from defaults(), so letting one mistyped number throw would answer a
+ * configuration typo by destroying jwtSecret, both password hashes, git.token and
+ * every API key hash. The heal is loud because the alternative is an operator who
+ * tightened their login throttle, was silently given the shipped default back,
+ * and has no way to tell.
+ *
+ * It heals to the DEFAULT rather than clamping to the nearest bound, and that is
+ * deliberate. Clamping invents a number nobody wrote: an operator who typed 0 for
+ * `loginMaxAttempts` would get 3, i.e. the tightest legal throttle, which is much
+ * closer to the lockout they accidentally asked for than to anything they would
+ * have chosen. Falling back to the shipped value is the one answer that is never
+ * a surprise in the dangerous direction.
+ */
+function loginLimitField(field: keyof LoginRateLimit, min: number, max: number) {
+  const fallback = LOGIN_RATE_LIMIT_DEFAULTS[field];
+  return z
+    .number()
+    .int()
+    .min(min)
+    .max(max)
+    .default(fallback)
+    .catch((ctx: { input: unknown }) => {
+      console.warn(
+        `[settings] refusing auth.rateLimit.${field} ${JSON.stringify(ctx.input)}: it must be a whole ` +
+          `number between ${min} and ${max}; using ${fallback} instead. A value below the floor does ` +
+          'not mean "unlimited", it means every login attempt is refused including the operator\'s.',
+      );
+      return fallback;
+    });
+}
+
+/**
+ * The operator-configurable login throttle, as a sub-block of `auth`.
+ *
+ * It lives under `auth` rather than beside it because it configures the password
+ * door and nothing else: `loginRateLimit` is mounted on `POST /auth/login` alone,
+ * and the OIDC endpoints carry their own separate limiters (routes/auth.ts) whose
+ * budget has no per-identity layer to pair with and is therefore deliberately not
+ * exposed here.
+ *
+ * Note the consequence for redactSettings(): the `auth` branch there is built by
+ * ENUMERATING the fields it wants rather than by spreading `s.auth`, precisely
+ * because the rest of that block is credential material. A field added here is
+ * invisible to every client until it is named there too, which is a fourth way
+ * for the four-file settings contract to half-land.
+ */
+const AuthRateLimitSchema = z.object({
+  loginWindowSec: loginLimitField('loginWindowSec', MIN_LOGIN_WINDOW_SEC, MAX_LOGIN_WINDOW_SEC),
+  loginMaxAttempts: loginLimitField('loginMaxAttempts', MIN_LOGIN_ATTEMPTS, MAX_LOGIN_ATTEMPTS),
+  loginFailureWindowSec: loginLimitField(
+    'loginFailureWindowSec',
+    MIN_LOGIN_WINDOW_SEC,
+    MAX_LOGIN_WINDOW_SEC,
+  ),
+  loginFailureMaxAttempts: loginLimitField(
+    'loginFailureMaxAttempts',
+    MIN_LOGIN_ATTEMPTS,
+    MAX_LOGIN_ATTEMPTS,
+  ),
+})
+  /*
+   * The pair check, applied AFTER the per-field heals so it is judged on the
+   * values that will actually be used rather than on what was written.
+   *
+   * Raising the count rather than shortening the window is the safe direction of
+   * the two. Both make the configuration legal; only one of them does it without
+   * weakening the throttle the operator asked for. Shortening the window would
+   * silently give an attacker a shorter memory than the operator configured,
+   * which is a security change made on the operator's behalf without saying so.
+   * Raising the count keeps the window intact and only permits more attempts
+   * inside it, which is the availability side, and availability is what the
+   * operator has already lost if this rule is firing at all.
+   *
+   * Loud, because a healed value that nobody sees is how the 24-hour lockout got
+   * shipped. The API refuses the same combination outright with a 400: see
+   * sanitizeAuth in routes/settings.ts.
+   */
+  .transform((r) => {
+    const heal = (windowSec: number, attempts: number, field: string): number => {
+      const floor = minAttemptsForWindow(windowSec);
+      if (attempts >= floor) return attempts;
+      console.warn(
+        `[settings] auth.rateLimit.${field} of ${attempts} over a ${windowSec}s window is a lockout, ` +
+          `not a throttle: it permits one attempt per ${Math.round(windowSec / attempts)}s. Raising it to ${floor}.`,
+      );
+      return floor;
+    };
+    return {
+      ...r,
+      loginMaxAttempts: heal(r.loginWindowSec, r.loginMaxAttempts, 'loginMaxAttempts'),
+      loginFailureMaxAttempts: heal(
+        r.loginFailureWindowSec,
+        r.loginFailureMaxAttempts,
+        'loginFailureMaxAttempts',
+      ),
+    };
+  });
+
 const SettingsBaseSchema = z.object({
   /**
    * Schema version of the file on disk. Two separate behaviours, and they need
@@ -701,6 +1008,34 @@ const SettingsBaseSchema = z.object({
       // this file by hand). Empty = none.
       passwordHash: z.string().default(''),
       jwtSecret: z.string().default(''),
+      // The ONLY non-credential field in this block, and the only one the
+      // settings API may write. See AuthRateLimitSchema above, sanitizeAuth in
+      // routes/settings.ts, and the enumerated `auth` branch of redactSettings().
+      // `.catch()` on the OBJECT, not only on the scalars inside it, and that
+      // distinction is the difference between a healed field and a wiped vault.
+      //
+      // `.default({})` fires on `undefined` and on nothing else. Every scalar
+      // below it already heals, but a `rateLimit` that is null, a number, a
+      // string or an array never reaches those scalars: the object parse fails,
+      // the failure propagates to SettingsSchema.parse, and loadSettingsImpl
+      // catches it with a bare `catch { cache = defaults(); await persist(); }`.
+      // That rewrites settings.json from defaults, which ROTATES jwtSecret
+      // (evicting every session), CLEARS userPasswordHash and passwordHash so
+      // the instance falls back to accepting 123456, and destroys git.token and
+      // every API key hash.
+      //
+      // The path there is not exotic, it is the documented one. The lockout
+      // warning on this feature tells an operator to hand-edit this file to
+      // recover, and a hand edit is exactly where `"rateLimit": 10` gets typed
+      // instead of `"rateLimit": {"loginMaxAttempts": 10}`. So the recovery
+      // instructions led to reintroducing the default-password bypass that
+      // fix/default-password-bypass exists to close.
+      rateLimit: AuthRateLimitSchema.default({}).catch((ctx: { input: unknown }) => {
+        console.warn(
+          `[settings] refusing auth.rateLimit ${JSON.stringify(ctx.input)}; it must be an object, using the shipped limits instead`,
+        );
+        return AuthRateLimitSchema.parse({});
+      }),
     })
     .default({}),
   vault: z
@@ -1132,6 +1467,36 @@ export async function getSettings(): Promise<Settings> {
   return cache ?? (await loadSettings());
 }
 
+/**
+ * The settings as they stand RIGHT NOW, or null when the file has not been read
+ * yet. Never triggers a load, never awaits, never persists.
+ *
+ * This exists for exactly one caller shape: code on a synchronous request path
+ * that has to read a setting and cannot become async. middleware/ratelimit.ts is
+ * the case it was added for. A `RequestHandler` that returns void cannot await
+ * `getSettings()` without either buffering the request or turning every limiter
+ * into a promise, and the limiters sit in front of the login endpoint, so making
+ * them async would put a microtask boundary between the throttle check and the
+ * credential check for no benefit.
+ *
+ * Returning null rather than defaults() is the honest answer and the safe one.
+ * defaults() generates a fresh jwtSecret every call, so handing one out here
+ * would let a caller believe it was holding the instance's real configuration
+ * when it is holding a brand-new one; the caller supplies its own fallback
+ * instead and knows that it is a fallback. In practice the window is tiny:
+ * server/src/index.ts loads settings during boot, well before the listener
+ * accepts a connection.
+ *
+ * The returned object is the live cache, not a copy. Callers must treat it as
+ * read-only: every mutation goes through updateSettings(), which replaces the
+ * cache wholesale, so a caller must re-read on each use rather than capturing the
+ * object once, or it will keep serving the configuration that was current when it
+ * started.
+ */
+export function peekSettings(): Settings | null {
+  return cache;
+}
+
 // ---------------------------------------------------------------------------
 // Serialized settings mutation
 //
@@ -1194,6 +1559,23 @@ export function redactSettings(s: Settings) {
       // the UI must stop warning that the instance is on the default password.
       hasCustomPassword: !isDefaultPasswordActive(s.auth),
       hasOverridePassword: Boolean(s.auth.passwordHash),
+      /**
+       * The login throttle, published in full. It holds no secret: four integers
+       * that an unauthenticated attacker can measure from outside anyway by
+       * counting how many attempts it takes to earn a 429 and reading the
+       * Retry-After header the limiter sets. Withholding it would buy nothing and
+       * would cost the settings panel the ability to show what is configured.
+       *
+       * It has to be named EXPLICITLY, and that is the whole reason this comment
+       * exists. Unlike `git`, `livesync` and `oidc`, this branch does not spread
+       * `...s.auth`: the rest of that block is jwtSecret and two password hashes,
+       * so it is built by enumeration and anything not listed here simply does
+       * not reach the client. A new non-secret field under `auth` that stops at
+       * the schema therefore renders as "undefined" in the UI with no error
+       * anywhere, which is the same silent half-landing the PUT allowlist has.
+       * Everything else added under `auth` should be assumed secret and left out.
+       */
+      rateLimit: s.auth.rateLimit,
     },
     git: { ...s.git, token: s.git.token ? REDACTED_SECRET : '' },
     livesync: {
