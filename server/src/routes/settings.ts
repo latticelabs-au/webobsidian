@@ -607,6 +607,15 @@ function sanitizeOidc(v: Record<string, unknown>, current: Settings['oidc']): Oi
   if (v.allowedGroups !== undefined) {
     fields.allowedGroups = requireStringList(v.allowedGroups, 'oidc.allowedGroups');
   }
+  // Lowercased here as well as in the schema so the value that is persisted is
+  // the value that is compared, whichever door it came through. Without it the
+  // API path would store "Ops@Example.com" while a hand-edited file storing the
+  // same address would be folded, and only one of the two would match.
+  if (v.allowedEmails !== undefined) {
+    fields.allowedEmails = requireStringList(v.allowedEmails, 'oidc.allowedEmails').map((e) =>
+      e.toLowerCase(),
+    );
+  }
   // Refused with a 400 rather than filtered, because a rule silently dropped
   // from an authorization allowlist is indistinguishable from one that is in
   // force and simply never matching. The reserved-name check in particular has

@@ -968,6 +968,7 @@ function SsoSettings({ s, reload }: { s: any; reload: () => void }) {
     scopes: (o.scopes ?? ['openid', 'profile', 'email']).join(' '),
     allowedSubjects: (o.allowedSubjects ?? []).join('\n'),
     allowedGroups: (o.allowedGroups ?? []).join('\n'),
+    allowedEmails: (o.allowedEmails ?? []).join('\n'),
     // Defaults TRUE when absent, matching the schema. Reading a missing value as
     // false would render a settings page claiming the password door is shut on
     // an install where it is wide open.
@@ -1037,6 +1038,7 @@ function SsoSettings({ s, reload }: { s: any; reload: () => void }) {
     const scopes = cfg.scopes.split(/\s+/).filter(Boolean);
     const allowedSubjects = splitLines(cfg.allowedSubjects);
     const allowedGroups = splitLines(cfg.allowedGroups);
+    const allowedEmails = splitLines(cfg.allowedEmails).map((e) => e.toLowerCase());
 
     // Everything from here to the request is a user-experience affordance and
     // never the control. `assertUsableOidc` in server/src/routes/settings.ts
@@ -1094,6 +1096,7 @@ function SsoSettings({ s, reload }: { s: any; reload: () => void }) {
       scopes,
       allowedSubjects,
       allowedGroups,
+      allowedEmails,
       allowPasswordLogin: cfg.allowPasswordLogin,
       pkce: cfg.pkce,
       allowedClaims: claimRulesFromText(cfg.allowedClaims),
@@ -1278,6 +1281,25 @@ function SsoSettings({ s, reload }: { s: any; reload: () => void }) {
           style={{ width: 260, resize: 'vertical', fontFamily: 'var(--font-monospace, monospace)' }}
           value={cfg.allowedGroups}
           onChange={(e) => set('allowedGroups', e.target.value)}
+        />
+      </Row>
+      {/*
+        The weakest of the fixed axes, and labelled as such rather than left for
+        the operator to work out. Addresses get recycled when a person leaves,
+        and at a provider that allows self-service address changes they can be
+        claimed outright, so an entry here only matches when the provider says
+        email_verified is true. Prefer groups or subjects where either will do.
+      */}
+      <Row
+        name="Allowed emails"
+        desc="One per line, matched case-insensitively. Only counts when the provider marks the address verified. The weakest axis: addresses get reassigned, subjects never do."
+      >
+        <textarea
+          className="text-input"
+          rows={3}
+          style={{ width: 260, resize: 'vertical', fontFamily: 'var(--font-monospace, monospace)' }}
+          value={cfg.allowedEmails}
+          onChange={(e) => set('allowedEmails', e.target.value)}
         />
       </Row>
       {/*

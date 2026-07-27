@@ -17,3 +17,8 @@ desktop/release/
 # Local agent runbooks/skills: may contain server creds; never commit.
 .claude/skills/
 report.md
+# Playwright: run artefacts and the saved e2e session cookie. The session file
+# is a live owner credential for whatever BASE_URL it was captured against.
+test-results/
+playwright-report/
+e2e/.auth/

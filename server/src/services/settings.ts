@@ -602,6 +602,32 @@ const OidcBlockSchema = z.object({
       return [] as string[];
     }),
   /**
+   * Verified email addresses that may sign in.
+   *
+   * This field was matched on by isAllowed() from the day SSO landed and was
+   * never declared here, so zod's default object behaviour (strip unknown keys)
+   * silently deleted it on the first load and every write after that. The
+   * setting looked configurable, the matcher had a paragraph explaining that an
+   * entry here requires email_verified, and the list it read was permanently
+   * empty. An operator setting only this got a locked instance and a log line
+   * saying their account "matches no allowlist entry", with nothing anywhere
+   * pointing at the real cause.
+   *
+   * Lowercased on the way in because addresses are not case-significant in
+   * practice, matching how the matcher compares them. Subjects deliberately are
+   * not: see the note above.
+   */
+  allowedEmails: z
+    .array(z.string())
+    .default([])
+    .transform((v) => normalizeOidcList(v).map((entry) => entry.toLowerCase()))
+    .catch((ctx: { input: unknown }) => {
+      console.warn(
+        `[settings] refusing oidc.allowedEmails ${JSON.stringify(ctx.input)}; applying no email restriction instead`,
+      );
+      return [] as string[];
+    }),
+  /**
    * Allowlist rules on a claim this app does not know the name of.
    *
    * The four fixed axes cover what OIDC standardises, and standardised claims
