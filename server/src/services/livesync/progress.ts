@@ -167,6 +167,27 @@ export const PROBE_GRACE_MS = 60_000;
  */
 export const WRITE_GRACE_MS = 60_000;
 
+/**
+ * How long the replication checkpoint may sit held behind a change that failed
+ * to apply before the peer says so out loud.
+ *
+ * THE CONDITION THIS TIMES IS NOT A FAULT, IT IS A DEFERRED RETRY, which is why
+ * it gets a window rather than an immediate verdict. A single failed inbound
+ * write holds the checkpoint (see `noteCheckpointHeld`), and the great majority
+ * of those clear themselves: the engine re-arms its own feed ten seconds after an
+ * error, the re-arm resumes from the held checkpoint, and the document is applied
+ * on the second attempt with nobody the wiser. Reporting that as a stall would
+ * turn ordinary self-healing into an alarm.
+ *
+ * What must NOT stay quiet is the other case: a hold that is still standing a
+ * minute later means the failed change is waiting for a replay that is not coming
+ * on its own, and the vault is missing a note that the status API would otherwise
+ * describe as `idle`. The same 60 seconds as `DELIVER_GRACE_MS`, `PROBE_GRACE_MS`
+ * and `WRITE_GRACE_MS`, so this module keeps one notion of how patient to be with
+ * a standing condition instead of four that quietly disagree.
+ */
+export const HELD_GRACE_MS = 60_000;
+
 /** What the inbound direction is doing, as a fixed vocabulary. */
 export type InboundState =
     /** Nothing outstanding and nothing pending on the remote. Genuinely idle. */
@@ -193,6 +214,16 @@ export type InboundState =
      * clears itself the moment one write succeeds.
      */
     | 'unwritable'
+    /**
+     * A remote change failed to apply, so the replication checkpoint is being
+     * held at it, and the hold has outlasted the replays that normally clear it.
+     *
+     * Distinct from `unwritable`, which is the total case (nothing is landing at
+     * all). This is the PARTIAL one: other changes are applying perfectly well
+     * and the vault is nonetheless missing the ones that failed, which is exactly
+     * the combination that used to resolve to `idle` and answer 200.
+     */
+    | 'behind'
     /** The remote has work past the feed's cursor and the feed delivers nothing. */
     | 'undelivered'
     /**
@@ -283,6 +314,18 @@ export interface InboundVerdict extends InboundCounts {
     undecodable: number;
     /** Documents lost between decryption and the vault. */
     unapplied: number;
+    /**
+     * The replication checkpoint is being held behind a change that failed to
+     * apply, so that change is replayed rather than skipped.
+     *
+     * Published as a plain fact rather than only as a `state`, because it is true
+     * for the whole of `HELD_GRACE_MS` before the state says anything, and an
+     * operator reading the status API during that window should be able to see
+     * that the checkpoint is not where the feed is. It is also the one number in
+     * the ledger that explains why a restart is worth doing: the restart is what
+     * performs the replay.
+     */
+    checkpointHeld: boolean;
 }
 
 export interface InboundProgressOptions {
@@ -291,6 +334,7 @@ export interface InboundProgressOptions {
     deliverGraceMs?: number;
     probeGraceMs?: number;
     writeGraceMs?: number;
+    heldGraceMs?: number;
 }
 
 /**
@@ -420,6 +464,7 @@ export class InboundProgress {
     private readonly deliverGraceMs: number;
     private readonly probeGraceMs: number;
     private readonly writeGraceMs: number;
+    private readonly heldGraceMs: number;
 
     private received = 0;
     private delivered = 0;
@@ -461,6 +506,29 @@ export class InboundProgress {
      */
     private failedSince: number | undefined;
 
+    /**
+     * When the replication checkpoint was first held behind a failed change, and
+     * how many changes have failed since.
+     *
+     * ONE TIMESTAMP AND ONE COUNTER IS THE WHOLE OF THE STATE, and that is a
+     * deliberate answer to the obvious alternative. "Everything up to N except 4,
+     * 5 and 6" cannot be expressed by a high-water mark, and the tempting repair
+     * is to keep the exception list and retry its members. That list has no
+     * natural bound (a vault volume that stays full collects one entry per remote
+     * change, indefinitely), it is in memory while the checkpoint is on disk, so a
+     * restart loses precisely the record that says which documents still need
+     * replaying, and CouchDB sequences are opaque strings that cannot be ordered
+     * or reasoned about by arithmetic anyway.
+     *
+     * Holding the checkpoint instead needs neither ordering nor a list: the peer
+     * simply stops advancing it, and every replay from that point re-delivers
+     * every change after it, the failed ones included. The counter below exists
+     * only so the report can say how much is waiting; nothing derives correctness
+     * from it, so it has nothing to overflow.
+     */
+    private checkpointHeldSince: number | undefined;
+    private checkpointHeldCount = 0;
+
     private undeliveredSince: number | undefined;
     /** First unanswered probe since the last answered one. See `noteProbeUnanswerable`. */
     private probeUnansweredSince: number | undefined;
@@ -486,6 +554,7 @@ export class InboundProgress {
         this.deliverGraceMs = opts.deliverGraceMs ?? DELIVER_GRACE_MS;
         this.probeGraceMs = opts.probeGraceMs ?? PROBE_GRACE_MS;
         this.writeGraceMs = opts.writeGraceMs ?? WRITE_GRACE_MS;
+        this.heldGraceMs = opts.heldGraceMs ?? HELD_GRACE_MS;
     }
 
     // --- recording -------------------------------------------------------------
@@ -613,6 +682,48 @@ export class InboundProgress {
     }
 
     /**
+     * The peer has stopped advancing the replication checkpoint because a change
+     * failed to apply.
+     *
+     * SEPARATE FROM `noteFailed()` ON PURPOSE, though the peer calls both from the
+     * same catch. They are different facts with different lifetimes: a failed
+     * write is an event, and the checkpoint being held is a STANDING condition
+     * that outlives it. `noteApplied()` clears the failed-write clock the moment
+     * anything lands, which is right for "is the vault writable", and would be
+     * exactly wrong here: the checkpoint stays held whatever else succeeds,
+     * because the change that failed has still not been applied and later
+     * successes say nothing about it. That difference is the reported defect. The
+     * checkpoint was a single high-water mark, so the next successful apply wrote
+     * its own higher sequence over the failure and the failed sequences were
+     * skipped forever; the ledger meanwhile watched the failed-write clock get
+     * cleared by those very successes and went back to reporting `idle`.
+     *
+     * Opened by the FIRST hold and left alone by later ones, for the same reason
+     * `noteFailed()` gives: restamping per event would measure the time since the
+     * last failure rather than how long the condition has stood, which is the
+     * per-peer restamping bug `PendingClock` exists to remove.
+     */
+    noteCheckpointHeld(): void {
+        this.checkpointHeldCount += 1;
+        if (this.checkpointHeldSince === undefined) this.checkpointHeldSince = Date.now();
+    }
+
+    /**
+     * The checkpoint is free to advance again.
+     *
+     * The peer calls this when it arms the changes feed from the persisted
+     * checkpoint, because that is the one event that makes the hold unnecessary:
+     * the feed replays every sequence after the checkpoint, so the changes that
+     * failed are delivered again and get another attempt. Nothing else clears it,
+     * and in particular a later successful apply does not, since applying a
+     * DIFFERENT document is no evidence about the one still waiting.
+     */
+    noteCheckpointReleased(): void {
+        this.checkpointHeldSince = undefined;
+        this.checkpointHeldCount = 0;
+    }
+
+    /**
      * Adopt persisted evidence that decryption has worked for this configuration
      * against this remote before now.
      *
@@ -721,6 +832,12 @@ export class InboundProgress {
         this.awaitingDecode.clear();
         this.awaitingApply.clear();
         this.failedSince = undefined;
+        // Cleared with the rest: a fresh run arms its feed from the persisted
+        // checkpoint, which is exactly the replay the hold was waiting for, so
+        // carrying the hold across would report a condition the new run has
+        // already acted on.
+        this.checkpointHeldSince = undefined;
+        this.checkpointHeldCount = 0;
         this.undeliveredSince = undefined;
         this.probeUnansweredSince = undefined;
         this.observable = true;
@@ -761,7 +878,7 @@ export class InboundProgress {
         const undecodable = this.undecodableCount();
         const unapplied = this.unappliedCount();
         const now = Date.now();
-        const base = { ...counts, undecodable, unapplied };
+        const base = { ...counts, undecodable, unapplied, checkpointHeld: this.checkpointHeldSince !== undefined };
 
         if (!this.observable) {
             return {
@@ -879,6 +996,47 @@ export class InboundProgress {
             };
         }
 
+        /*
+         * Ordered directly BELOW `unwritable`, because the two are the total and
+         * the partial reading of the same evidence and the total one is both more
+         * specific and differently actionable. A vault that refuses every write
+         * holds the checkpoint too, and reporting the hold there would send an
+         * operator to look at replication over a full disk, and would also claim a
+         * restart was worth doing when `unwritable` has just established that it
+         * is not.
+         *
+         * Everything below this point is about work that is still moving, so this
+         * is also the last of the "something is wrong with what already arrived"
+         * cases.
+         */
+        if (this.checkpointHeldSince !== undefined && now - this.checkpointHeldSince > this.heldGraceMs) {
+            return {
+                ...base,
+                state: 'behind',
+                detail:
+                    `${this.checkpointHeldCount} remote change(s) failed to apply; the replication ` +
+                    'checkpoint is held at the earliest of them so they are replayed rather than skipped',
+                stalled: true,
+                // Not a broken configuration. The changes are still on the remote
+                // and the peer has to be running to replay them.
+                fatal: false,
+                /*
+                 * DELIBERATELY RESTART-WORTHY, and the only state below
+                 * `unwritable` for which that is the actual repair rather than a
+                 * side effect. The supervisor's lever is to tear the peer pair
+                 * down and build a fresh one; the fresh one arms its feed from the
+                 * persisted checkpoint, which is being held at the failed change,
+                 * so the restart IS the replay this state is waiting for. That is
+                 * also what the operators who hit the original defect did by hand:
+                 * `POST /disconnect` then `POST /connect` was the only thing that
+                 * recovered the missing notes, and the point of reporting this is
+                 * that they should not have to.
+                 */
+                restartFutile: false,
+                stalledMs: now - this.checkpointHeldSince,
+            };
+        }
+
         const applySince = this.awaitingApply.oldest();
         if (unapplied > 0 && applySince !== undefined && now - applySince > this.applyGraceMs) {
             return {
@@ -936,12 +1094,33 @@ export class InboundProgress {
         // but it is the distinction KICKOFF asks for by name, so it is made
         // explicitly rather than left to a caller to infer from a count.
         const busy = undecodable > 0 || unapplied > 0 || this.undeliveredSince !== undefined;
+        /*
+         * A held checkpoint inside its grace window does NOT change the state, and
+         * does change the detail.
+         *
+         * Not the state, because that would break the rule every other clock here
+         * follows: a condition inside its window is not yet a condition, and the
+         * window exists because most holds are cleared within seconds by the
+         * engine's own feed reconnect. Promoting it immediately would make routine
+         * self-healing indistinguishable from the failure it heals.
+         *
+         * The detail, because `idle at 4 applied` is the exact sentence the
+         * original defect produced while three notes were missing from the vault,
+         * and there is no reason for this module to say it when it holds a fact
+         * that contradicts it. `checkpointHeld` on the verdict carries the same
+         * information as a field, for callers that would rather test than parse.
+         */
+        const held =
+            this.checkpointHeldSince === undefined
+                ? ''
+                : `; ${this.checkpointHeldCount} failed change(s) awaiting replay`;
         return {
             ...base,
             state: busy ? 'flowing' : 'idle',
-            detail: busy
-                ? `${undecodable + unapplied} remote change(s) in flight`
-                : `idle at ${counts.applied} applied, ${counts.skipped} ignored`,
+            detail:
+                (busy
+                    ? `${undecodable + unapplied} remote change(s) in flight`
+                    : `idle at ${counts.applied} applied, ${counts.skipped} ignored`) + held,
             stalled: false,
             fatal: false,
             restartFutile: false,

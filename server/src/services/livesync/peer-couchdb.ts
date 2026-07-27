@@ -397,7 +397,30 @@ export class CouchDBPeer {
     private readonly tracker: HealthTracker;
 
     private man?: DirectFileManipulator;
+    /**
+     * A LIFECYCLE flag: the connect sequence completed and this peer is running.
+     *
+     * NOT a statement about the link, and the distinction is a reported defect
+     * rather than a nicety. It is set once when `connectLoop` succeeds and cleared
+     * only by `stop()` and `markFatal()`, so it stays true through an outage of any
+     * length: measured at `true` for the whole of a 269-second dead link. Every
+     * reader that wants "is the peer running" (`start()`'s re-entry guard,
+     * `requireReady`, the probe gate) is asking the right question of it, and every
+     * reader that wants "is the link up" is not. The second question has its own
+     * answer now: see `isLinkUp()`.
+     */
     private connected = false;
+    /**
+     * The replication checkpoint is being held at a change that failed to apply.
+     *
+     * See the apply callback in `startWatch()` (FIX 4 part 3) for what it protects
+     * and why a boolean is enough: it turns the checkpoint from a high-water mark
+     * into a low-water one, which is the only shape that can survive a failure
+     * followed by later successes. Set in the callback's catch, and cleared only by
+     * `startWatch()`, which is the point at which the feed is armed from the held
+     * position and the failed changes are therefore about to be re-delivered.
+     */
+    private checkpointHeld = false;
     /**
      * Connected fine, but there is no milestone document to reconcile against.
      * Tracked separately from `connected` so the health snapshot can call it
@@ -594,6 +617,9 @@ export class CouchDBPeer {
         this.connected = false;
         this.remoteEmpty = false;
         this.degraded = false;
+        // A stopped peer holds nothing: the next run arms its feed from the
+        // persisted checkpoint, which is the replay the hold was waiting for.
+        this.checkpointHeld = false;
         this.wakeFromBackoff?.();
         if (this.watchdog) {
             clearInterval(this.watchdog);
@@ -616,8 +642,54 @@ export class CouchDBPeer {
         }
     }
 
+    /**
+     * Is this peer RUNNING? A lifecycle question, and the one the callers below
+     * have always been asking.
+     *
+     * Kept exactly as it was, deliberately, because three callers depend on the
+     * lifecycle reading and would be made worse by the link reading:
+     * `services/livesync.ts`'s `dispatchToCouch` uses it to decide whether a push
+     * should wait for the first connect attempt to settle, `syncImpl` uses it to
+     * decide whether a pass can do anything at all, and `connectImpl` uses it to
+     * decide whether the connect it just performed worked. None of those wants a
+     * transient feed detachment to change the answer.
+     */
     isConnected(): boolean {
         return this.connected;
+    }
+
+    /**
+     * Is the LINK to CouchDB up right now?
+     *
+     * THE FLAG THIS REPLACES WAS A LIFECYCLE FLAG WEARING A LINK FLAG'S NAME.
+     * `connected` is set once when the connect sequence succeeds and cleared only
+     * by an explicit stop or a fatal configuration, so a link that dies mid-session
+     * leaves it true indefinitely: measured true throughout a 269-second outage.
+     * Two things read badly as a result. `routes/livesync.ts`'s `classifyDetail`
+     * has a `not connected to CouchDB` case that was unreachable for any
+     * mid-session drop, so the endpoint published the much vaguer `peers not
+     * syncing` for the first minute of every outage and named nothing an operator
+     * could go and look at; and the `connected` field on the status API, which an
+     * operator or the settings panel reads as "is the link up", said yes while it
+     * was down.
+     *
+     * The answer is composed rather than stored, from the two facts that together
+     * mean a live connection: the peer is running, and its changes feed is
+     * currently attached. `man.watching` is not a strong enough signal on its own
+     * (the whole inbound ledger exists because an attached feed can be delivering
+     * nothing), but it is exactly the right signal for THIS question: it goes false
+     * when the connection errors or completes, which is what a dropped link does,
+     * and the watchdog re-arms it as soon as the link is back. `remoteEmpty` is
+     * included for the same reason `snapshot()` includes it: a peer connected to a
+     * database with no milestone document to reconcile against is connected.
+     *
+     * Synchronous and free, so a status call costs no network I/O. The expensive,
+     * authoritative question ("does CouchDB answer right now?") already has its own
+     * answer in `couchReachable()`, which `HealthTracker` calls only when a peer is
+     * already unhealthy.
+     */
+    isLinkUp(): boolean {
+        return this.connected && (this.man?.watching === true || this.remoteEmpty);
     }
 
     /** Set when the configuration itself is unusable. Never cleared by retrying. */
@@ -1306,6 +1378,43 @@ export class CouchDBPeer {
         // last processed change left off rather than where this process started.
         man.since = this.state.getSince() || '0';
         /*
+         * Arming the feed from the persisted checkpoint is the event that RELEASES
+         * the checkpoint hold, and it is the only one.
+         *
+         * The hold (see the apply callback below) stops the checkpoint moving past
+         * a change that failed to apply, so that the change is replayed instead of
+         * being skipped. Everything after the held position is then re-delivered
+         * by the very next feed the peer opens, which is this one: the failed
+         * changes get another attempt, and the ones that already succeeded are
+         * re-applied harmlessly, since an inbound write is idempotent (same
+         * content, same mtime, same resulting baseline).
+         *
+         * Releasing HERE rather than on the next successful apply is what keeps the
+         * checkpoint honest. A later success is no evidence about the change that
+         * failed; only a replay that re-delivers it is. Releasing on the assignment
+         * above also keeps the two facts adjacent, so a reader can see that the
+         * position the hold was protecting is exactly the position the feed is
+         * about to resume from.
+         *
+         * It can never release the hold for a feed that is still running: the
+         * connect sequence reaches this through `connectAndWatch` with a freshly
+         * built manipulator, and the watchdog reaches it only after finding
+         * `man.watching` false.
+         *
+         * THE ENGINE CAN ALSO ARM A FEED WITHOUT COMING THROUGH HERE, and the flag
+         * is deliberately left set when it does. Its `error` handler clears
+         * `watching` and schedules its own `beginWatch` ten seconds later
+         * (`DirectFileManipulatorV2.ts:473-486`), which re-reads `man.since` and so
+         * performs the same replay. Our watchdog ticks every five seconds and
+         * therefore normally wins that race, but if it ever did not, the hold would
+         * simply stand: the checkpoint stops advancing, the ledger reports `behind`
+         * once the grace window passes, and the supervisor's restart clears it.
+         * Erring towards a checkpoint that is too old costs re-applied work, which
+         * is idempotent; erring the other way costs a note.
+         */
+        this.checkpointHeld = false;
+        this.progress.noteCheckpointReleased();
+        /*
          * Hand the ledger the evidence that OUTLIVES this run, before the first
          * document can arrive.
          *
@@ -1341,6 +1450,48 @@ export class CouchDBPeer {
                      * per-pass verdict is derived from it.
                      */
                     this.progress.noteFailed(key);
+                    /*
+                     * FIX 4 (part 3): HOLD THE CHECKPOINT, do not merely decline to
+                     * advance it for this one sequence.
+                     *
+                     * Skipping the advance below is necessary and was not
+                     * sufficient, and the gap between those two is a measured data
+                     * loss. `state.setSince` records a single HIGH-WATER MARK, so
+                     * the very next change that applies writes its own, higher
+                     * sequence straight over the failure. A high-water mark cannot
+                     * express "everything up to 14 except 6, 7 and 8": once it
+                     * reads 14, the sequences that failed are behind it and no
+                     * replay will ever deliver them again. Measured against a real
+                     * CouchDB: the checkpoint sat at 5 through three failed writes,
+                     * jumped to 14 when the next document landed, three notes were
+                     * missing from the vault permanently, and the status API
+                     * reported `state: idle`, `healthy: true`, `applied.pulled: 4`
+                     * with `/healthz/livesync` serving 200 throughout. Even a
+                     * deliberate disconnect and reconnect did not recover them,
+                     * because the checkpoint they resumed from was already past.
+                     *
+                     * So the flag below turns the checkpoint into a LOW-water mark:
+                     * it stops advancing at the earliest unresolved failure and
+                     * stays there, and the peer keeps applying everything after it
+                     * in the meantime, so nothing is delayed except the record of
+                     * how far we have got. It is released by `startWatch`, i.e. by
+                     * the replay that re-delivers the failed changes. That is what
+                     * makes the at-least-once claim below true rather than
+                     * conditional: without it, the claim held only for as long as
+                     * no LATER change succeeded, which on any active vault is
+                     * seconds.
+                     *
+                     * The cost is stated rather than hidden: while the hold stands,
+                     * a restart replays every change made since it began, and that
+                     * tail grows with time. It is re-applied idempotently, and the
+                     * ledger reports the hold (`InboundProgress.noteCheckpointHeld`,
+                     * and the `behind` state once it outlasts its grace window) so
+                     * a hold that is not clearing itself becomes an operator's
+                     * problem rather than a silent one. Re-applying work is the
+                     * recoverable direction; skipping it is not.
+                     */
+                    this.checkpointHeld = true;
+                    this.progress.noteCheckpointHeld();
                     this.log(`could not apply a remote change: ${describeError(e)}`, 'error');
                     throw e;
                 }
@@ -1364,8 +1515,18 @@ export class CouchDBPeer {
                  * Note that the engine catches and logs whatever the callback
                  * throws, so a throw here stops the checkpoint without stopping the
                  * feed.
+                 *
+                 * `checkpointHeld` is the part that makes "skips this line" mean
+                 * something durable: see part 3 in the catch above. While it is
+                 * set, a SUCCESSFUL apply does not advance the checkpoint either,
+                 * because the earlier failure is still unreplayed and moving the
+                 * mark past it would skip it forever. `man.since` is held in step
+                 * with the persisted value deliberately, since it is what the next
+                 * re-arm resumes from; letting the in-memory copy run ahead would
+                 * lose the failures on the engine's own ten-second feed reconnect,
+                 * which is the most likely replay to happen at all.
                  */
-                if (seq !== undefined && seq !== null) {
+                if (seq !== undefined && seq !== null && !this.checkpointHeld) {
                     const value = String(seq);
                     man.since = value;
                     this.state.setSince(value);
@@ -1571,9 +1732,11 @@ export class CouchDBPeer {
         if (!vaultPath) return false;
 
         if (entry.deleted || entry._deleted) {
-            if (this.echo.isRepeating(vaultPath, false)) return false;
+            if (this.echo.hasSeen(vaultPath, false)) return false;
             this.log(`${vaultPath} delete detected`, 'debug');
-            return await this.deps.dispatch(vaultPath, false);
+            const applied = await this.deps.dispatch(vaultPath, false);
+            this.echo.remember(vaultPath, false);
+            return applied;
         }
 
         const data: FileData = {
@@ -1583,9 +1746,35 @@ export class CouchDBPeer {
             deleted: entry.deleted || entry._deleted,
             data: decodeEntryData(entry),
         };
-        if (this.echo.isRepeating(vaultPath, data)) return false;
+        if (this.echo.hasSeen(vaultPath, data)) return false;
         this.log(`${vaultPath} change detected`, 'debug');
-        return await this.deps.dispatch(vaultPath, data);
+        const applied = await this.deps.dispatch(vaultPath, data);
+        /*
+         * Recorded only once the dispatch has RETURNED, and therefore never when
+         * it threw.
+         *
+         * The check above used to record the hash as a side effect, which made
+         * the retry of a failed inbound write impossible to distinguish from an
+         * echo. The sequence, measured: the vault write throws, the throw
+         * propagates so the checkpoint is not advanced, the feed later replays
+         * that sequence, and the replayed document arrives here and matches the
+         * claim left behind by the attempt that failed. The dispatch is skipped,
+         * `false` is returned, the caller reads that as a deliberate refusal, and
+         * the checkpoint advances past a document that never reached the vault.
+         * `EchoSuppressor` documents the same defect in the outbound direction;
+         * the two are the same mistake facing opposite ways, and the checkpoint
+         * hold added for the leapfrog defect would have been useless without this
+         * half, since every replay it enables would have been swallowed here.
+         *
+         * `false` still records. A `false` from the storage peer means the write
+         * was legitimately skipped rather than failed (an excluded path, a path
+         * `resolveInVault` refuses, one that resolves to the vault root, or an
+         * echo the storage side recognised first), and the caller advances the
+         * checkpoint for exactly that reason. The claim and the checkpoint stay in
+         * step: this document is done with, either way.
+         */
+        this.echo.remember(vaultPath, data);
+        return applied;
     }
 
     /**
@@ -1790,7 +1979,7 @@ export class CouchDBPeer {
         // Echo key is the vault-relative path on BOTH sides of the pair, so an
         // inbound write and the outbound event it causes hash against the same
         // entry. (The bridge does the same, keying on the pre-mapping path.)
-        if (this.echo.isRepeating(pathSrc, data)) return false;
+        if (this.echo.hasSeen(pathSrc, data)) return false;
         const remotePath = this.toRemotePath(pathSrc);
         const info: FileInfo = { ctime: data.ctime, mtime: data.mtime, size: data.size };
         const body = data.data instanceof Uint8Array ? createBlob(data.data) : createTextBlob(data.data);
@@ -1810,6 +1999,28 @@ export class CouchDBPeer {
             }
             const type = isPlainText(remotePath) ? 'plain' : 'newnote';
             const ok = await man.put(remotePath, body, info, type);
+            /*
+             * Claimed only now, and this is the half of the echo fix WITHOUT
+             * which the storage-side half achieves nothing.
+             *
+             * The failure being closed: `man.put` throws (CouchDB unreachable
+             * mid-write, a 401 after a credential rotation, a conflict), the
+             * throw propagates so `StoragePeer.processPath` leaves that file's
+             * baseline unadvanced, and the offline scan finds the file again.
+             * With the claim recorded before the write, that retry reached this
+             * method, matched the entry left by the attempt that failed, and
+             * returned `false` WITHOUT THROWING. `processPath` treats a
+             * non-throwing dispatch as delivered and advances the baseline, so
+             * the file was marked synced having never been written to CouchDB,
+             * and no later scan would look at it again. Fixing only the storage
+             * peer's suppressor would have moved the same loss one layer down.
+             *
+             * The same-content skip above deliberately does NOT record. It
+             * returns before any write, and this method claims only what this
+             * peer actually wrote; the caller's own baseline is what records that
+             * the file needs no further attention.
+             */
+            this.echo.remember(pathSrc, data);
             this.log(`${pathSrc} ${ok ? 'saved' : 'ignored'}`, 'debug');
             return ok;
         } catch (e) {
@@ -1820,10 +2031,14 @@ export class CouchDBPeer {
 
     async delete(pathSrc: string): Promise<boolean> {
         const man = this.requireReady();
-        if (this.echo.isRepeating(pathSrc, false)) return false;
+        if (this.echo.hasSeen(pathSrc, false)) return false;
         const remotePath = this.toRemotePath(pathSrc);
         try {
             const ok = await man.delete(remotePath);
+            // As in `put`: claimed after the remote write, so a delete that threw
+            // is retried by the next offline scan instead of being answered with
+            // a claim the failed attempt left behind.
+            this.echo.remember(pathSrc, false);
             this.log(`${pathSrc} ${ok ? 'deleted' : 'delete ignored'}`, 'debug');
             return ok;
         } catch (e) {
@@ -1912,7 +2127,11 @@ export class CouchDBPeer {
     snapshot(): PeerHealth {
         const watching = this.man?.watching === true;
         const inbound = this.progress.verdict();
-        const attached = this.connected && (watching || this.remoteEmpty);
+        // `isLinkUp()` rather than a second copy of the same expression: this
+        // snapshot and the status API's `connected` field must agree about what a
+        // live connection is, and the way to guarantee that is to have one of them
+        // ask the other rather than to keep two spellings in step by hand.
+        const attached = this.isLinkUp();
         const syncing = attached && !inbound.stalled;
         let detail: string;
         if (this.fatalReason) detail = `configuration error: ${this.fatalReason}`;

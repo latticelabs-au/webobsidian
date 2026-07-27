@@ -551,6 +551,43 @@ export class LiveSyncStateStore {
  * This is one of two layers. The other is the persisted `file-stat-<path>`
  * baseline, which survives a restart; this one catches same-content rewrites
  * that the stat cannot distinguish. Both are needed.
+ *
+ * THE QUESTION AND THE RECORD ARE TWO OPERATIONS, AND THAT SPLIT IS A BUG FIX.
+ *
+ * The bridge (and this port's first revision) fused them into a single
+ * `isRepeating()` that recorded the hash on the MISS path, on the argument that
+ * "is this a repeat" and "remember it" are one thought and splitting them invites
+ * a caller who checks and forgets to record. That argument is right about the
+ * hazard and wrong about which hazard is worse, because recording on the miss
+ * path states something the caller does not yet know: it says "this content has
+ * passed through this path" at the moment the caller has only decided to TRY to
+ * pass it through. When the attempt then fails, the claim is a lie that nothing
+ * ever retracts, and every later retry of the same bytes is answered with "you
+ * already did that".
+ *
+ * Measured, against a real CouchDB. A note edited during a CouchDB outage was
+ * checked here (miss, recorded), dispatched, and the dispatch threw. The storage
+ * peer deliberately leaves the file's baseline unadvanced on a throw so that the
+ * next offline scan finds the file again, which it did; the scan routed it back
+ * through the same code path, which now found the entry recorded by the FAILED
+ * attempt and skipped it. Two individually correct mechanisms cancelled each
+ * other out and the note was never pushed for the life of the process, while
+ * `/healthz/livesync` served 200 and the inbound direction reported `idle`. A
+ * process restart pushed the file within twenty seconds, because this cache is
+ * in memory and the restart was the only thing that cleared the false claim.
+ *
+ * So the record is now explicit and every caller makes it only after its
+ * operation has actually happened. The invariant that replaces "check and record
+ * are one call" is stated once, here, and asserted by the regression tests:
+ *
+ *   A write that was never successfully passed on must always be retried, and a
+ *   write that WAS passed on must never come back as a new change.
+ *
+ * `hasSeen()` gives the first half by recording nothing; `remember()` gives the
+ * second half, and is called on the success path of `StoragePeer.put`/`delete`/
+ * `processPath` and `CouchDBPeer.put`/`delete`/`onRemoteChange`. The window
+ * between the two calls is genuinely unprotected, and the peers' own comments
+ * argue at their call sites why nothing can loop through it.
  */
 export class EchoSuppressor {
     private readonly capacity: number;
@@ -564,23 +601,38 @@ export class EchoSuppressor {
     /**
      * Has this exact content already passed through this path, recently?
      *
-     * Records the hash as a side effect, exactly as the bridge does: the question
-     * "is this a repeat" and the act of remembering are one operation, and
-     * splitting them invites a caller that checks and forgets to record.
+     * A QUERY: a miss records nothing, which is the whole point of the split
+     * described above. A HIT does touch the entry, moving it to the end of the
+     * LRU, because a file that keeps round-tripping is exactly the one whose
+     * entry must not be evicted. That is recency bookkeeping about an entry that
+     * already exists, not a new claim about content that has not moved.
      */
-    isRepeating(relPath: string, data: FileData | false): boolean {
-        const digest = hashContent(data);
+    hasSeen(relPath: string, data: FileData | false): boolean {
         const seen = this.entries.get(relPath);
-        if (seen === digest) {
-            // Refresh recency: a file that keeps round-tripping is exactly the
-            // one whose entry must not be evicted.
-            this.entries.delete(relPath);
-            this.entries.set(relPath, digest);
-            return true;
-        }
-        this.entries.set(relPath, digest);
+        if (seen === undefined || seen !== hashContent(data)) return false;
+        this.entries.delete(relPath);
+        this.entries.set(relPath, seen);
+        return true;
+    }
+
+    /**
+     * Record that this exact content HAS now passed through this path.
+     *
+     * Call this only once the operation it describes has succeeded. Calling it
+     * before is the defect the class comment documents: it makes a claim on
+     * behalf of an operation that may still fail, and there is no later event
+     * that retracts it.
+     *
+     * Delete-then-set rather than a bare `set`, so a re-recorded path moves to
+     * the end of the LRU. A path being written right now is by definition the
+     * hottest one, and leaving it at its original position (which is what a bare
+     * `set` on an existing key does) would let a busy file whose content keeps
+     * changing age out while quiet ones survive.
+     */
+    remember(relPath: string, data: FileData | false): void {
+        this.entries.delete(relPath);
+        this.entries.set(relPath, hashContent(data));
         this.evict();
-        return false;
     }
 
     /** Drop a path's entry (used when a file is deleted for good). */

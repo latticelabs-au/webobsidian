@@ -187,32 +187,64 @@ describe('path mapping', () => {
 // ===========================================================================
 
 describe('EchoSuppressor', () => {
-    it('suppresses the same content for the same path on the second call', () => {
+    /**
+     * WHY EVERY CASE BELOW NOW SPELLS THE RECORD OUT.
+     *
+     * The class used to expose one `isRepeating()` that answered the question and
+     * recorded the hash on the miss path in the same call, and these tests were
+     * written against that shape ("first call false, second call true"). The
+     * combined call is gone, because recording on a miss claims that content has
+     * passed through a path at the moment the caller has only decided to TRY, and
+     * a caller whose attempt then fails leaves behind a claim that suppresses
+     * every later retry of the same bytes. That produced permanent, silent,
+     * measured data loss in both directions; `EchoSuppressor`'s own comment tells
+     * the story and the peers' regression tests below drive it end to end.
+     *
+     * So the fixture is `hasSeen()` for the question and `remember()` for the
+     * claim, and the sequence `hasSeen -> false; remember; hasSeen -> true` is
+     * what the old `isRepeating` did in two calls. Every assertion about hashing
+     * and eviction is preserved exactly; only the call shape changed.
+     */
+    it('suppresses the same content for the same path once it has been recorded', () => {
         const echo = new EchoSuppressor();
         const data = textData('hello');
-        // First sighting is not a repeat: this is the write itself.
-        expect(echo.isRepeating('note.md', data)).toBe(false);
-        // Second is the watcher event our own write caused.
-        expect(echo.isRepeating('note.md', data)).toBe(true);
+        // Before the write there is nothing to repeat.
+        expect(echo.hasSeen('note.md', data)).toBe(false);
+        echo.remember('note.md', data);
+        // And now the watcher event our own write caused is recognised.
+        expect(echo.hasSeen('note.md', data)).toBe(true);
+    });
+
+    it('records nothing when it is only asked', () => {
+        // THE PROPERTY THE WHOLE SPLIT EXISTS FOR. A caller that asks and then
+        // fails to perform its write must leave the cache exactly as it found it,
+        // or its own retry is answered with a claim it never earned.
+        const echo = new EchoSuppressor();
+        const data = textData('hello');
+        expect(echo.hasSeen('note.md', data)).toBe(false);
+        expect(echo.hasSeen('note.md', data)).toBe(false);
+        expect(echo.hasSeen('note.md', data)).toBe(false);
     });
 
     it('does not suppress different content for the same path', () => {
         const echo = new EchoSuppressor();
-        expect(echo.isRepeating('note.md', textData('hello'))).toBe(false);
-        expect(echo.isRepeating('note.md', textData('hello world'))).toBe(false);
+        expect(echo.hasSeen('note.md', textData('hello'))).toBe(false);
+        echo.remember('note.md', textData('hello'));
+        expect(echo.hasSeen('note.md', textData('hello world'))).toBe(false);
+        echo.remember('note.md', textData('hello world'));
         // ...and the new content is now the one being suppressed.
-        expect(echo.isRepeating('note.md', textData('hello world'))).toBe(true);
+        expect(echo.hasSeen('note.md', textData('hello world'))).toBe(true);
         // The superseded content is no longer suppressed: an edit that reverts a
         // file must be pushed, not swallowed.
-        expect(echo.isRepeating('note.md', textData('hello'))).toBe(false);
+        expect(echo.hasSeen('note.md', textData('hello'))).toBe(false);
     });
 
     it('does not suppress the same content on a different path', () => {
         // Two files with identical content are two files. Keying the cache by
         // content alone would make a copy-paste of a note invisible to sync.
         const echo = new EchoSuppressor();
-        expect(echo.isRepeating('a.md', textData('same'))).toBe(false);
-        expect(echo.isRepeating('b.md', textData('same'))).toBe(false);
+        echo.remember('a.md', textData('same'));
+        expect(echo.hasSeen('b.md', textData('same'))).toBe(false);
     });
 
     it('hashes content only, so a touch with identical bytes is an echo', () => {
@@ -221,26 +253,27 @@ describe('EchoSuppressor', () => {
         // and hashing the mtime would make every inbound write echo back out
         // (the inbound path sets the mtime from the remote metadata).
         const echo = new EchoSuppressor();
-        expect(echo.isRepeating('note.md', textData('same bytes', 1_700_000_000_000))).toBe(false);
-        expect(echo.isRepeating('note.md', textData('same bytes', 1_700_000_999_000))).toBe(true);
+        echo.remember('note.md', textData('same bytes', 1_700_000_000_000));
+        expect(echo.hasSeen('note.md', textData('same bytes', 1_700_000_999_000))).toBe(true);
     });
 
     it('models a delete distinctly from an empty write', () => {
         const echo = new EchoSuppressor();
         // A delete is recorded...
-        expect(echo.isRepeating('note.md', false)).toBe(false);
-        expect(echo.isRepeating('note.md', false)).toBe(true);
+        expect(echo.hasSeen('note.md', false)).toBe(false);
+        echo.remember('note.md', false);
+        expect(echo.hasSeen('note.md', false)).toBe(true);
 
         // ...and an empty write to the same path is NOT that delete. Collapsing
         // the two would mean a "truncate to empty" arriving right after a delete
         // is swallowed, so the file stays deleted on one side and empty on the
         // other, permanently divergent with no event left to repair it.
-        expect(echo.isRepeating('note.md', textData(''))).toBe(false);
+        expect(echo.hasSeen('note.md', textData(''))).toBe(false);
 
         // Symmetrically: a delete following an empty write is not an echo of it.
         const echo2 = new EchoSuppressor();
-        expect(echo2.isRepeating('note.md', textData(''))).toBe(false);
-        expect(echo2.isRepeating('note.md', false)).toBe(false);
+        echo2.remember('note.md', textData(''));
+        expect(echo2.hasSeen('note.md', false)).toBe(false);
     });
 
     it('hashes bytes, not the document type, so a text/binary crossing is not an echo storm', () => {
@@ -263,17 +296,17 @@ describe('EchoSuppressor', () => {
             size: 5,
             data: new Uint8Array([0x68, 0x65, 0x6c, 0x6c, 0x6f]),
         };
-        expect(echo.isRepeating('note.md', asText)).toBe(false);
-        expect(echo.isRepeating('note.md', asBinary)).toBe(true);
+        echo.remember('note.md', asText);
+        expect(echo.hasSeen('note.md', asBinary)).toBe(true);
 
         const empties = new EchoSuppressor();
         const emptyText: FileData = { ctime: 1, mtime: 1, size: 0, data: [] };
         const emptyBinary: FileData = { ctime: 1, mtime: 1, size: 0, data: new Uint8Array(0) };
-        expect(empties.isRepeating('x.bin', emptyText)).toBe(false);
-        expect(empties.isRepeating('x.bin', emptyBinary)).toBe(true);
+        empties.remember('x.bin', emptyText);
+        expect(empties.hasSeen('x.bin', emptyBinary)).toBe(true);
         // ...but an empty file is still not a DELETE. That distinction is the one
         // that matters, and it holds.
-        expect(empties.isRepeating('x.bin', false)).toBe(false);
+        expect(empties.hasSeen('x.bin', false)).toBe(false);
     });
 
     it('compares a re-chunked text file equal to its original chunking', () => {
@@ -284,16 +317,17 @@ describe('EchoSuppressor', () => {
         const echo = new EchoSuppressor();
         const oneChunk: FileData = { ctime: 1, mtime: 1, size: 11, data: ['hello world'] };
         const threeChunks: FileData = { ctime: 1, mtime: 1, size: 11, data: ['hello', ' ', 'world'] };
-        expect(echo.isRepeating('note.md', oneChunk)).toBe(false);
-        expect(echo.isRepeating('note.md', threeChunks)).toBe(true);
+        echo.remember('note.md', oneChunk);
+        expect(echo.hasSeen('note.md', threeChunks)).toBe(true);
     });
 
     it('forgets a path on demand', () => {
         const echo = new EchoSuppressor();
         const data = textData('hello');
-        expect(echo.isRepeating('note.md', data)).toBe(false);
+        echo.remember('note.md', data);
+        expect(echo.hasSeen('note.md', data)).toBe(true);
         echo.forget('note.md');
-        expect(echo.isRepeating('note.md', data)).toBe(false);
+        expect(echo.hasSeen('note.md', data)).toBe(false);
     });
 
     /**
@@ -316,13 +350,14 @@ describe('EchoSuppressor', () => {
 
         const paths = Array.from({ length: BULK }, (_, i) => `bulk/note-${i}.md`);
         for (const p of paths) {
-            expect(echo.isRepeating(p, textData(`content of ${p}`))).toBe(false);
+            expect(echo.hasSeen(p, textData(`content of ${p}`))).toBe(false);
+            echo.remember(p, textData(`content of ${p}`));
         }
 
         // Now the watcher events for the whole batch arrive, oldest first. Every
         // one of them must still be recognised as our own write.
         for (const p of paths) {
-            expect(echo.isRepeating(p, textData(`content of ${p}`))).toBe(true);
+            expect(echo.hasSeen(p, textData(`content of ${p}`))).toBe(true);
         }
     });
 
@@ -331,32 +366,32 @@ describe('EchoSuppressor', () => {
         // problem on a 30k-file vault. Verified at a small capacity so the
         // boundary is exact.
         const echo = new EchoSuppressor(3);
-        for (let i = 0; i < 3; i += 1) echo.isRepeating(`p${i}`, textData(`c${i}`));
+        for (let i = 0; i < 3; i += 1) echo.remember(`p${i}`, textData(`c${i}`));
         // Still within capacity: nothing evicted.
-        expect(echo.isRepeating('p0', textData('c0'))).toBe(true);
+        expect(echo.hasSeen('p0', textData('c0'))).toBe(true);
         // p0 was just refreshed to the end, so p1 is now the oldest.
-        echo.isRepeating('p3', textData('c3'));
-        expect(echo.isRepeating('p1', textData('c1'))).toBe(false);
-        expect(echo.isRepeating('p0', textData('c0'))).toBe(true);
+        echo.remember('p3', textData('c3'));
+        expect(echo.hasSeen('p1', textData('c1'))).toBe(false);
+        expect(echo.hasSeen('p0', textData('c0'))).toBe(true);
     });
 
     it('refreshes recency on a hit, so a file that keeps round-tripping is never evicted', () => {
         // The pathological case for a plain insertion-order cache: the one file
         // that echoes constantly is also the one whose entry must survive.
         const echo = new EchoSuppressor(2);
-        echo.isRepeating('hot', textData('h'));
-        echo.isRepeating('cold', textData('c'));
-        expect(echo.isRepeating('hot', textData('h'))).toBe(true); // moves 'hot' to the end
-        echo.isRepeating('new', textData('n')); // evicts 'cold', not 'hot'
-        expect(echo.isRepeating('hot', textData('h'))).toBe(true);
-        expect(echo.isRepeating('cold', textData('c'))).toBe(false);
+        echo.remember('hot', textData('h'));
+        echo.remember('cold', textData('c'));
+        expect(echo.hasSeen('hot', textData('h'))).toBe(true); // moves 'hot' to the end
+        echo.remember('new', textData('n')); // evicts 'cold', not 'hot'
+        expect(echo.hasSeen('hot', textData('h'))).toBe(true);
+        expect(echo.hasSeen('cold', textData('c'))).toBe(false);
     });
 
     it('clear() drops everything', () => {
         const echo = new EchoSuppressor();
-        echo.isRepeating('note.md', textData('hello'));
+        echo.remember('note.md', textData('hello'));
         echo.clear();
-        expect(echo.isRepeating('note.md', textData('hello'))).toBe(false);
+        expect(echo.hasSeen('note.md', textData('hello'))).toBe(false);
     });
 });
 

@@ -47,6 +47,12 @@ interface Dispatched {
     deleted: boolean;
 }
 
+/** The text a dispatched write carried, for asserting that the RETRY sent it. */
+function contentOf(data: FileData | false): string {
+    if (data === false) return '';
+    return data.data instanceof Uint8Array ? Buffer.from(data.data).toString('utf8') : data.data.join('');
+}
+
 /**
  * The module reset happens ONCE for this file, not once per test, and that is not
  * a shortcut.
@@ -347,5 +353,234 @@ describe('StoragePeer.runOfflineScan', () => {
 
         expect(deletedPaths(dispatched)).toEqual([]);
         expect(logs.some((l) => l.startsWith('error:') && l.includes('Refusing to treat that'))).toBe(true);
+    });
+
+    // =======================================================================
+    // DEFECT 1: a local change made during a CouchDB outage must be retried
+    // =======================================================================
+
+    /**
+     * THE DEADLOCK BETWEEN TWO INDIVIDUALLY CORRECT MECHANISMS.
+     *
+     * `processPath` refuses to advance a file's sync baseline when the dispatch
+     * throws, deliberately, so the next offline scan finds the file again and
+     * pushes it. That is the whole recovery story for the push direction, and it
+     * is the second half of KICKOFF's "dropped mid-session, then recovering
+     * without a restart".
+     *
+     * The echo suppressor used to record the content hash as a side effect of
+     * asking "is this an echo?", on the MISS path. So the failed dispatch left
+     * behind a claim that these exact bytes had already gone out, the scan's retry
+     * was answered with that claim at the gate, and the file was never dispatched
+     * again for the life of the process. Confirmed by elimination in the field: a
+     * process restart against the same DATA_DIR pushed the file within twenty
+     * seconds, because this cache is in memory and the restart was the only thing
+     * that cleared the false claim.
+     *
+     * What made it the worst kind of bug is that every instrument said fine.
+     * `/healthz/livesync` served 200, autosync logged `ok`, and the inbound ledger
+     * reported `idle`, because the ledger instruments the direction this failure
+     * is not in. So these tests assert on DISPATCHES, which is the only place the
+     * difference shows: the number of them, and the content they carried.
+     */
+    describe('a dispatch that failed is retried, not swallowed as an echo', () => {
+        /**
+         * A peer whose dispatch fails while `offline.value` is true.
+         *
+         * Modelled as a throw rather than a `false` return because that is what
+         * `CouchDBPeer.put` does when it cannot reach CouchDB
+         * (`LiveSyncNotReadyError`, or a rethrown network error), and the whole
+         * contract between the two peers turns on the difference: a throw means
+         * "not delivered, do not record anything", a `false` means "legitimately
+         * skipped, this file is up to date".
+         */
+        async function makeFlakyPeer(state: StateStoreType, offline: { value: boolean }) {
+            const dispatched: Dispatched[] = [];
+            const contents: string[] = [];
+            const peer = new StoragePeer(
+                { name: 'vault', baseDir: '', scanOfflineChanges: false, debounceMs: 300 },
+                {
+                    state,
+                    dispatch: (p: string, d: FileData | false) => {
+                        if (offline.value) {
+                            return Promise.reject(new Error('CouchDB peer is not connected'));
+                        }
+                        dispatched.push({ path: p, deleted: d === false });
+                        contents.push(contentOf(d));
+                        return Promise.resolve(true);
+                    },
+                    log: () => {},
+                },
+            );
+            await peer.start();
+            return { peer, dispatched, contents };
+        }
+
+        it('pushes a note edited during a CouchDB outage once the outage ends', async () => {
+            /*
+             * The reported failure, end to end. Revert the `hasSeen`/`remember`
+             * split in `processPath` and the second scan dispatches nothing:
+             * `dispatched` stays empty and the baseline is never recorded, forever.
+             */
+            const edited = path.join(tmp.vaultDir, 'note.md');
+            await fs.writeFile(edited, 'the edit made during the outage\n');
+
+            const state = await makeState('outage-edit');
+            const offline = { value: true };
+            const { peer, dispatched, contents } = await makeFlakyPeer(state, offline);
+
+            // CouchDB is down. The scan finds the file, tries to push it, and is
+            // refused. Nothing is recorded as synced, which is correct.
+            await peer.runOfflineScan();
+            expect(dispatched).toEqual([]);
+            expect(state.getFileStat('note.md')).toBeUndefined();
+
+            // CouchDB comes back, and `onConnected` re-runs the scan. This is the
+            // moment the note either goes out or is lost silently.
+            offline.value = false;
+            await peer.runOfflineScan();
+
+            expect(dispatched).toEqual([{ path: 'note.md', deleted: false }]);
+            expect(contents).toEqual(['the edit made during the outage\n']);
+            // ...and only now is it recorded as synced, so a third scan is quiet.
+            expect(state.getFileStat('note.md')).toBeDefined();
+
+            await peer.runOfflineScan();
+            expect(dispatched).toHaveLength(1);
+
+            await peer.stop();
+            await state.close();
+        });
+
+        it('pushes a DELETION made during a CouchDB outage once the outage ends', async () => {
+            /*
+             * The same defect on the deletion path, which had it too and is worse
+             * to lose: a note deleted here stays present on every other client in
+             * the cluster indefinitely, and the local vault has nothing left to
+             * show that anything is outstanding.
+             *
+             * `processDelete` forgets the path's entry after a SUCCESSFUL dispatch,
+             * so the claim only ever survived on the failure path, which is exactly
+             * where it did the damage. Revert the split there and the second scan
+             * dispatches nothing.
+             */
+            const state = await makeState('outage-delete');
+            // Tracked, and genuinely absent: deleted while the peer was down.
+            state.setFileStat('gone.md', '1700000000000-16');
+            // One file that is really there, so the walk is not empty and the
+            // mass-deletion safety valve stays out of the way.
+            await fs.writeFile(path.join(tmp.vaultDir, 'kept.md'), 'still here\n');
+
+            const offline = { value: true };
+            const { peer, dispatched } = await makeFlakyPeer(state, offline);
+
+            await peer.runOfflineScan();
+            expect(dispatched).toEqual([]);
+            // The baseline survives the refusal, which is what keeps the path in
+            // the tracked set for the next scan to find.
+            expect(state.getFileStat('gone.md')).toBeDefined();
+
+            offline.value = false;
+            await peer.runOfflineScan();
+
+            expect(deletedPaths(dispatched)).toEqual(['gone.md']);
+            expect(state.getFileStat('gone.md')).toBeUndefined();
+
+            await peer.stop();
+            await state.close();
+        });
+
+        it('re-applies an inbound write whose first attempt failed on disk', async () => {
+            /*
+             * THE SAME DEFECT FACING THE OTHER WAY, and the half that decides
+             * whether DEFECT 2's checkpoint hold is worth anything at all.
+             *
+             * `put()` throws when the write itself fails, and the CouchDB peer
+             * relies on that: a throw holds the replication checkpoint so the
+             * change is replayed rather than skipped. But the echo check used to
+             * record the content hash before the write was attempted, so the
+             * replay arrived here, matched the claim left by the attempt that
+             * failed, and returned FALSE. `false` is the peer's spelling for "this
+             * document was legitimately refused", so it advances the checkpoint,
+             * counts a skip, and the note is gone with the ledger reporting a
+             * healthy peer. Every replay the hold buys would have been consumed
+             * this way.
+             *
+             * The obstruction is a directory sitting where the note has to land,
+             * which makes the rename fail the same way a full disk, a read-only
+             * remount or a uid change does, and clears the moment it is removed.
+             * Revert the record to the check and the second `put` resolves false
+             * with nothing on disk.
+             */
+            const state = await makeState('inbound-write-retry');
+            const offline = { value: false };
+            const { peer } = await makeFlakyPeer(state, offline);
+
+            const blocked = path.join(tmp.vaultDir, 'blocked.md');
+            await fs.mkdir(blocked, { recursive: true });
+            await fs.writeFile(path.join(blocked, 'occupied.txt'), 'in the way\n');
+
+            await expect(peer.put('blocked.md', inbound('remote content\n'))).rejects.toThrow(
+                /local write failed/,
+            );
+
+            // The obstruction goes away, and the feed replays the change.
+            await fs.rm(blocked, { recursive: true, force: true });
+            await expect(peer.put('blocked.md', inbound('remote content\n'))).resolves.toBe(true);
+            expect(await fs.readFile(blocked, 'utf8')).toBe('remote content\n');
+            expect(state.getFileStat('blocked.md')).toBeDefined();
+
+            await peer.stop();
+            await state.close();
+        });
+
+        it('CONTROL: an inbound write is still recognised as our own and not pushed back', async () => {
+            /*
+             * The other half of the invariant, and the reason the fix is "record
+             * later" rather than "stop recording".
+             *
+             * `put()` writes a file because CouchDB told us to, and the vault
+             * watcher then reports that write as a local change. Without
+             * suppression the file goes straight back to CouchDB, comes down again
+             * as a change, and the document churns a revision per round trip with
+             * no user involved. The claim `put()` records after its rename is what
+             * stops that, and this asserts it through the real code path rather
+             * than on the suppressor in isolation.
+             */
+            const state = await makeState('inbound-not-echoed');
+            const offline = { value: false };
+            const { peer, dispatched } = await makeFlakyPeer(state, offline);
+
+            await peer.put('pulled.md', inbound('content from couchdb\n'));
+            expect(dispatched).toEqual([]);
+
+            // The watcher event our own write caused, delivered the way index.ts
+            // delivers it. A scan asks the same question the debounced handler
+            // does, and must reach the same answer.
+            await peer.runOfflineScan();
+            expect(dispatched).toEqual([]);
+
+            await peer.stop();
+            await state.close();
+        });
+
+        it('CONTROL: a genuine local edit after an inbound write is still pushed', async () => {
+            // The failure mode the control above could hide: a suppressor that
+            // never let anything through would pass it. An edit made after an
+            // inbound write is different content at the same path, so it must go.
+            const state = await makeState('local-edit-after-inbound');
+            const offline = { value: false };
+            const { peer, dispatched, contents } = await makeFlakyPeer(state, offline);
+
+            await peer.put('pulled.md', inbound('content from couchdb\n'));
+            await fs.writeFile(path.join(tmp.vaultDir, 'pulled.md'), 'edited by the user\n');
+            await peer.runOfflineScan();
+
+            expect(dispatched).toEqual([{ path: 'pulled.md', deleted: false }]);
+            expect(contents).toEqual(['edited by the user\n']);
+
+            await peer.stop();
+            await state.close();
+        });
     });
 });
