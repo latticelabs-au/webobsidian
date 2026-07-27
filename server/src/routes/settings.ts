@@ -19,6 +19,7 @@ import {
   type Settings,
 } from '../services/settings.js';
 import { redactUrlCreds } from '../lib/redact.js';
+import { isReservedClaim } from '../services/oidc.js';
 import { config } from '../config.js';
 
 /** Build an error the shared error middleware will answer with `status`. */
@@ -605,6 +606,40 @@ function sanitizeOidc(v: Record<string, unknown>, current: Settings['oidc']): Oi
   }
   if (v.allowedGroups !== undefined) {
     fields.allowedGroups = requireStringList(v.allowedGroups, 'oidc.allowedGroups');
+  }
+  // Refused with a 400 rather than filtered, because a rule silently dropped
+  // from an authorization allowlist is indistinguishable from one that is in
+  // force and simply never matching. The reserved-name check in particular has
+  // to say WHY: `{"claim":"type","values":["id-token"]}` looks like a specific
+  // rule and would admit every account the issuer has.
+  if (v.allowedClaims !== undefined) {
+    if (!Array.isArray(v.allowedClaims)) {
+      throw httpError(400, 'oidc.allowedClaims must be an array');
+    }
+    const rules: { claim: string; values: string[] }[] = [];
+    for (const entry of v.allowedClaims) {
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+        throw httpError(400, 'each oidc.allowedClaims entry must be an object');
+      }
+      const rec = entry as Record<string, unknown>;
+      const claim = typeof rec.claim === 'string' ? rec.claim.trim() : '';
+      if (!claim) throw httpError(400, 'each oidc.allowedClaims entry needs a claim name');
+      if (isReservedClaim(claim)) {
+        throw httpError(
+          400,
+          `oidc.allowedClaims cannot use '${claim}': that claim carries the same value for every ` +
+            'user of the issuer, or changes on every request, so a rule on it would admit ' +
+            'everybody or nobody rather than a specific person. Use a claim that identifies the ' +
+            'user, such as preferred_username or a custom claim your provider issues.',
+        );
+      }
+      const values = requireStringList(rec.values, `oidc.allowedClaims['${claim}'].values`);
+      if (values.length === 0) {
+        throw httpError(400, `oidc.allowedClaims['${claim}'] needs at least one value`);
+      }
+      rules.push({ claim, values });
+    }
+    fields.allowedClaims = rules;
   }
   if (v.allowPasswordLogin !== undefined) {
     if (typeof v.allowPasswordLogin !== 'boolean') {

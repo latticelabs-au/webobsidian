@@ -78,10 +78,32 @@ export interface OidcSettings {
    * behind anything non-trivial should set it explicitly.
    */
   redirectUri: string;
-  /** See `isAllowed()`. All three empty means NOBODY is allowed in. */
+  /** See `isAllowed()`. ALL of these empty means NOBODY is allowed in. */
   allowedSubjects: string[];
   allowedGroups: string[];
   allowedEmails: string[];
+  /**
+   * Allowlist rules keyed on a claim this app knows nothing about.
+   *
+   * The four fixed axes cover the claims OIDC standardises, and standardised
+   * claims are not what most IdPs actually key identity on. Pocket ID, for one,
+   * lets an operator define per-client custom claims, so a real ID token from it
+   * carries `preferred_username`, `nextcloud_username` and `portainer_username`
+   * side by side, and which of those is "the username" is a deployment
+   * decision this app has no way to guess. Rather than add a fixed axis per
+   * claim anybody might use, take the claim name from the operator.
+   *
+   * Each rule is one claim and the values that satisfy it. Rules OR together
+   * with each other and with the fixed axes: matching any one entry anywhere is
+   * enough, which is the same rule the fixed axes already follow.
+   */
+  allowedClaims: ClaimRule[];
+}
+
+/** One `allowedClaims` entry: a claim name and the values that satisfy it. */
+export interface ClaimRule {
+  claim: string;
+  values: string[];
 }
 
 function claimTrimmed(value: unknown): string {
@@ -125,7 +147,86 @@ export async function getOidcSettings(): Promise<OidcSettings> {
     allowedSubjects: stringList(block.allowedSubjects),
     allowedGroups: stringList(block.allowedGroups),
     allowedEmails: stringList(block.allowedEmails),
+    allowedClaims: claimRules(block.allowedClaims),
   };
+}
+
+/**
+ * Read `allowedClaims`, dropping anything that cannot authorize anybody.
+ *
+ * A rule with no claim name or no values matches nothing, so keeping it would
+ * only make `isAllowed()`'s "every list is empty" check disagree with what the
+ * settings file appears to say: an operator who typed a claim name and no values
+ * would see a populated allowlist and a server that admits nobody. Dropping the
+ * rule here means that same operator hits the empty-allowlist path, which is the
+ * one failure mode this file documents loudly.
+ *
+ * `RESERVED_CLAIMS` is enforced at the API boundary (`sanitizeOidc`) so a bad
+ * rule is refused with an explanation rather than accepted and ignored. It is
+ * enforced AGAIN here because settings.json is a file an operator can edit by
+ * hand, and a hand-edited `{"claim": "iss"}` would otherwise admit every account
+ * the IdP has.
+ */
+function claimRules(value: unknown): ClaimRule[] {
+  if (!Array.isArray(value)) return [];
+  const out: ClaimRule[] = [];
+  for (const entry of value) {
+    if (!entry || typeof entry !== 'object') continue;
+    const claim = claimTrimmed((entry as Record<string, unknown>).claim);
+    const values = stringList((entry as Record<string, unknown>).values);
+    if (!claim || values.length === 0) continue;
+    if (RESERVED_CLAIMS.has(claim.toLowerCase())) {
+      console.warn(
+        `[oidc] ignoring allowedClaims rule on '${claim}': that claim is the same for every ` +
+          'user of this issuer, so an allowlist entry on it would admit everybody',
+      );
+      continue;
+    }
+    out.push({ claim, values });
+  }
+  return out;
+}
+
+/**
+ * Claims that may never be used as an allowlist axis.
+ *
+ * Not a style rule. Every claim here is either identical for every user of this
+ * issuer, or is a per-request value, so a rule matching it is not an allowlist
+ * at all: it is `return true` written in JSON. `iss` is the same string in
+ * everyone's token. So is `aud`, and `azp`, and `type` (the sample Pocket ID
+ * token that motivated this feature literally carries `"type": "id-token"`, and
+ * `{"claim":"type","values":["id-token"]}` reads like a plausible rule while
+ * admitting the entire internet). The timestamps and the per-request hashes are
+ * here for the same reason in the other direction: they match nobody twice, so a
+ * rule on one is a lockout that looks like a working config.
+ *
+ * `email_verified` is on the list for a third reason: it is a flag, and a rule
+ * on it would sidestep the deliberate coupling in `isAllowed()` that makes an
+ * `email` match require verification.
+ */
+const RESERVED_CLAIMS: ReadonlySet<string> = new Set([
+  'iss',
+  'aud',
+  'azp',
+  'exp',
+  'iat',
+  'nbf',
+  'auth_time',
+  'nonce',
+  'jti',
+  'at_hash',
+  'c_hash',
+  's_hash',
+  'typ',
+  'type',
+  'scope',
+  'token_type',
+  'email_verified',
+]);
+
+/** Exported for the settings route, which refuses these with a 400. */
+export function isReservedClaim(claim: string): boolean {
+  return RESERVED_CLAIMS.has(claim.trim().toLowerCase());
 }
 
 /** True when the block is complete enough that a login attempt can succeed. */
@@ -649,6 +750,15 @@ export interface OidcIdentity {
   emailVerified: boolean;
   preferredUsername: string;
   groups: string[];
+  /**
+   * Every claim as received, for `allowedClaims` to read.
+   *
+   * Kept raw rather than folded into the named fields above because the whole
+   * point of that setting is claims this app has never heard of. ID token wins
+   * per key where userinfo also spoke: the token is signed, userinfo is a JSON
+   * document fetched with a bearer token.
+   */
+  claims: ClaimSource;
 }
 
 /** An object with claim-shaped access. Both `IDToken` and `UserInfoResponse` fit. */
@@ -679,7 +789,44 @@ function readProfile(source: ClaimSource): Omit<OidcIdentity, 'iss' | 'sub'> {
     emailVerified: claimBoolean(source, 'email_verified'),
     preferredUsername: claimString(source, 'preferred_username'),
     groups: claimStringList(source, 'groups'),
+    claims: source,
   };
+}
+
+/**
+ * Does a claim rule match, given the claims we actually received?
+ *
+ * Accepts a string, a number, or an array of either. Everything else is refused
+ * rather than stringified, and the two refusals are the interesting part:
+ *
+ *  - A **boolean** claim is a flag, not an identity. `{"claim":"is_active",
+ *    "values":["true"]}` would read like a sensible rule and admit every active
+ *    account at the IdP. There is no coercion that makes that safe, so there is
+ *    no coercion.
+ *  - An **object or null** would stringify to `[object Object]` or `null`,
+ *    values an operator can literally type, so coercing them turns a structured
+ *    claim into an accidental wildcard.
+ *
+ * Numbers are allowed because plenty of IdPs issue numeric user ids, and
+ * comparing `1234` to the string `"1234"` an operator copied out of a token has
+ * exactly one sensible answer.
+ *
+ * Comparison is EXACT, unlike groups and emails which fold case. Those two have
+ * known semantics; a claim named by the operator does not. Widening the match on
+ * an authorization gate whose meaning we cannot see is the wrong default, and the
+ * value is copied from a token the operator can read, so exactness costs nothing.
+ */
+function claimRuleMatches(rule: ClaimRule, claims: ClaimSource): boolean {
+  const raw = claims[rule.claim];
+  const present: string[] = [];
+  const collect = (v: unknown) => {
+    if (typeof v === 'string') present.push(v.trim());
+    else if (typeof v === 'number' && Number.isFinite(v)) present.push(String(v));
+  };
+  if (Array.isArray(raw)) raw.forEach(collect);
+  else collect(raw);
+  if (present.length === 0) return false;
+  return rule.values.some((want) => present.includes(want));
 }
 
 /**
@@ -698,6 +845,11 @@ function needsUserInfo(
 ): boolean {
   if (s.allowedGroups.length > 0 && profile.groups.length === 0) return true;
   if (s.allowedEmails.length > 0 && !profile.email) return true;
+  // Same rule for operator-named claims, and it matters more here: a custom
+  // claim is exactly the kind an IdP is likely to expose at userinfo only, and
+  // an operator who configured one has no way to tell "the IdP did not send it
+  // in the token" apart from "the value did not match".
+  if (s.allowedClaims.some((rule) => profile.claims[rule.claim] === undefined)) return true;
   return !profile.name && !profile.email && !profile.preferredUsername;
 }
 
@@ -791,6 +943,10 @@ export async function handleCallback(
         emailVerified: profile.email ? profile.emailVerified : merged.emailVerified,
         preferredUsername: profile.preferredUsername || merged.preferredUsername,
         groups: profile.groups.length > 0 ? profile.groups : merged.groups,
+        // Per-key, ID token last so it wins: userinfo may carry a custom claim
+        // the token omitted, but must never be able to overwrite one the token
+        // signed.
+        claims: { ...merged.claims, ...profile.claims },
       };
     } catch (err) {
       // Non-fatal. If the missing claim was one the allowlist needs, the
@@ -804,7 +960,8 @@ export async function handleCallback(
   if (!isAllowed(identity, s)) {
     throw new OidcError(
       'not_allowed',
-      `subject ${identity.sub} authenticated at ${redactUrlCreds(identity.iss)} but matches no allowlist entry`,
+      `subject ${identity.sub} authenticated at ${redactUrlCreds(identity.iss)} but matches no ` +
+        `allowlist entry${describeRefusal(identity, s)}`,
     );
   }
   return identity;
@@ -853,11 +1010,16 @@ export async function handleCallback(
  * operator typing "Admins" for a group named "admins" would otherwise be
  * debugging an invisible failure.
  */
-function isAllowed(identity: OidcIdentity, s: OidcSettings): boolean {
+// Exported for tests. This is the whole authorization decision for SSO, it is a
+// pure function of two values, and reaching it through a full callback exchange
+// would mean a mock IdP for cases that are really a truth table. Nothing on the
+// request path imports it from outside this module.
+export function isAllowed(identity: OidcIdentity, s: OidcSettings): boolean {
   if (
     s.allowedSubjects.length === 0 &&
     s.allowedGroups.length === 0 &&
-    s.allowedEmails.length === 0
+    s.allowedEmails.length === 0 &&
+    s.allowedClaims.length === 0
   ) {
     return false;
   }
@@ -870,7 +1032,58 @@ function isAllowed(identity: OidcIdentity, s: OidcSettings): boolean {
     const email = identity.email.toLowerCase();
     if (s.allowedEmails.some((e) => e.toLowerCase() === email)) return true;
   }
+
+  for (const rule of s.allowedClaims) {
+    // A rule naming `email` routes through the same verification gate as
+    // allowedEmails. Without this, `{"claim":"email","values":[...]}` would be a
+    // strictly weaker allowlist that looks strictly more specific: it would
+    // accept an address the IdP never confirmed the user controls, which is the
+    // exact hole `allowedEmails` refuses. Same for the alias claims that carry
+    // an address under another name.
+    if (EMAIL_LIKE_CLAIMS.has(rule.claim.toLowerCase()) && !identity.emailVerified) continue;
+    if (claimRuleMatches(rule, identity.claims)) return true;
+  }
   return false;
+}
+
+/**
+ * Claims that hold an email address and therefore inherit the verification rule.
+ *
+ * Deliberately short: guessing at every name an IdP might use for an address
+ * would start rejecting logins for claims that merely sound email-ish. These
+ * three are the ones that unambiguously mean "the user's email address".
+ */
+const EMAIL_LIKE_CLAIMS: ReadonlySet<string> = new Set(['email', 'mail', 'emailaddress']);
+
+/**
+ * Explain a refusal in the server log, without printing the claim values.
+ *
+ * The distinction worth surfacing is "the IdP never sent that claim" versus "it
+ * sent it and nothing matched", because the first is a misconfiguration at the
+ * IdP and the second is a misconfiguration here, and they look identical from
+ * the login screen. Values stay out: this file's existing restraint is that
+ * detail lives in the log rather than the browser, but a claim an operator
+ * chose as an identity key can hold anything, and a log is not the place to
+ * decide it is harmless.
+ */
+function describeRefusal(identity: OidcIdentity, s: OidcSettings): string {
+  const parts: string[] = [];
+  if (s.allowedEmails.length > 0 && identity.email && !identity.emailVerified) {
+    parts.push('email present but not verified by the IdP');
+  }
+  const absent = s.allowedClaims
+    .filter((rule) => identity.claims[rule.claim] === undefined)
+    .map((rule) => rule.claim);
+  if (absent.length > 0) {
+    parts.push(`the IdP sent no ${absent.join(', ')} claim`);
+  }
+  const presentButUnmatched = s.allowedClaims
+    .filter((rule) => identity.claims[rule.claim] !== undefined)
+    .map((rule) => rule.claim);
+  if (presentButUnmatched.length > 0) {
+    parts.push(`${presentButUnmatched.join(', ')} present but no configured value matched`);
+  }
+  return parts.length > 0 ? ` (${parts.join('; ')})` : '';
 }
 
 /**

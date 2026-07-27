@@ -921,6 +921,14 @@ body.wo-col-resizing .sidebar, body.wo-col-resizing .right-sidebar { transition:
 .settings-nav button { display: block; width: 100%; text-align: left; padding: 7px 12px; background: transparent; border: 0;
   color: var(--text-muted); cursor: pointer; font-size: 13px; border-radius: var(--radius-s); }
 .settings-nav button:hover { background: var(--bg-modifier-hover); color: var(--text-normal); }
+/* Close control. Sticky so it survives the horizontal scroll the nav strip gets
+   on narrow screens, where it is the only way out of the dialog. */
+.settings-close {
+  width: auto !important; flex: 0 0 auto; align-self: flex-start;
+  font-size: 15px; line-height: 1; padding: 7px 10px !important; margin-bottom: 4px;
+  position: sticky; left: 0; z-index: 1; background: var(--bg-secondary) !important;
+}
+.settings-close:hover { background: var(--bg-modifier-hover) !important; color: var(--text-normal); }
 .settings-nav button.active { background: var(--bg-modifier-active); color: var(--text-normal); }
 .settings-content { flex: 1; overflow-y: auto; padding: 22px 28px; }
 .settings-content h2 { margin-top: 0; font-size: 18px; }

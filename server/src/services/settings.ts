@@ -602,6 +602,30 @@ const OidcBlockSchema = z.object({
       return [] as string[];
     }),
   /**
+   * Allowlist rules on a claim this app does not know the name of.
+   *
+   * The four fixed axes cover what OIDC standardises, and standardised claims
+   * are not what most IdPs key identity on. A real Pocket ID token carries
+   * `preferred_username`, `nextcloud_username` and `portainer_username` at once,
+   * because it lets an operator define per-client custom claims, and which one
+   * means "the user" is a deployment decision. So take the claim name from the
+   * operator rather than adding a fixed field per claim anyone might use.
+   *
+   * Rules OR with each other and with the fixed axes, matching how the fixed
+   * axes already behave. Claim names that are the same for every user of an
+   * issuer (`iss`, `aud`, `type`, ...) are refused at the API and dropped here:
+   * see RESERVED_CLAIMS in services/oidc.ts for why each one is on that list.
+   */
+  allowedClaims: z
+    .array(z.object({ claim: z.string(), values: z.array(z.string()) }))
+    .default([])
+    .catch((ctx: { input: unknown }) => {
+      console.warn(
+        `[settings] refusing oidc.allowedClaims ${JSON.stringify(ctx.input)}; applying no claim restriction instead`,
+      );
+      return [] as { claim: string; values: string[] }[];
+    }),
+  /**
    * Whether the password form still works once SSO is configured. DEFAULT TRUE,
    * and the default is a compatibility requirement rather than a preference.
    *

@@ -46,6 +46,25 @@ export default function Settings() {
     if (open) api.getSettings().then(setSettings).catch(() => {});
   }, [open]);
 
+  /*
+   * Escape closes. Until this existed, the ONLY way out of this dialog was
+   * clicking the backdrop, and on mobile the backdrop is not reachable: the
+   * media query promotes .settings-modal to `position: fixed; inset: 0`, so it
+   * covers the click target completely and the settings screen becomes a dead
+   * end with no way back to the vault. The explicit close button below is the
+   * real fix for that; this is the keyboard half, and it also brings the dialog
+   * in line with the command palette and the context menu, which both close on
+   * Escape already.
+   */
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setOpen(false);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [open, setOpen]);
+
   if (!open) return null;
 
   return (
@@ -53,6 +72,22 @@ export default function Settings() {
       <div className="modal settings-modal" onClick={(e) => e.stopPropagation()}>
         <div className="settings-layout">
           <div className="settings-nav">
+            {/*
+              Pinned to the start of the nav strip rather than floated over the
+              content, because the strip is the one element that is always
+              visible: it scrolls horizontally on mobile, and a close control
+              that scrolled away with the tabs would reintroduce the dead end it
+              exists to fix. `position: sticky` keeps it parked at the left edge
+              while the tabs slide underneath.
+            */}
+            <button
+              className="settings-close"
+              onClick={() => setOpen(false)}
+              aria-label="Close settings"
+              title="Close settings (Esc)"
+            >
+              ✕
+            </button>
             {(['vault', 'git', 'livesync', 'api', 'sharing', 'plugins', 'appearance', 'sso', 'account', 'about'] as Section[]).map((s) => (
               <button key={s} className={section === s ? 'active' : ''} onClick={() => setSection(s)}>
                 {labels[s]}
@@ -880,6 +915,43 @@ function splitLines(value: string): string[] {
  * IdP, no near misses), the allowlists (empty means any account the IdP will
  * authenticate) and password sign-in (turning it off breaks the desktop shell).
  */
+/** Stored rules -> one `claim = value` line per value, grouped by claim. */
+function claimRulesToText(rules: unknown): string {
+  if (!Array.isArray(rules)) return '';
+  const lines: string[] = [];
+  for (const rule of rules) {
+    if (!rule || typeof rule !== 'object') continue;
+    const claim = String((rule as any).claim ?? '').trim();
+    const values = Array.isArray((rule as any).values) ? (rule as any).values : [];
+    for (const v of values) if (claim && typeof v === 'string') lines.push(`${claim} = ${v}`);
+  }
+  return lines.join('\n');
+}
+
+/**
+ * `claim = value` lines -> stored rules, merging repeated claim names.
+ *
+ * Split on the FIRST `=` only: claim names never contain one, and a value might
+ * (base64 padding, a query string in a URL-shaped claim). Splitting on the last
+ * one, or on all of them, would silently corrupt exactly those values.
+ */
+function claimRulesFromText(text: string): { claim: string; values: string[] }[] {
+  const byClaim = new Map<string, string[]>();
+  for (const raw of text.split('\n')) {
+    const line = raw.trim();
+    if (!line) continue;
+    const eq = line.indexOf('=');
+    if (eq < 0) continue;
+    const claim = line.slice(0, eq).trim();
+    const value = line.slice(eq + 1).trim();
+    if (!claim || !value) continue;
+    const existing = byClaim.get(claim);
+    if (existing) existing.push(value);
+    else byClaim.set(claim, [value]);
+  }
+  return [...byClaim].map(([claim, values]) => ({ claim, values }));
+}
+
 function SsoSettings({ s, reload }: { s: any; reload: () => void }) {
   const o = s.oidc ?? {};
   const [cfg, setCfg] = useState({
@@ -904,6 +976,11 @@ function SsoSettings({ s, reload }: { s: any; reload: () => void }) {
     // reading a missing value as 'off' would render a page claiming PKCE is
     // disabled on an install where it is on.
     pkce: (o.pkce ?? 'auto') as 'auto' | 'force' | 'off',
+    // Stored as [{claim, values[]}] but edited as `claim = value` lines, because
+    // a repeating two-field record editor is a lot of UI for a list most people
+    // will have one entry in, and the line form is the shape an operator can
+    // paste straight out of a decoded token.
+    allowedClaims: claimRulesToText(o.allowedClaims),
   });
   const set = <K extends keyof typeof cfg>(k: K, v: (typeof cfg)[K]) =>
     setCfg((p) => ({ ...p, [k]: v }));
@@ -1019,6 +1096,7 @@ function SsoSettings({ s, reload }: { s: any; reload: () => void }) {
       allowedGroups,
       allowPasswordLogin: cfg.allowPasswordLogin,
       pkce: cfg.pkce,
+      allowedClaims: claimRulesFromText(cfg.allowedClaims),
     };
     // 'keep' sends nothing at all. The sentinel would be ignored by the server
     // anyway, but omitting the key says what is meant and keeps the mask out of
@@ -1200,6 +1278,26 @@ function SsoSettings({ s, reload }: { s: any; reload: () => void }) {
           style={{ width: 260, resize: 'vertical', fontFamily: 'var(--font-monospace, monospace)' }}
           value={cfg.allowedGroups}
           onChange={(e) => set('allowedGroups', e.target.value)}
+        />
+      </Row>
+      {/*
+        The escape hatch from the four fixed axes, and the reason it exists is
+        that standardised claims are not what most providers key identity on. A
+        real Pocket ID token carries preferred_username, nextcloud_username and
+        portainer_username side by side, because it lets you define custom claims
+        per client, and only you know which one means "the user here".
+      */}
+      <Row
+        name="Allowed claims"
+        desc="One `claim = value` per line, e.g. preferred_username = addie. Repeat a claim name to allow several values. Matches alongside the lists above: any one entry anywhere is enough."
+      >
+        <textarea
+          className="text-input"
+          rows={3}
+          placeholder="preferred_username = addie"
+          style={{ width: 260, resize: 'vertical', fontFamily: 'var(--font-monospace, monospace)' }}
+          value={cfg.allowedClaims}
+          onChange={(e) => set('allowedClaims', e.target.value)}
         />
       </Row>
       {/*
