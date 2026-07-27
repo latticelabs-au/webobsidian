@@ -365,7 +365,7 @@ export class StoragePeer {
             this.log(`refusing inbound write to an excluded path: ${rel}`, 'notice');
             return false;
         }
-        if (this.echo.isRepeating(rel, data)) {
+        if (this.echo.hasSeen(rel, data)) {
             this.log(`${rel} inbound write is an echo; skipped`, 'debug');
             return false;
         }
@@ -457,6 +457,29 @@ export class StoragePeer {
             throw new Error(`local write failed for ${rel}: ${describeError(e)}`);
         }
 
+        /*
+         * The echo claim is made HERE, after the rename, and never at the check
+         * above.
+         *
+         * Recording at the check would state "these bytes have passed through
+         * this path" while the write has not happened yet, and the write above
+         * can throw for entirely ordinary reasons (a full volume, a read-only
+         * remount, a uid change). A throw leaves the replication checkpoint
+         * unadvanced precisely so the change is replayed; the replay then arrives
+         * at this method again, finds the claim left behind by the attempt that
+         * failed, returns false, and the caller reads that false as a deliberate
+         * refusal and advances the checkpoint past a document that was never
+         * written. That is silent loss in the inbound direction, and it is the
+         * mirror image of the outbound deadlock documented on `EchoSuppressor`.
+         *
+         * Recording after the rename is still far ahead of the event it has to
+         * suppress. The claim exists to make the watcher event caused by THIS
+         * write recognisable as our own, and that event cannot reach
+         * `processPath` for at least the composition root's `awaitWriteFinish`
+         * window plus this peer's own `debounceMs` (300ms each by default),
+         * whereas this line runs in the same continuation as the rename.
+         */
+        this.echo.remember(rel, data);
         await this.recordBaseline(rel);
         this.log(`${rel} saved`, 'debug');
         return true;
@@ -478,7 +501,7 @@ export class StoragePeer {
     async delete(pathSrc: string): Promise<boolean> {
         const rel = normaliseRel(pathSrc);
         if (!rel || isIgnoredVaultPath(rel)) return false;
-        if (this.echo.isRepeating(rel, false)) {
+        if (this.echo.hasSeen(rel, false)) {
             this.log(`${rel} inbound delete is an echo; skipped`, 'debug');
             return false;
         }
@@ -499,6 +522,18 @@ export class StoragePeer {
         } catch (e) {
             throw new Error(`local delete failed for ${rel}: ${describeError(e)}`);
         }
+        /*
+         * Same discipline as `put`, and needed for the same reason: an inbound
+         * delete whose `fs.rm` threw must be replayable, so nothing may be
+         * claimed until the removal has actually happened.
+         *
+         * This claim is also what stops the deletion bouncing. The watcher sees
+         * the unlink, `processPath` reads ENOENT and hands the path to
+         * `processDelete`, and the deletion sentinel recorded here is what
+         * `processDelete` recognises as our own work rather than as a local
+         * deletion to push back out.
+         */
+        this.echo.remember(rel, false);
         this.state.deleteFileStat(rel);
         this.log(`${rel} deleted`, 'debug');
         return true;
@@ -662,7 +697,7 @@ export class StoragePeer {
             return;
         }
         if (read.kind === 'skip') return;
-        if (this.echo.isRepeating(rel, read.data)) {
+        if (this.echo.hasSeen(rel, read.data)) {
             this.log(`${rel} local change is an echo; skipped`, 'debug');
             return;
         }
@@ -671,7 +706,8 @@ export class StoragePeer {
             await this.deps.dispatch(rel, read.data);
         } catch (e) {
             /*
-             * Not delivered, so the baseline is deliberately NOT advanced.
+             * Not delivered, so NEITHER the baseline NOR the echo claim is
+             * advanced, and the second half of that sentence is the fix.
              *
              * The bridge records the baseline before dispatching and ignores the
              * outcome, so an edit made while CouchDB is unreachable is marked
@@ -679,10 +715,37 @@ export class StoragePeer {
              * touches the file. Leaving the baseline stale means the next offline
              * scan (at startup, or on the CouchDB peer's reconnect) finds this
              * file again and pushes it.
+             *
+             * That recovery was DEFEATED by the echo suppressor, which used to
+             * record the content hash as a side effect of the check above. The
+             * two mechanisms are individually correct and cancelled each other
+             * out: the failed dispatch left the baseline stale so the scan would
+             * retry, and it left a hash claiming this content had already gone
+             * out so the retry was skipped at the check and never dispatched
+             * again for the life of the process. Measured against a real CouchDB,
+             * with `/healthz/livesync` serving 200 throughout, and cleared only by
+             * a process restart because this cache is in memory. See
+             * `EchoSuppressor` for the full account; the fix is that nothing is
+             * recorded until the line below has been reached.
              */
             this.log(`${rel} not dispatched: ${describeError(e)}`, 'notice');
             return;
         }
+        /*
+         * Delivered. The claim and the baseline are made together, and they say
+         * the same thing from two angles: "CouchDB has this content" (so a repeat
+         * of these exact bytes at this path is our own echo) and "this file is
+         * synced as of this stat" (so a scan will not re-read it). Keeping them
+         * on one line of control flow is what makes the invariant checkable: a
+         * file is either both remembered and baselined, or neither.
+         *
+         * Deliberately NOT gated on the dispatch's return value. `false` means
+         * the CouchDB side legitimately skipped the write (the document already
+         * holds these exact bytes, or the push is an echo of something it just
+         * pulled), which is still "CouchDB has this content" and is exactly what
+         * both facts assert.
+         */
+        this.echo.remember(rel, read.data);
         this.state.setFileStat(rel, read.baseline);
     }
 
@@ -714,17 +777,33 @@ export class StoragePeer {
             this.log(`${rel} is on disk after all; not dispatching a delete for it`, 'debug');
             return;
         }
-        if (this.echo.isRepeating(rel, false)) return;
+        if (this.echo.hasSeen(rel, false)) return;
         this.log(`${rel} delete detected`, 'debug');
         try {
             await this.deps.dispatch(rel, false);
         } catch (e) {
+            /*
+             * Undelivered, so the baseline stays: the path remains in
+             * `trackedPaths()`, the next scan finds it in the tracked set and not
+             * on disk, and the deletion is dispatched again.
+             *
+             * And, as in `processPath`, nothing is claimed. The check above used
+             * to record the deletion sentinel as a side effect, so a deletion
+             * dispatched during a CouchDB outage poisoned its own retry in
+             * exactly the same way an edit did: the scan found the path, arrived
+             * here, matched its own failed attempt, and returned. The note stayed
+             * present on every other client in the cluster for the life of the
+             * process.
+             */
             this.log(`${rel} delete not dispatched: ${describeError(e)}`, 'notice');
             return;
         }
         this.state.deleteFileStat(rel);
-        // The path is gone: keeping its content hash would only occupy an LRU slot
-        // that a live file needs.
+        // Delivered. No claim is recorded here, because the path is gone and
+        // forgetting it is strictly better than remembering a deletion: keeping
+        // its hash would only occupy an LRU slot that a live file needs, and the
+        // inbound direction records its own sentinel in `delete()` when it is the
+        // side doing the removing.
         this.echo.forget(rel);
     }
 

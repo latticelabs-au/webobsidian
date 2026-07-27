@@ -48,8 +48,10 @@ import {
     APPLY_GRACE_MS,
     DECODE_GRACE_MS,
     DELIVER_GRACE_MS,
+    HELD_GRACE_MS,
     PROBE_GRACE_MS,
     WRITE_GRACE_MS,
+    type InboundProgressOptions,
 } from '../services/livesync/progress.js';
 import type { DispatchFn, FileData, LiveSyncCouchDBConf, LiveSyncLogger } from '../services/livesync/types.js';
 
@@ -827,6 +829,12 @@ describe('InboundProgress', () => {
         // it gets the standing conditions' patience rather than a fourth number.
         // It must not be zero, or one transient EBUSY flips the health signal.
         expect(WRITE_GRACE_MS).toBe(DELIVER_GRACE_MS);
+        // And so does the checkpoint hold, for a reason of its own: the engine
+        // re-arms its own changes feed ten seconds after an error, and that re-arm
+        // replays from the held checkpoint and clears the hold. A window shorter
+        // than that would report ordinary self-healing as a fault on every blip.
+        expect(HELD_GRACE_MS).toBe(DELIVER_GRACE_MS);
+        expect(HELD_GRACE_MS).toBeGreaterThan(10_000);
     });
 
     it('FINDING 2: gives the pending probe a deadline sized for its EXPENSIVE case', () => {
@@ -1046,6 +1054,16 @@ interface PeerInternals {
     progress: InboundProgress;
 }
 
+/**
+ * `FakeManipulator.put` replaced for one test, so a CouchDB write can be made to
+ * throw.
+ *
+ * Typed rather than assigned through `any`: the peer calls `man.put(path, body,
+ * info, type)` and only the path is asserted on, so the stand-in takes the path
+ * and ignores the rest, which is exactly what the class method does.
+ */
+type PutFn = (path: string) => Promise<boolean>;
+
 function couchConf(overrides: Partial<LiveSyncCouchDBConf> = {}): LiveSyncCouchDBConf {
     return {
         name: 'couch',
@@ -1115,6 +1133,15 @@ describe('CouchDBPeer inbound wiring', () => {
         state?: LiveSyncStateStore;
         /** Change the key material or the remote the peer believes it is talking to. */
         conf?: Partial<LiveSyncCouchDBConf>;
+        /**
+         * Narrow the ledger's windows further for one test.
+         *
+         * Merged over the defaults below rather than replacing them, so a test
+         * that only cares about (say) the checkpoint-hold window does not silently
+         * restore the production-length windows for every other clock and then
+         * assert against a condition that can no longer be reached inside a test.
+         */
+        progress?: InboundProgressOptions;
     }
 
     /** A store on the shared temp dir, with the debounce pushed out of reach. */
@@ -1155,6 +1182,7 @@ describe('CouchDBPeer inbound wiring', () => {
                 deliverGraceMs: 3_000,
                 probeGraceMs: 4_000,
                 writeGraceMs: 5_000,
+                ...w.progress,
             },
         });
         const man = new FakeManipulator(opts);
@@ -1931,6 +1959,302 @@ describe('CouchDBPeer inbound wiring', () => {
         internals.escalateInboundFatal();
         await flush();
         expect(peer.getFatalReason()).toContain('passphrase');
+    });
+
+    // -----------------------------------------------------------------------
+    // D1 (CouchDB half): a push that threw must be retried, not answered with
+    // the claim its own failed attempt left behind
+    // -----------------------------------------------------------------------
+
+    it('D1: a CouchDB write that threw is genuinely re-attempted, not swallowed as an echo', async () => {
+        /*
+         * REGRESSION GUARD FOR DEFECT 1, THE HALF THAT LIVES ON THIS SIDE OF THE
+         * PAIR, and the reason fixing the storage peer alone would have moved the
+         * loss one layer down rather than removing it.
+         *
+         * The suppressor used to record the content hash as a side effect of the
+         * "is this an echo?" question, on the MISS path, i.e. before the write it
+         * describes had happened. So a push that threw (CouchDB unreachable
+         * mid-write, a 401 after a credential rotation) left behind a claim that
+         * these exact bytes had already gone out. `StoragePeer.processPath` reacts
+         * to a throw by leaving the file's baseline unadvanced precisely so the
+         * next offline scan retries it, and that retry arrived here, matched the
+         * claim, and returned `false` WITHOUT THROWING. A non-throwing dispatch is
+         * what `processPath` treats as delivered, so it advanced the baseline and
+         * the file was marked synced having never reached CouchDB. No scan looks
+         * at it again.
+         *
+         * The two assertions that matter are the second `put` resolving TRUE and
+         * `man.puts` containing the path: both say the retry reached the network.
+         * Revert `hasSeen`/`remember` here to the old record-on-miss and the second
+         * put resolves `false` with `man.puts` empty.
+         */
+        const { peer, man } = makePeer();
+        const data: FileData = { ctime: 1, mtime: 1, size: 3, data: ['abc'] };
+
+        let failNext = true;
+        const put: PutFn = (p: string) => {
+            if (failNext) {
+                failNext = false;
+                return Promise.reject(new Error('socket hang up'));
+            }
+            man.puts.push(p);
+            return Promise.resolve(true);
+        };
+        man.put = put;
+
+        // The outage. A throw is the contract: the caller must not record this
+        // file as synced.
+        await expect(peer.put('note.md', data)).rejects.toThrow(/CouchDB put failed/);
+        expect(man.puts).toEqual([]);
+
+        // CouchDB is back, and the scan retries the same bytes at the same path.
+        await expect(peer.put('note.md', data)).resolves.toBe(true);
+        expect(man.puts).toEqual(['note.md']);
+    });
+
+    it('D1 CONTROL: a push that SUCCEEDED still does not bounce back off the feed', async () => {
+        /*
+         * The other half of the invariant, and the reason the fix could not simply
+         * be "stop recording": a write that WAS pushed must never come back as a
+         * new change. The feed hands our own document back within milliseconds of
+         * every push, and without suppression it would be dispatched to the vault,
+         * rewritten there, observed by the watcher, and pushed again.
+         *
+         * `getByMeta` is overridden so the document that comes back down carries
+         * the bytes that went up; the suppressor hashes content only, so that is
+         * what makes this the same change rather than a different one.
+         */
+        const bytes = 'abc';
+        const { peer, man } = makePeer({
+            getByMeta: (doc) => Promise.resolve({ ...doc, data: [bytes] }),
+        });
+        const data: FileData = { ctime: 1, mtime: 1, size: bytes.length, data: [bytes] };
+
+        await expect(peer.put('note.md', data)).resolves.toBe(true);
+        expect(man.puts).toEqual(['note.md']);
+
+        // ...and here it comes back down the changes feed, as it always does.
+        man.emitChange({ seq: '1', doc: remoteDoc('note.md') });
+        await flush();
+        expect(dispatched).toEqual([]);
+    });
+
+    // -----------------------------------------------------------------------
+    // D2: the checkpoint is a low-water mark, not a high-water one
+    // -----------------------------------------------------------------------
+
+    /** The three seed documents whose writes fail, as in the measured run. */
+    function failOn(paths: string[]): DispatchFn {
+        const failing = new Set(paths);
+        return (p: string) =>
+            failing.has(p)
+                ? Promise.reject(new Error('EACCES: permission denied'))
+                : Promise.resolve(true);
+    }
+
+    it('D2: a later successful change does not carry the checkpoint past a failed one', async () => {
+        /*
+         * REGRESSION GUARD FOR DEFECT 2, driven with the sequence numbers from the
+         * run that found it.
+         *
+         * A throw from `onRemoteChange` correctly skips the checkpoint advance for
+         * THAT sequence, and that was never enough, because `since` is a single
+         * value. The next change that applies writes its own, higher sequence over
+         * the failure, and from that moment the failed sequences are behind the
+         * checkpoint: no replay will ever deliver them again, from this process or
+         * any later one, because the checkpoint is persisted. Measured against a
+         * real CouchDB: pinned at 5 through three failures, jumped to 14 when the
+         * next document landed, three notes permanently missing from the vault,
+         * `state: idle`, `healthy: true`, `/healthz/livesync` 200, and a deliberate
+         * disconnect/reconnect did NOT recover them.
+         *
+         * Revert `checkpointHeld` and the assertion below reads '14', which is the
+         * defect exactly.
+         */
+        const { peer, man, state } = makePeer(
+            {},
+            { dispatch: failOn(['seed-4.md', 'seed-5.md', 'seed-6.md']) },
+        );
+
+        man.emitChange({ seq: '5', doc: remoteDoc('seed-3.md') });
+        await flush();
+        expect(state.getSince()).toBe('5'); // the last change that actually landed
+
+        man.emitChange({ seq: '6', doc: remoteDoc('seed-4.md') });
+        man.emitChange({ seq: '7', doc: remoteDoc('seed-5.md') });
+        man.emitChange({ seq: '8', doc: remoteDoc('seed-6.md') });
+        await flush();
+        expect(peer.inbound().failed).toBe(3);
+
+        // The change that used to do the damage: it applies cleanly, and its own
+        // sequence used to become the checkpoint.
+        man.emitChange({ seq: '14', doc: remoteDoc('seed-7.md') });
+        await flush();
+        expect(peer.inbound().applied).toBe(2);
+
+        expect(state.getSince()).toBe('5');
+        expect(peer.inbound().checkpointHeld).toBe(true);
+    });
+
+    it('D2: the held checkpoint is what makes a reconnect replay the failed changes', async () => {
+        /*
+         * The other end of the same fix: holding the checkpoint is only worth
+         * anything if something eventually replays from it, and this is the
+         * mechanism that does. Re-arming the feed (what the watchdog does when the
+         * connection drops, and what `maybeRestart`'s disconnect/connect does)
+         * resumes from the persisted checkpoint, so every sequence after the hold
+         * is delivered again, the failed ones included.
+         *
+         * This also drives the inbound half of DEFECT 1, and could not work
+         * without it: the first attempt at seed-4.md threw, and if that attempt had
+         * recorded an echo claim the replay would have been skipped at the gate and
+         * the hold would have been released having achieved nothing. Both hunks are
+         * load-bearing here, so a revert of either fails the last two assertions.
+         */
+        const failing = new Set(['seed-4.md']);
+        // Its own recorder: supplying `dispatch` replaces the shared one that
+        // writes to `dispatched`, so a test that asserts on what reached the vault
+        // has to keep its own list or it would assert against an array nothing
+        // ever appends to.
+        const landed: string[] = [];
+        const { peer, man, internals, state } = makePeer(
+            {},
+            {
+                dispatch: (p: string) => {
+                    if (failing.has(p)) return Promise.reject(new Error('EACCES: permission denied'));
+                    landed.push(p);
+                    return Promise.resolve(true);
+                },
+            },
+        );
+
+        man.emitChange({ seq: '5', doc: remoteDoc('seed-3.md') });
+        await flush();
+        man.emitChange({ seq: '6', doc: remoteDoc('seed-4.md') });
+        await flush();
+        expect(landed).toEqual(['seed-3.md']);
+        expect(state.getSince()).toBe('5');
+
+        // The link drops and the watchdog re-arms the feed. It must resume from
+        // the HELD position, not from the last sequence the feed happened to see.
+        man.endWatch();
+        internals.startWatch();
+        expect(man.since).toBe('5');
+        expect(peer.inbound().checkpointHeld).toBe(false);
+
+        // The vault is writable again, and the replay delivers seed-4.md a second
+        // time. It has to reach the vault this time.
+        failing.clear();
+        man.emitChange({ seq: '6', doc: remoteDoc('seed-4.md') });
+        await flush();
+        expect(landed).toEqual(['seed-3.md', 'seed-4.md']);
+        expect(state.getSince()).toBe('6');
+    });
+
+    it('D2: a checkpoint held past its grace window is reported, and is restart-worthy', async () => {
+        /*
+         * The visibility half. A hold that clears itself in seconds is ordinary
+         * self-healing and must stay quiet; a hold that is still standing a minute
+         * later means the vault is missing a note and nothing is coming to fix it
+         * on its own, which is precisely the state that used to report `idle` and
+         * answer 200.
+         *
+         * `restartFutile: false` is the assertion that closes the loop: the
+         * supervisor's one lever is to rebuild the peer pair, the rebuilt pair arms
+         * its feed from the held checkpoint, and that replay IS the retry. The
+         * operators who hit this defect performed it by hand.
+         */
+        const { peer, man } = makePeer(
+            {},
+            { dispatch: failOn(['seed-4.md']), progress: { heldGraceMs: 6_000 } },
+        );
+
+        man.emitChange({ seq: '6', doc: remoteDoc('seed-4.md') });
+        await flush();
+        // A change that lands afterwards, so the total-failure verdict
+        // (`unwritable`) is NOT what is being measured here: the partial case is
+        // the one that used to be invisible.
+        man.emitChange({ seq: '7', doc: remoteDoc('seed-7.md') });
+        await flush();
+
+        // Inside the window: still quiet, and still honest about it in the detail.
+        expect(peer.inbound().state).toBe('idle');
+        expect(peer.inbound().checkpointHeld).toBe(true);
+        expect(peer.inbound().detail).toContain('awaiting replay');
+        expect(peer.snapshot().ok).toBe(true);
+
+        vi.advanceTimersByTime(6_001);
+        const v = peer.inbound();
+        expect(v.state).toBe('behind');
+        expect(v.stalled).toBe(true);
+        expect(v.fatal).toBe(false);
+        expect(v.restartFutile).toBe(false);
+        expect(peer.snapshot().ok).toBe(false);
+        expect(peer.snapshot().detail).toContain('checkpoint is held');
+    });
+
+    // -----------------------------------------------------------------------
+    // D3: "the peer is running" and "the link is up" are two questions
+    // -----------------------------------------------------------------------
+
+    it('D3: a mid-session link drop is visible, while the lifecycle flag stays true', () => {
+        /*
+         * REGRESSION GUARD FOR DEFECT 3.
+         *
+         * `connected` is set once when the connect sequence succeeds and cleared
+         * only by an explicit stop or a fatal configuration, so it is a statement
+         * about the peer's lifecycle and not about the link. Measured true for the
+         * whole of a 269-second dead link. Two things read badly as a result:
+         * `classifyDetail()` in routes/livesync.ts has a `not connected to CouchDB`
+         * case that is unreachable for any mid-session drop, so the public health
+         * endpoint published the far vaguer `peers not syncing` for the first
+         * minute of every outage; and the `connected` field on the status API,
+         * which an operator reads as "is my CouchDB reachable", said yes while it
+         * was not.
+         *
+         * The fix is to add the second question rather than to redefine the first,
+         * because three callers genuinely want the lifecycle answer (see
+         * `isConnected`). Revert `isLinkUp()` to return `this.connected` and every
+         * `false` below becomes `true`.
+         */
+        const { peer, man } = makePeer();
+        expect(peer.isConnected()).toBe(true);
+        expect(peer.isLinkUp()).toBe(true);
+
+        // The link dies. PouchDB's feed emits `error` (or a clean `complete` on an
+        // idle-timeout), the engine clears `watching`, and nothing else changes.
+        man.endWatch();
+
+        // The lifecycle answer is deliberately unchanged: the peer is still
+        // running, still supervised, and still the thing that will reconnect.
+        expect(peer.isConnected()).toBe(true);
+        // The link answer is not.
+        expect(peer.isLinkUp()).toBe(false);
+        expect(peer.snapshot().detail).toBe('reconnecting');
+
+        // And time does not heal it, which is the whole shape of the report: the
+        // flag stayed true for 269 measured seconds of a dead link.
+        vi.advanceTimersByTime(269_000);
+        expect(peer.isConnected()).toBe(true);
+        expect(peer.isLinkUp()).toBe(false);
+    });
+
+    it('D3: the link reads down before the first connect, and up again after a re-arm', () => {
+        // The two boundaries. A peer that has never connected must not claim a
+        // link, and a peer whose watchdog has re-armed the feed must stop denying
+        // one, or the recovery would be invisible in exactly the field an operator
+        // is watching.
+        const { peer, man, internals } = makePeer();
+        internals.connected = false;
+        expect(peer.isLinkUp()).toBe(false);
+
+        internals.connected = true;
+        man.endWatch();
+        expect(peer.isLinkUp()).toBe(false);
+
+        internals.startWatch();
+        expect(peer.isLinkUp()).toBe(true);
     });
 });
 

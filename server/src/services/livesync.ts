@@ -119,7 +119,15 @@ export interface LiveSyncStatus {
   enabled: boolean;
   /** A peer pair exists and has been started. */
   running: boolean;
-  /** The CouchDB peer has a live connection right now. */
+  /**
+   * The CouchDB peer has a live connection RIGHT NOW: the peer is running and its
+   * changes feed is attached.
+   *
+   * The second half of that sentence is what this field used to be missing. It
+   * reported the peer's lifecycle flag, which is set once on a successful connect
+   * and cleared only by an explicit stop, so it answered "yes" for the whole of
+   * every mid-session outage. See `CouchDBPeer.isLinkUp()`.
+   */
   connected: boolean;
   liveMode: boolean;
   intervalSec: number;
@@ -773,7 +781,14 @@ async function syncImpl(opts: LiveSyncPassOptions): Promise<{ ok: boolean; log: 
     return { ok: false, log: [`Configuration error: ${fatal}`] };
   }
 
-  const connected = rt.couch.isConnected();
+  /*
+   * The LINK, not the lifecycle. `isConnected()` answers "did the connect
+   * sequence complete", which stays true for the whole of an outage of any
+   * length, so a pass during a dead link used to open with "Connected to
+   * couch.example/vault" and then report everything else honestly. See
+   * `CouchDBPeer.isLinkUp()`.
+   */
+  const connected = rt.couch.isLinkUp();
   lines.push(connected ? `Connected to ${describeRemote(s)}` : 'CouchDB is not reachable; retrying in the background');
 
   /*
@@ -902,7 +917,17 @@ async function statusImpl(): Promise<LiveSyncStatus> {
     backend: s.sync.backend,
     enabled: s.sync.backend === 'livesync',
     running: Boolean(rt) && rt?.stopped === false,
-    connected: rt?.couch.isConnected() ?? false,
+    /*
+     * The LINK, and `running` above is the lifecycle. Splitting them here is the
+     * whole point: an operator reading this API, and `classifyDetail()` in
+     * routes/livesync.ts reading it on their behalf, is asking whether CouchDB is
+     * reachable right now, and the lifecycle flag answered that with a permanent
+     * yes for the entire duration of any mid-session drop. `classifyDetail`'s
+     * `not connected to CouchDB` case was unreachable as a result, so the public
+     * health endpoint reported the vaguer `peers not syncing` for the first minute
+     * of every outage. See `CouchDBPeer.isLinkUp()`.
+     */
+    connected: rt?.couch.isLinkUp() ?? false,
     liveMode: s.livesync.liveMode,
     intervalSec: s.livesync.intervalSec,
     remote: describeRemote(s),
