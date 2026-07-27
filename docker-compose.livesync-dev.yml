@@ -1,0 +1,64 @@
+# Disposable CouchDB for developing and testing the LiveSync backend (FR-14).
+#
+# This is a DEVELOPMENT aid and is deliberately a separate file from
+# docker-compose.yml: LiveSync talks to a CouchDB the operator already runs (the
+# same cluster their Obsidian clients use), exactly as the git backend talks to a
+# remote the operator already has. WebObsidian does not ship a database, and
+# CONTRIBUTING.md is explicit that runtime config stays JSON only, so nothing here
+# belongs in the production stack.
+#
+#   docker compose -f docker-compose.livesync-dev.yml up -d
+#   docker compose -f docker-compose.livesync-dev.yml down -v     # -v wipes the data
+#
+# Then point Settings > LiveSync at http://127.0.0.1:5984 with the credentials
+# below and a database name of your choosing.
+#
+# The single-node setup below needs its system databases created once. CouchDB
+# will not serve requests correctly without them, and the error it gives is
+# unhelpful, so the init container does it rather than leaving you to find out:
+#   curl -X PUT http://admin:devpassword@127.0.0.1:5984/_users
+#
+# WARNING: these credentials are hardcoded and weak on purpose, because this
+# binds to localhost and exists to be thrown away. Never expose this port, and
+# never reuse this file as a template for a real deployment.
+
+services:
+  couchdb:
+    image: couchdb:3
+    container_name: webobsidian-livesync-dev-couch
+    restart: unless-stopped
+    environment:
+      COUCHDB_USER: admin
+      COUCHDB_PASSWORD: devpassword
+    ports:
+      # Bound to loopback only. A CouchDB with these credentials reachable from
+      # the network is an open database.
+      - "127.0.0.1:5984:5984"
+    volumes:
+      - livesync-dev-couch:/opt/couchdb/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:5984/_up"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  # Creates the system databases a single-node CouchDB needs, then exits.
+  # Without _users the auth endpoints misbehave; without _replicator the
+  # replicator is unavailable. Idempotent: re-running is harmless.
+  couchdb-init:
+    image: curlimages/curl:latest
+    container_name: webobsidian-livesync-dev-init
+    depends_on:
+      couchdb:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command: >
+      'for db in _users _replicator _global_changes; do
+         curl -sS -X PUT "http://admin:devpassword@couchdb:5984/$$db" || true;
+       done;
+       echo "system databases ready"'
+    restart: "no"
+
+volumes:
+  livesync-dev-couch:

@@ -5,6 +5,7 @@ import { z } from 'zod';
 import { config, SETTINGS_FILE } from '../config.js';
 import { isDefaultPasswordActive } from './password-policy.js';
 import { getApiKeyLastUsed } from './apikey-usage.js';
+import { redactUrlCreds } from '../lib/redact.js';
 
 /**
  * Schema version of the settings file this build writes. Bumped whenever a
@@ -185,7 +186,173 @@ const ApiKeySchema = z.object({
   lastUsed: z.string().nullable().default(null),
 });
 
-const SettingsSchema = z.object({
+/**
+ * The literal that stands in for a stored secret in every API response, and the
+ * literal the settings PUT reads back as "the client did not change this".
+ *
+ * Eight U+2022 BULLET characters. It is a shared constant rather than a repeated
+ * literal because it is load-bearing on BOTH sides of one round trip:
+ * redactSettings() writes it, and routes/settings.ts compares an incoming value
+ * against it byte-for-byte before deciding whether that value is a new secret.
+ * Let the two copies drift and the failure is silent in the worst possible
+ * direction: the comparison stops matching, so the mask the UI just echoed back
+ * is stored as if it were the operator's real password or passphrase, and the
+ * credential is destroyed by a save that reported success. Byte-identical, one
+ * definition, both doors.
+ */
+export const REDACTED_SECRET = '••••••••';
+
+/**
+ * True when the LiveSync E2EE settings are in the one combination that looks
+ * configured and is not: an obfuscation passphrase with no encryption passphrase.
+ *
+ * This gets a long note because the failure is invisible from outside and it
+ * defeats the exact check an operator would run to convince themselves that
+ * end-to-end encryption is on.
+ *
+ * The engine derives encryption from the passphrase ALONE. In
+ * server/vendor/livesync-engine, DirectFileManipulatorV2's `get settings()`
+ * builds the remote database settings with
+ * `encrypt: this.options.passphrase ? true : false`, while the document id is
+ * hashed on a separate path via
+ * `path2id_base(name, this.options.obfuscatePassphrase ?? false, ...)`. So with
+ * obfuscatePassphrase set and passphrase empty:
+ *
+ *   - every document id in CouchDB is opaque (`f:<hash>`), which is precisely
+ *     what KICKOFF acceptance criterion 3 tells an operator to look for, and
+ *   - every document BODY is written in the clear, so `path`, `mtime`, `size`
+ *     and the chunk contents of every note are readable by anyone who can read
+ *     the database.
+ *
+ * An operator who lists the ids sees opaque hashes, concludes E2EE is honoured,
+ * and is wrong about every byte that matters. That is worse than plainly
+ * unencrypted replication, because unencrypted replication does not claim
+ * otherwise. Both doors therefore refuse the combination: the API answers 400
+ * (routes/settings.ts) and the schema below refuses to RUN the backend when a
+ * hand-edited file contains it.
+ *
+ * Structural, not stylistic: the predicate lives here so the HTTP layer, the
+ * schema and services/livesync.ts all ask the same question in the same words.
+ */
+export function isUnsafeE2eePairing(v: {
+  passphrase: string;
+  obfuscatePassphrase: string;
+}): boolean {
+  return Boolean(v.obfuscatePassphrase) && !v.passphrase;
+}
+
+/**
+ * The LiveSync (CouchDB) backend configuration, as a sibling of the `git` block.
+ *
+ * One deliberate difference from every other string field in this file: nothing
+ * in here is trimmed except the fields where surrounding whitespace can only
+ * ever be a paste artefact. `password`, `passphrase` and `obfuscatePassphrase`
+ * are stored byte-for-byte INCLUDING leading and trailing whitespace, because
+ * they are key material. Trimming a passphrase silently derives a different key,
+ * and the symptom is not an error at save time: it is a remote database full of
+ * documents this instance can no longer decrypt, discovered long afterwards with
+ * nothing left to reconstruct the original string from. `uri`, `database` and
+ * `username` are trimmed, because " http://host " is never anything but a typo.
+ */
+const LiveSyncBlockSchema = z.object({
+  /**
+   * The CouchDB base URL, WITHOUT the database name and without a trailing
+   * slash. The engine builds its endpoint by string concatenation
+   * (`this.options.url + "/" + this.options.database` in
+   * DirectFileManipulatorV2.$$createPouchDBInstance), so a stored trailing slash
+   * yields `http://host//db`. That is not a cosmetic difference: CouchDB treats
+   * the empty path segment as a database name of its own, so the request lands
+   * somewhere that does not exist and the backend reports a connection problem
+   * that no amount of staring at the URL explains. Normalising here, and
+   * identically in routes/settings.ts, means both entry points store one string.
+   *
+   * Credentials do not belong in this field. The API refuses a URL carrying
+   * userinfo outright, and redactSettings() masks it on the way out in case a
+   * hand-edited file has one anyway.
+   */
+  uri: z
+    .string()
+    .default('')
+    .transform((v) => v.trim().replace(/\/+$/, '')),
+  database: z
+    .string()
+    .default('')
+    .transform((v) => v.trim()),
+  username: z
+    .string()
+    .default('')
+    .transform((v) => v.trim()),
+  // The three secrets. Never trimmed (see the block note), never logged, always
+  // masked by redactSettings() before they can reach a client.
+  password: z.string().default(''),
+  passphrase: z.string().default(''),
+  obfuscatePassphrase: z.string().default(''),
+  /**
+   * Continuous replication, opt-in, default FALSE.
+   *
+   * That default is a safety property rather than a taste: live mode holds an
+   * open changes feed and applies remote writes into the vault the moment they
+   * arrive, so an operator who mistypes a database name (or points a fresh
+   * instance at a colleague's cluster) finds out by having someone else's vault
+   * written over theirs in real time. Interval polling reaches the same steady
+   * state one tick later, with a window in which a misconfiguration can still be
+   * noticed and corrected. Turn it on once the pairing is proven.
+   */
+  liveMode: z.boolean().default(false).catch(false),
+  /**
+   * Poll interval when liveMode is off, in seconds.
+   *
+   * Bounded for the same reason as api.rateLimitPerMin above: at 0 or a negative
+   * value the scheduler's timer degenerates into a hot loop hammering CouchDB,
+   * and because the value is persisted the damage survives a restart. `.catch()`
+   * so that one bad literal in a hand-edited file cannot take the whole file
+   * down with it, which (see `version`) would rewrite it from defaults and
+   * destroy jwtSecret, the API keys and git.token.
+   */
+  intervalSec: z.number().int().min(1).default(30).catch(30),
+  /**
+   * Vault-relative directories replicated as LiveSync internal (`i:`) documents.
+   * EMPTY BY DEFAULT, which is why this is a list of opt-in directories rather
+   * than the boolean the reference bridge exposes.
+   *
+   * Two independent reasons, and either one on its own would be enough:
+   *
+   * 1. The reference bridge's own implementation of this feature is broken. It
+   *    strips the base directory BEFORE adding the `i:` prefix, so the stored
+   *    name is mangled, and it never re-adds the prefix on the outbound side, so
+   *    the same file comes back as a second, divergent document. Shipping the
+   *    feature on by default would mean shipping that defect on by default.
+   * 2. WebObsidian's own watcher in server/src/index.ts deliberately ignores
+   *    `.obsidian/`, because desktop Obsidian rewrites its workspace files
+   *    constantly and floods the server. Replicating those same files inbound
+   *    while refusing to watch them outbound is a one-way flow that no operator
+   *    asked for.
+   *
+   * Entries are validated as vault-relative sub-paths by the API (the same
+   * predicate that guards vault.trash), because an entry here is joined onto the
+   * vault root exactly like that one is: a `..` segment would replicate the
+   * operator's home directory into CouchDB. A hand-edited file with a bad entry
+   * heals to the empty list rather than to "everything", i.e. fail closed:
+   * replicating nothing extra is always recoverable, replicating the wrong tree
+   * to a remote is not.
+   */
+  includeInternal: z
+    .array(z.string())
+    .default([])
+    .transform((v) => v.map((entry) => entry.trim()))
+    .refine((v) => v.every(isVaultRelativeSubpath), {
+      message:
+        'each entry must be a vault-relative sub-path: no absolute paths, drive letters, UNC prefixes or ".." segments',
+    })
+    .catch((ctx: { input: unknown }) => {
+      console.warn(
+        `[settings] refusing livesync.includeInternal ${JSON.stringify(ctx.input)}; replicating no internal files instead`,
+      );
+      return [] as string[];
+    }),
+});
+
+const SettingsBaseSchema = z.object({
   /**
    * Schema version of the file on disk. Two separate behaviours, and they need
    * different answers, which is why this is not a bare `z.number()`:
@@ -249,6 +416,43 @@ const SettingsSchema = z.object({
         .default(['*.png', '*.jpg', '*.jpeg', '*.gif', '*.pdf', '*.mp4', '*.mov', '*.zip']),
     })
     .default({}),
+  /**
+   * Which backend owns this vault's synchronisation. ONE value, never a set.
+   *
+   * Mutual exclusivity is enforced by the SHAPE of this field, deliberately, and
+   * it is a data-integrity rule rather than a UI simplification (KICKOFF §5.3).
+   * Git and LiveSync have incompatible conflict models: git resolves at commit
+   * granularity over a working tree it assumes it alone mutates, while LiveSync
+   * resolves per document against revision history held in CouchDB. Run both
+   * over one vault and each one's writes look to the other like an unexplained
+   * local edit. A checkout reverts a replicated change, LiveSync replicates the
+   * revert back out as a new revision, the next tick reverts it again, and the
+   * vault churns between two histories with no principled way to say which side
+   * is right. There is no merge that repairs that after the fact, so the settings
+   * model refuses to let the state be expressed at all: an enum cannot hold two
+   * values, and there is no "both" for a UI to offer or a PUT to smuggle in.
+   *
+   * 'none' is the default so that this block appearing in an existing install
+   * changes nothing until an operator opts in. The legacy `git.enabled` and
+   * `git.autoSync` flags keep their current meaning for the git path and are
+   * deliberately NOT rewritten when the backend changes: silently clearing an
+   * operator's git configuration on a backend switch would be a surprise, and it
+   * would not survive switching back. The contract is instead that
+   * services/autosync.ts treats `sync.backend` as authoritative and must not run
+   * the git path while the backend is 'livesync' (KICKOFF acceptance criterion 7:
+   * git behaviour is unchanged when the backend is not 'livesync').
+   *
+   * `.catch()` for the usual reason documented on `version`: an unrecognised
+   * literal in a hand-edited file heals to 'none' (no sync at all, the only safe
+   * answer to "which writer owns this vault?") instead of failing the parse and
+   * taking jwtSecret, the API keys and git.token down with it.
+   */
+  sync: z
+    .object({
+      backend: z.enum(['none', 'git', 'livesync']).default('none').catch('none'),
+    })
+    .default({}),
+  livesync: LiveSyncBlockSchema.default({}),
   search: z
     .object({
       fuzzy: z.number().default(0.2),
@@ -285,6 +489,54 @@ const SettingsSchema = z.object({
     })
     .default({}),
 });
+
+type SettingsBase = z.infer<typeof SettingsBaseSchema>;
+
+/**
+ * The self-heal that pairs with the API's 400 for the E2EE hazard documented on
+ * isUnsafeE2eePairing(): a settings file that would run the LiveSync backend
+ * with an obfuscation passphrase and no encryption passphrase does not run it.
+ *
+ * This is the same division of labour the vault path fields use. The HTTP layer
+ * refuses the combination loudly (routes/settings.ts), and this is the matching
+ * non-destructive fallback for a file that arrived by a hand edit, a restored
+ * backup, or a build that predates the check.
+ *
+ * Three plausible heals, and only one of them is honest:
+ *
+ *   - Clear obfuscatePassphrase. Rejected: replication then proceeds with
+ *     plaintext ids AND plaintext bodies, which silently downgrades what the
+ *     operator asked for, and re-keys every document id in a database that may
+ *     already be populated.
+ *   - Copy obfuscatePassphrase into passphrase. Rejected outright: never invent
+ *     key material on a user's behalf. It would encrypt a vault under a key
+ *     nobody chose and that no other client is configured with.
+ *   - Refuse to run. Taken. The operator's fields are preserved exactly as
+ *     written, so the UI still shows what they configured and one edit fixes it,
+ *     and in the meantime not one byte of path, mtime, size or content leaves
+ *     the machine under a false expectation of encryption. It fails closed and
+ *     it fails visibly, which is the whole point: a sync daemon that quietly
+ *     does the wrong thing is worse than one that stops.
+ *
+ * A transform rather than a throwing refinement, because loadSettingsImpl treats
+ * ANY parse failure as "file unusable" and rewrites from defaults(), so throwing
+ * here would answer a configuration mistake by destroying jwtSecret, every API
+ * key and git.token.
+ */
+function enforceSyncSafety(s: SettingsBase): SettingsBase {
+  if (s.sync.backend === 'livesync' && isUnsafeE2eePairing(s.livesync)) {
+    console.warn(
+      '[settings] refusing to run the LiveSync backend: livesync.obfuscatePassphrase is set ' +
+        'while livesync.passphrase is empty, which produces opaque document ids over plaintext ' +
+        'bodies (path, mtime, size and content readable in CouchDB). Set livesync.passphrase, ' +
+        'or clear livesync.obfuscatePassphrase, then re-select the backend.',
+    );
+    s.sync.backend = 'none';
+  }
+  return s;
+}
+
+const SettingsSchema = SettingsBaseSchema.transform(enforceSyncSafety);
 
 export type Settings = z.infer<typeof SettingsSchema>;
 export type ApiKeyRecord = z.infer<typeof ApiKeySchema>;
@@ -579,7 +831,31 @@ export function redactSettings(s: Settings) {
       hasCustomPassword: !isDefaultPasswordActive(s.auth),
       hasOverridePassword: Boolean(s.auth.passwordHash),
     },
-    git: { ...s.git, token: s.git.token ? '••••••••' : '' },
+    git: { ...s.git, token: s.git.token ? REDACTED_SECRET : '' },
+    livesync: {
+      ...s.livesync,
+      /**
+       * The URI is not a secret field, but it is a URL, and a hand-edited
+       * settings.json can perfectly well contain `https://user:pass@host` in it.
+       * The API refuses that form outright (requireCouchUri in
+       * routes/settings.ts), so masking here is the belt to that braces: a
+       * credential this process did not write still cannot leave it through a
+       * settings response. redactUrlCreds is a no-op on a URL without userinfo,
+       * which is every URL this build stores.
+       *
+       * routes/settings.ts knows this mask exists and treats an incoming URI
+       * that is exactly the masked form of the stored one as "unchanged" rather
+       * than storing `https://***@host`, which would replace a working URL with
+       * a broken one on the next save from a UI that round-trips what it read.
+       */
+      uri: redactUrlCreds(s.livesync.uri),
+      // All three are write-only over the API. Empty stays empty rather than
+      // becoming the mask, so the client can still tell "not configured" from
+      // "configured, value withheld" and render the two states differently.
+      password: s.livesync.password ? REDACTED_SECRET : '',
+      passphrase: s.livesync.passphrase ? REDACTED_SECRET : '',
+      obfuscatePassphrase: s.livesync.obfuscatePassphrase ? REDACTED_SECRET : '',
+    },
     api: {
       ...s.api,
       keys: s.api.keys.map((k) => ({

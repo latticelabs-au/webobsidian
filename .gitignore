@@ -14,6 +14,6 @@ coverage/
 # Desktop (Electron) build artifacts
 desktop/.gen/
 desktop/release/
-# Local agent runbooks/skills — may contain server creds; never commit.
+# Local agent runbooks/skills: may contain server creds; never commit.
 .claude/skills/
 report.md

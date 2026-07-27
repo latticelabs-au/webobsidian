@@ -10,9 +10,12 @@ import {
   redactSettings,
   ensureVaultBrowsable,
   isVaultRelativeSubpath,
+  isUnsafeE2eePairing,
   isWithinRoot,
+  REDACTED_SECRET,
   type Settings,
 } from '../services/settings.js';
+import { redactUrlCreds } from '../lib/redact.js';
 import { config } from '../config.js';
 
 /** Build an error the shared error middleware will answer with `status`. */
@@ -25,6 +28,15 @@ function httpError(status: number, message: string): Error & { status: number } 
 interface SettingsPatchBody {
   vault?: Record<string, unknown>;
   git?: Record<string, unknown>;
+  // Both of these have to be listed here AND handled in the if-chain inside the
+  // PUT below. A block that is missing from that chain is silently unwritable
+  // through the API and the request still answers 200 with the unchanged
+  // settings, which is the worst failure mode this endpoint has: the operator
+  // sees "Saved", the value never lands, and there is nothing in the response or
+  // the log to say so. Adding a settings block is a four-file contract (schema,
+  // redaction, this allowlist, the UI panel) and half of it fails quietly.
+  sync?: Record<string, unknown>;
+  livesync?: Record<string, unknown>;
   search?: Record<string, unknown>;
   ui?: Record<string, unknown>;
   api?: Record<string, unknown>;
@@ -83,6 +95,28 @@ settingsRouter.put(
         throw httpError(400, 'api.rateLimitPerMin must be a whole number of at least 1');
       }
     }
+    // Which backend owns the vault. One value, never a set: see the long note on
+    // the `sync` block in services/settings.ts for why two writers over one vault
+    // is unrepairable rather than merely untidy. Validated here so an unknown
+    // literal answers 400 instead of being coerced to 'none' by the schema's
+    // `.catch()`, which would read as "saved, and quietly stopped syncing".
+    const syncBackend =
+      body.sync?.backend !== undefined ? requireSyncBackend(body.sync.backend) : undefined;
+    // Everything about the LiveSync block that can be judged without looking at
+    // the stored settings is judged before the lock, exactly as the vault patch
+    // is: a rejected value answers 400 without taking the settings lock.
+    //
+    // The stored URI is read here because recognising the redacted echo (see
+    // sanitizeLiveSync) needs it. getSettings() deliberately does NOT take the
+    // settings lock (see the note on updateSettings), so reading it here cannot
+    // deadlock against the update below. The read is racy against a concurrent
+    // write in exactly one direction: if another request changed the URI in
+    // between, the worst outcome is that this request leaves the stored URI
+    // alone. It can never cause a masked URI to be persisted, which is the only
+    // outcome that would matter.
+    const liveSyncPatch = body.livesync
+      ? sanitizeLiveSync(body.livesync, (await getSettings()).livesync.uri)
+      : null;
     const updated = await updateSettings((d) => {
       if (vaultPatch) {
         Object.assign(d.vault, vaultPatch);
@@ -91,8 +125,41 @@ settingsRouter.put(
       if (body.git) {
         const { token, ...rest } = body.git;
         Object.assign(d.git, rest);
-        if (typeof token === 'string' && token && token !== '••••••••') d.git.token = token;
+        // The secret round-trip rule, stated once here and applied field by field
+        // to the LiveSync secrets by readSecret() below. The constant is imported
+        // rather than written out again so the mask this compares against is
+        // provably the same string redactSettings() emits.
+        if (typeof token === 'string' && token && token !== REDACTED_SECRET) d.git.token = token;
       }
+      if (liveSyncPatch) {
+        // `fields` last-writer-wins over the block, `secrets` applied on top and
+        // only for the fields the client actually sent a new value for. Two
+        // objects rather than one because "absent" and "empty" mean different
+        // things for a secret and the same thing for everything else.
+        Object.assign(d.livesync, liveSyncPatch.fields, liveSyncPatch.secrets);
+      }
+      if (syncBackend) d.sync.backend = syncBackend;
+      // Deliberately inside the mutator, unlike every other check in this
+      // handler, and for two reasons.
+      //
+      // It is a question about the MERGED result, not about the request: a body
+      // that sets only `obfuscatePassphrase` is unsafe or not depending on the
+      // passphrase already on disk, and a body that clears `passphrase` is unsafe
+      // or not depending on the obfuscation passphrase already on disk. Neither
+      // can be answered from the patch alone.
+      //
+      // And throwing here is just as atomic as throwing before the lock:
+      // updateSettings awaits the mutator BEFORE it validates, assigns the cache
+      // or persists, so a throw rejects the whole call with the draft discarded,
+      // the cache untouched and nothing written. The queue is not poisoned either
+      // (withSettingsLock swallows the rejection for the next caller).
+      //
+      // Gated on the request actually touching sync configuration. Without that
+      // gate, an instance that already holds the bad pairing from a hand edit
+      // would 400 on every unrelated save (a theme change, an API key) with an
+      // error about a passphrase, which is both baffling and unfixable from the
+      // UI it breaks.
+      if (body.livesync || body.sync) assertSafeE2eePairing(d);
       if (body.search) Object.assign(d.search, body.search);
       if (body.ui) Object.assign(d.ui, body.ui);
       if (typeof rateLimit === 'number') d.api.rateLimitPerMin = rateLimit;
@@ -178,6 +245,270 @@ function requireVaultRelative(value: unknown, field: string): string {
     );
   }
   return value.trim();
+}
+
+/**
+ * Accept one of the three backend names, or reject the request.
+ *
+ * The enum is the mutual-exclusivity mechanism (KICKOFF §5.3, and the long note
+ * on the `sync` block in services/settings.ts). There is no combination of
+ * backends to express here because there is no safe one: git resolves conflicts
+ * at commit granularity over a working tree it assumes it alone mutates, and
+ * LiveSync resolves them per document against CouchDB revision history, so each
+ * one reads the other's writes as an unexplained local edit and the vault churns
+ * between two histories that cannot afterwards be merged. A single value makes
+ * the bad state unrepresentable rather than merely discouraged.
+ *
+ * Loud rather than coerced: the schema heals an unknown literal to 'none' so a
+ * hand-edited file still loads, but a request that names a backend this build
+ * does not have must not answer 200 and then quietly stop syncing.
+ */
+function requireSyncBackend(value: unknown): Settings['sync']['backend'] {
+  if (value !== 'none' && value !== 'git' && value !== 'livesync') {
+    throw httpError(400, "sync.backend must be one of 'none', 'git' or 'livesync'");
+  }
+  return value;
+}
+
+/**
+ * A validated LiveSync patch, split by how "absent" has to be interpreted.
+ *
+ * `fields` are ordinary values: absent means "not being changed", and every
+ * present value has already been checked and normalised.
+ * `secrets` holds ONLY the credential fields the client actually supplied a new
+ * value for. For those, absent and empty are the same thing (leave the stored
+ * secret alone), which is why they cannot travel in the same bag as the rest.
+ */
+interface LiveSyncPatch {
+  fields: Partial<Settings['livesync']>;
+  secrets: Partial<
+    Pick<Settings['livesync'], 'password' | 'passphrase' | 'obfuscatePassphrase'>
+  >;
+}
+
+/**
+ * Narrow an incoming livesync patch to the fields we accept, rejecting anything
+ * malformed with a 400 rather than coercing it.
+ *
+ * `currentUri` is the stored URI, needed only to recognise the redacted echo
+ * described below.
+ */
+function sanitizeLiveSync(v: Record<string, unknown>, currentUri: string): LiveSyncPatch {
+  const fields: Partial<Settings['livesync']> = {};
+
+  if (v.uri !== undefined) {
+    const uri = requireLiveSyncString(v.uri, 'livesync.uri').trim();
+    // redactSettings() masks credentials embedded in the stored URI, so a client
+    // that round-trips what it read sends back `https://***@host`. That is not a
+    // new value, it is the mask, and storing it would replace a working URL with
+    // a broken one (and then requireCouchUri would reject it on the way in
+    // anyway, telling the operator their URL contains credentials they never
+    // typed). Recognising it here, before validation, is the same idea as the
+    // secret sentinel: a value the client can only have got from us means "I did
+    // not change this". The `uri !== currentUri` half keeps it from swallowing a
+    // genuine edit, since redactUrlCreds is the identity on a URL without
+    // userinfo, which is every URL this build is willing to store.
+    if (!(uri === redactUrlCreds(currentUri) && uri !== currentUri)) {
+      fields.uri = requireCouchUri(uri);
+    }
+  }
+  if (v.database !== undefined) fields.database = requireDatabaseName(v.database);
+  if (v.username !== undefined) {
+    fields.username = requireLiveSyncString(v.username, 'livesync.username').trim();
+  }
+  if (v.liveMode !== undefined) {
+    if (typeof v.liveMode !== 'boolean') {
+      throw httpError(400, 'livesync.liveMode must be a boolean');
+    }
+    fields.liveMode = v.liveMode;
+  }
+  if (v.intervalSec !== undefined) {
+    // Same bound and the same reasoning as api.rateLimitPerMin above: 0 or a
+    // negative value turns the poll timer into a hot loop against CouchDB, and
+    // the value is persisted, so it survives a restart. The schema carries the
+    // bound too, with a `.catch()`, for hand-edited files; here it is a 400.
+    const n = v.intervalSec;
+    if (typeof n !== 'number' || !Number.isInteger(n) || n < 1) {
+      throw httpError(400, 'livesync.intervalSec must be a whole number of at least 1');
+    }
+    fields.intervalSec = n;
+  }
+  if (v.includeInternal !== undefined) {
+    fields.includeInternal = requireIncludeInternal(v.includeInternal);
+  }
+
+  const secrets: LiveSyncPatch['secrets'] = {};
+  const password = readSecret(v.password, 'livesync.password');
+  if (password !== undefined) secrets.password = password;
+  const passphrase = readSecret(v.passphrase, 'livesync.passphrase');
+  if (passphrase !== undefined) secrets.passphrase = passphrase;
+  const obfuscate = readSecret(v.obfuscatePassphrase, 'livesync.obfuscatePassphrase');
+  if (obfuscate !== undefined) secrets.obfuscatePassphrase = obfuscate;
+
+  return { fields, secrets };
+}
+
+/**
+ * Decide what an incoming secret means. `undefined` means "leave the stored
+ * value alone"; a string is the value to write.
+ *
+ * The rule for a non-empty string is git.token's, verbatim, and for the same
+ * reason: the client is served REDACTED_SECRET in place of a stored secret, so
+ * any form that round-trips what it read sends the mask back. Writing that would
+ * replace the credential with eight bullet characters, and the operator would
+ * meet it as an authentication failure with nothing to connect it to. An empty
+ * string is treated as "the field was left blank", not "erase it", because a
+ * password input is conventionally rendered empty even when a value is stored,
+ * so a blank field is the normal state of a save that was not about the password.
+ *
+ * That rule alone cannot express "remove this", which is not an academic gap
+ * here: an instance holding obfuscatePassphrase with no passphrase (a hand edit,
+ * a restored backup, or a file written before assertSafeE2eePairing existed) is
+ * otherwise wedged, because every livesync save is refused by the pairing check
+ * and the one field that has to change cannot be changed through this API. An
+ * explicit JSON `null` is therefore the clear signal. It is deliberately a value
+ * no text input produces by accident, so it cannot be sent by a form that simply
+ * did not populate the field, which is precisely the accident the rule above
+ * exists to prevent.
+ *
+ * Note what does NOT happen to the value: it is not trimmed. These are key
+ * material, and a passphrase with a trailing space that gets silently trimmed
+ * derives a different key. The symptom is not an error at save time, it is a
+ * remote database this instance can no longer decrypt.
+ */
+function readSecret(value: unknown, field: string): string | undefined {
+  if (value === undefined) return undefined;
+  if (value === null) return '';
+  if (typeof value !== 'string') throw httpError(400, `${field} must be a string or null`);
+  if (!value || value === REDACTED_SECRET) return undefined;
+  return value;
+}
+
+/** A string field, or a 400. Kept separate from the vault helpers because the
+ *  message names the livesync field rather than a vault one. */
+function requireLiveSyncString(value: unknown, field: string): string {
+  if (typeof value !== 'string') throw httpError(400, `${field} must be a string`);
+  return value;
+}
+
+/**
+ * Accept a CouchDB base URL, or reject the request.
+ *
+ * Empty is accepted and means "not configured", which is how an operator takes
+ * the backend out of service without deleting the rest of the block.
+ *
+ * Credentials in the URL are refused rather than accepted-and-hidden. They would
+ * otherwise sit in a field nothing treats as a secret: it is returned by GET
+ * /api/settings, it is the natural thing to include in an error message, and it
+ * would be copied into a bug report by an operator who does not realise their
+ * password is in it. There is a dedicated pair of fields for the credential, and
+ * they are masked everywhere this one is not.
+ *
+ * The trailing slash is stripped because the engine builds its endpoint by
+ * concatenation (`url + "/" + database`), so a stored trailing slash produces a
+ * double slash, which CouchDB reads as a database whose name begins with an
+ * empty path segment. The failure is a 404 that looks nothing like its cause.
+ * The schema normalises identically, so both doors store one string.
+ */
+function requireCouchUri(value: string): string {
+  const bad = (why: string) => httpError(400, `livesync.uri ${why}`);
+  const raw = value.trim();
+  if (!raw) return '';
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    throw bad('must be an absolute URL, e.g. https://couchdb.example:6984');
+  }
+  // `new URL` happily parses `couchdb://host` and `file:///etc`, so the scheme
+  // has to be checked explicitly rather than inferred from the parse succeeding.
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw bad('must use http or https');
+  }
+  if (parsed.username || parsed.password) {
+    throw bad('must not embed credentials; use livesync.username and livesync.password');
+  }
+  return raw.replace(/\/+$/, '');
+}
+
+/**
+ * Accept a CouchDB database name, or reject the request.
+ *
+ * The character set is CouchDB's own, minus the slash. CouchDB does allow a
+ * slash in a database name (URL-encoded), but the engine builds its endpoint as
+ * `url + "/" + database` with no encoding step, so a value containing a slash or
+ * a `..` segment is path traversal against the CouchDB API rather than a name:
+ * `../_users` would point the replicator at the server's credential database.
+ * Refusing the character outright costs a legitimate operator nothing, since
+ * slashes in database names are a legacy curiosity and a LiveSync vault database
+ * never has one.
+ *
+ * Uppercase is rejected here rather than at the server, so the operator gets a
+ * sentence naming the field instead of a CouchDB 400 surfacing several layers
+ * away from the setting that caused it.
+ */
+function requireDatabaseName(value: unknown): string {
+  const bad = (why: string) => httpError(400, `livesync.database ${why}`);
+  if (typeof value !== 'string') throw bad('must be a string');
+  const raw = value.trim();
+  if (!raw) return '';
+  if (!/^[a-z][a-z0-9_$()+-]*$/.test(raw)) {
+    throw bad(
+      'must be a CouchDB database name: lowercase, starting with a letter, and containing only a-z 0-9 _ $ ( ) + -',
+    );
+  }
+  return raw;
+}
+
+/**
+ * Accept the list of vault-relative directories to replicate as LiveSync
+ * internal (`i:`) documents, or reject the request.
+ *
+ * Held to exactly the same containment rule as vault.trash, and by the same
+ * predicate, because an entry here is used the same way: joined onto the vault
+ * root and then walked. A `..` segment would enumerate a directory above the
+ * vault and replicate it into CouchDB, which is a disclosure that leaves the
+ * machine rather than merely a bad read. The list defaults to empty; see the
+ * note on the schema field for why the feature ships off.
+ */
+function requireIncludeInternal(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    throw httpError(400, 'livesync.includeInternal must be an array of vault-relative directories');
+  }
+  return value.map((entry: unknown) => {
+    if (!isVaultRelativeSubpath(entry)) {
+      throw httpError(
+        400,
+        'livesync.includeInternal entries must be directories inside the vault: no absolute paths, drive letters, UNC prefixes or ".." segments',
+      );
+    }
+    return entry.trim();
+  });
+}
+
+/**
+ * Refuse to store the one E2EE combination that looks configured and is not.
+ *
+ * With obfuscatePassphrase set and passphrase empty, the engine hashes every
+ * document id (`f:<hash>`) but writes the document BODY in the clear, because
+ * encryption is derived from the passphrase alone. Path, mtime, size and content
+ * are then readable by anyone with access to the database, while the ids look
+ * exactly like the ones KICKOFF acceptance criterion 3 tells an operator to
+ * check for. So the naive verification passes and the property it was meant to
+ * verify does not hold. That is why this is a hard 400 rather than a warning:
+ * the whole hazard is that nothing downstream looks wrong.
+ *
+ * The message names both ways out, because one of them (clearing a secret) is
+ * not otherwise discoverable: see readSecret() on the explicit `null`.
+ */
+function assertSafeE2eePairing(d: Settings): void {
+  if (!isUnsafeE2eePairing(d.livesync)) return;
+  throw httpError(
+    400,
+    'livesync.obfuscatePassphrase requires livesync.passphrase: obfuscation alone hashes document ids ' +
+      'but leaves path, mtime, size and content unencrypted in CouchDB, which looks like end-to-end ' +
+      'encryption without being it. Set a passphrase, or send obfuscatePassphrase as null to clear it.',
+  );
 }
 
 /**
