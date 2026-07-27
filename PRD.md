@@ -433,8 +433,12 @@ existing Express server + SPA (no code fork, no architecture change), so every w
   (blocking `..`, the `.git` segment, and symlinks escaping the vault), restricted CORS, rate limiting (including on `/auth/login`:
   10 attempts per 15 minutes, **keyed on the real TCP socket address, not on `req.ip`/`X-Forwarded-For`**, so it
   cannot be bypassed by rotating XFF, **regardless of the `trust proxy` configuration**; that is why `trust proxy` is
-  left enabled by default (`true`, via `TRUST_PROXY`) so `X-Forwarded-Proto`/Secure cookies work behind a proxy). Changing the default password (`123456`) is mandatory right after the first login
-  (`mustChangePassword`). Security headers via `helmet` + CSP (script-src 'self'+nonce; HTTPS is not forced,
+  left enabled by default (`true`, via `TRUST_PROXY`) so `X-Forwarded-Proto`/Secure cookies work behind a proxy). The default
+  password (`123456`) is **only accepted when no other credential has been configured**
+  (`auth.userPasswordHash`, `auth.passwordHash`, or the `WEBOBSIDIAN_PASSWORD` env var); only then is changing it
+  mandatory right after the first login (`mustChangePassword`). That flag is **not** returned by
+  `GET /auth/status` (an unauthenticated route), so it cannot be used to discover which instances still accept
+  the default; clients read it from `/auth/login` and `/auth/me`. Security headers via `helmet` + CSP (script-src 'self'+nonce; HTTPS is not forced,
   so HTTP self-hosting stays possible). Git tokens/PATs are redacted from every error message returned to the client and from the logs. The WebSocket
   `/ws` requires a valid login session. A plugin `id` is validated before it becomes a path segment; changing
   `vault.path` through the API is confined to `allowedRoots`.

@@ -4,7 +4,7 @@
 > Convention: `[ ]` not started · `[~]` in progress · `[x]` done.
 > Update this file **every time** an item changes state.
 
-Last updated: 2026-07-27 (chore: translated every document, comment and UI string in the repo to English)
+Last updated: 2026-07-27 (security fix: the default password stayed valid after an override was configured; removed the `mustChangePassword` oracle from `/auth/status`)
 
 ---
 
@@ -466,6 +466,32 @@ Last updated: 2026-07-27 (chore: translated every document, comment and UI strin
       `desktop/release`.
 
 ### Progress log
+- 2026-07-27 (security fix: default password `123456` still accepted after an override was configured):
+  `checkPassword()` (server/src/services/auth.ts) only skipped the default-password branch when
+  `auth.userPasswordHash` was set. Configuring `WEBOBSIDIAN_PASSWORD` or a hand-edited `auth.passwordHash`
+  does **not** populate that field (`bootstrap.ts` deliberately only logs), so an operator who followed the
+  documented Docker path (`.env.example` calls it the "Initial master password", `docker-compose.yml` says
+  "Set an initial password"), set a strong secret and never opened the UI **still had `123456` accepted as a
+  full owner session**: the whole vault, `/api/settings`, `/api/keys`, `/api/git` including the stored PAT,
+  and the WebSocket stream. `GET /auth/status` made this trivially discoverable: it requires no auth and
+  returned `mustChangePassword`, which is exactly `userPasswordHash === ''`, so a port scan identified every
+  instance that would accept the default.
+  **Fix, in 4 places:** (1) new `server/src/services/password-policy.ts` exporting
+  `isDefaultPasswordActive(auth)`, true only when none of `userPasswordHash` / `passwordHash` /
+  `config.initialPassword` is set. It is a separate module so it can be shared without an import cycle
+  between `auth.ts` and `settings.ts`. (2) `checkPassword()` now gates the default branch on it.
+  (3) `hasCustomPassword()` and `redactSettings()` derive from the **same** predicate, so the "must change"
+  signal can never disagree with "is the default accepted" (that drift was the actual bug, and disagreement
+  would strand the user: ForceChangePassword submits `changePassword('123456', ...)`). (4) `GET /auth/status`
+  now returns only `{ passwordSet }`; the client only ever read that field (`Login.tsx`), and
+  `mustChangePassword` remains available post-login on `/auth/login` and `/auth/me`.
+  *Side effect, deliberate:* the desktop shell injects its per-install secret as `WEBOBSIDIAN_PASSWORD`, so
+  `123456` is now never valid on the loopback server even if `autoLogin()` fails, which previously left it live.
+  Verified against a running server across 3 scenarios / 8 assertions: with an env password set, `123456` is
+  rejected (401) and the configured password accepted (200); with only a hand-edited recovery hash, `123456`
+  is rejected and the recovery password accepted; with nothing configured, `123456` still works (200) and
+  login reports `mustChangePassword: true`, preserving the documented first-run flow. `/auth/status` returns
+  `{"passwordSet":true}` with no `mustChangePassword` key. Typecheck + build clean.
 - 2026-07-27 (chore: full English translation of docs, comments and UI strings): the repo mixed Vietnamese
   and English, and several screens rendered **entirely** in Vietnamese while their surrounding headings were
   English (the `Settings.tsx` account panel, `ForceChangePassword.tsx`), so the UI read as half-translated.

@@ -3,6 +3,7 @@ import path from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { z } from 'zod';
 import { config, SETTINGS_FILE } from '../config.js';
+import { isDefaultPasswordActive } from './password-policy.js';
 
 /** ---- Schema (PRD §6) ---------------------------------------------------- */
 
@@ -192,7 +193,10 @@ export function redactSettings(s: Settings) {
     ...s,
     auth: {
       // hasCustomPassword=false means the default password (123456) is still in use.
-      hasCustomPassword: Boolean(s.auth.userPasswordHash),
+      // Shares one condition with checkPassword: once an override is configured
+      // (auth.passwordHash / WEBOBSIDIAN_PASSWORD) the default no longer works, so
+      // the UI must stop warning that the instance is on the default password.
+      hasCustomPassword: !isDefaultPasswordActive(s.auth),
       hasOverridePassword: Boolean(s.auth.passwordHash),
     },
     git: { ...s.git, token: s.git.token ? '••••••••' : '' },
