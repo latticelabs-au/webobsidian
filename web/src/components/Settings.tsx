@@ -900,6 +900,10 @@ function SsoSettings({ s, reload }: { s: any; reload: () => void }) {
     // false would render a settings page claiming the password door is shut on
     // an install where it is wide open.
     allowPasswordLogin: o.allowPasswordLogin !== false,
+    // Same "absent means the schema default" reasoning as allowPasswordLogin:
+    // reading a missing value as 'off' would render a page claiming PKCE is
+    // disabled on an install where it is on.
+    pkce: (o.pkce ?? 'auto') as 'auto' | 'force' | 'off',
   });
   const set = <K extends keyof typeof cfg>(k: K, v: (typeof cfg)[K]) =>
     setCfg((p) => ({ ...p, [k]: v }));
@@ -1014,6 +1018,7 @@ function SsoSettings({ s, reload }: { s: any; reload: () => void }) {
       allowedSubjects,
       allowedGroups,
       allowPasswordLogin: cfg.allowPasswordLogin,
+      pkce: cfg.pkce,
     };
     // 'keep' sends nothing at all. The sentinel would be ignored by the server
     // anyway, but omitting the key says what is meant and keeps the mask out of
@@ -1216,6 +1221,32 @@ function SsoSettings({ s, reload }: { s: any; reload: () => void }) {
           checked={cfg.allowPasswordLogin}
           onChange={(e) => set('allowPasswordLogin', e.target.checked)}
         />
+      </Row>
+      {/*
+        Exposed rather than hardcoded because both hardcodings are wrong for
+        somebody. Always-on locks out a provider that rejects the parameter, with
+        no recourse; always-off is a silent downgrade. 'Automatic' is the answer
+        for every provider we know of, including the awkward case it was written
+        for: Pocket ID supports S256 per client but omits
+        code_challenge_methods_supported from its discovery document, so reading
+        that metadata strictly would quietly turn PKCE off on a deployment where
+        it works. Automatic treats silence as consent and only stands down when
+        the provider publishes a method list that excludes S256.
+      */}
+      <Row
+        name="PKCE"
+        desc="Proof Key for Code Exchange. Leave on Automatic unless a provider rejects the challenge outright; the server logs which branch it took, so this is never a silent guess."
+      >
+        <select
+          className="text-input"
+          style={{ width: 260 }}
+          value={cfg.pkce}
+          onChange={(e) => set('pkce', e.target.value as 'auto' | 'force' | 'off')}
+        >
+          <option value="auto">Automatic (recommended)</option>
+          <option value="force">Always send</option>
+          <option value="off">Never send</option>
+        </select>
       </Row>
       <div style={{ display: 'flex', gap: 8, marginTop: 12 }}>
         <button className="btn" onClick={save}>Save</button>

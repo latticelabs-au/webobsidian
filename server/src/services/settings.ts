@@ -457,6 +457,33 @@ const OidcBlockSchema = z.object({
    */
   enabled: z.boolean().default(false).catch(false),
   /**
+   * Whether to send a PKCE challenge, and the reason this is a setting rather
+   * than a constant.
+   *
+   * PKCE should be on wherever it works, but hardcoding it locks out any IdP
+   * that genuinely does not support it, with no recourse for the operator.
+   * Hardcoding it OFF would be worse. So three states, and the default is the
+   * one that is both secure and correct against a real-world server:
+   *
+   *   'auto'  send S256 when the server advertises it, AND when the server says
+   *           nothing at all. Silence is not denial. This is not a hypothetical:
+   *           Pocket ID supports S256 per client but omits
+   *           `code_challenge_methods_supported` from its discovery document
+   *           entirely, so a strict reading of the metadata would silently
+   *           downgrade a working deployment. Only skip when the server
+   *           explicitly publishes a method list that excludes S256, which is
+   *           the one case where it has actually told us no.
+   *   'force' always send, for a server whose metadata is wrong in the other
+   *           direction (advertises a list that omits S256 while supporting it).
+   *   'off'   never send. The escape hatch for a server that rejects the
+   *           parameter outright.
+   *
+   * A silent PKCE downgrade is invisible in every log, which is why
+   * `describePkceDecision()` records the branch taken at connect time: the
+   * answer to "is PKCE actually on?" has to be observable, not inferred.
+   */
+  pkce: z.enum(['auto', 'force', 'off']).default('auto').catch('auto'),
+  /**
    * The IdP's issuer identifier, e.g. https://auth.example.com.
    *
    * Stored WITHOUT a trailing slash, and the reason is the same shape as

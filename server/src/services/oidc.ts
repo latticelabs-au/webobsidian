@@ -65,6 +65,8 @@ import { redactUrlCreds } from '../lib/redact.js';
  */
 export interface OidcSettings {
   enabled: boolean;
+  /** See `decidePkce()`. 'auto' treats an absent method list as permission. */
+  pkce: 'auto' | 'force' | 'off';
   /** Issuer identifier, no trailing slash (e.g. `https://auth.example.com`). */
   issuer: string;
   clientId: string;
@@ -110,6 +112,8 @@ export async function getOidcSettings(): Promise<OidcSettings> {
     raw && typeof raw === 'object' && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {};
   return {
     enabled: block.enabled === true,
+    pkce:
+      block.pkce === 'force' || block.pkce === 'off' ? block.pkce : 'auto',
     // Trailing slashes are stripped for the same reason the LiveSync URI strips
     // them: the issuer identifier is compared byte-for-byte against the `iss`
     // the discovery document reports, and "one configuration, one meaning" is
@@ -488,6 +492,40 @@ async function openTransaction(sealed: string): Promise<TransactionClaims> {
   return { jti, st, no, pk, ru };
 }
 
+/**
+ * Decide whether to send a PKCE challenge, per the `oidc.pkce` setting.
+ *
+ * Returns the reason as well as the decision, because a silent PKCE downgrade is
+ * invisible in every log. The caller prints it at connect time so that "is PKCE
+ * actually on?" is an observable fact rather than something inferred from source.
+ *
+ * The `auto` rule treats an ABSENT `code_challenge_methods_supported` as
+ * permission rather than refusal. That is deliberate and it is the common case,
+ * not an edge case: Pocket ID supports S256 per client while publishing no such
+ * field, so reading silence as denial would downgrade a working deployment
+ * without telling anyone. Only an explicit list that omits S256 counts as a no,
+ * because that is the one case where the server has actually answered.
+ */
+function decidePkce(
+  mode: 'auto' | 'force' | 'off',
+  config: oidcClient.Configuration,
+): { send: boolean; reason: string } {
+  if (mode === 'off') return { send: false, reason: 'disabled by oidc.pkce=off' };
+  if (mode === 'force') return { send: true, reason: 'forced by oidc.pkce=force' };
+
+  const methods = config.serverMetadata().code_challenge_methods_supported;
+  if (!Array.isArray(methods)) {
+    return { send: true, reason: 'auto: issuer advertises no methods, silence is not denial' };
+  }
+  if (methods.includes('S256')) {
+    return { send: true, reason: 'auto: issuer advertises S256' };
+  }
+  return {
+    send: false,
+    reason: `auto: issuer advertises [${methods.join(', ')}] which excludes S256`,
+  };
+}
+
 /** ---- Authorization request ------------------------------------------------ */
 
 export interface AuthorizationRequest {
@@ -556,8 +594,11 @@ export async function buildAuthorizationUrl(
 
   const state = oidcClient.randomState();
   const nonce = oidcClient.randomNonce();
-  const codeVerifier = oidcClient.randomPKCECodeVerifier();
-  const codeChallenge = await oidcClient.calculatePKCECodeChallenge(codeVerifier);
+
+  const pkce = decidePkce(s.pkce, config);
+  console.log(`[oidc] PKCE ${pkce.send ? 'enabled' : 'disabled'} (${pkce.reason})`);
+  const codeVerifier = pkce.send ? oidcClient.randomPKCECodeVerifier() : '';
+  const codeChallenge = pkce.send ? await oidcClient.calculatePKCECodeChallenge(codeVerifier) : '';
 
   const url = oidcClient.buildAuthorizationUrl(config, {
     redirect_uri: redirectUri,
@@ -570,8 +611,11 @@ export async function buildAuthorizationUrl(
     response_mode: 'query',
     state,
     nonce,
-    code_challenge: codeChallenge,
-    code_challenge_method: 'S256',
+    // Omitted entirely when PKCE is off. Sending an empty `code_challenge` is
+    // not the same as sending none: some servers accept the empty string and
+    // then demand a matching verifier at the token endpoint, which fails in a
+    // way that looks like a client bug rather than a configuration choice.
+    ...(pkce.send ? { code_challenge: codeChallenge, code_challenge_method: 'S256' as const } : {}),
   });
 
   const transaction = await sealTransaction({
@@ -711,7 +755,11 @@ export async function handleCallback(
     tokens = await oidcClient.authorizationCodeGrant(config, currentUrl, {
       expectedState: tx.st,
       expectedNonce: tx.no,
-      pkceCodeVerifier: tx.pk,
+      // Only when the authorization request actually carried a challenge. An
+      // empty verifier is not "no verifier": oauth4webapi sends `code_verifier`
+      // for any value that is not its `nopkce` sentinel, so passing '' would
+      // send an empty parameter and the token endpoint would reject it.
+      ...(tx.pk ? { pkceCodeVerifier: tx.pk } : {}),
       // Belt to the braces of `expectedNonce`, which already forces it. An
       // access token without an ID token would authenticate nobody: there would
       // be no signed subject to put in the session.

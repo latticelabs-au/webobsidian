@@ -612,6 +612,17 @@ function sanitizeOidc(v: Record<string, unknown>, current: Settings['oidc']): Oi
     }
     fields.allowPasswordLogin = v.allowPasswordLogin;
   }
+  // Validated against the literal union rather than passed through, because the
+  // zod schema's .catch('auto') would silently rewrite a typo to the default. A
+  // save that reads back as something other than what was submitted is the worst
+  // outcome for a security toggle: the operator believes PKCE is off, the server
+  // has it on, and nothing anywhere says so.
+  if (v.pkce !== undefined) {
+    if (v.pkce !== 'auto' && v.pkce !== 'force' && v.pkce !== 'off') {
+      throw httpError(400, "oidc.pkce must be one of 'auto', 'force' or 'off'");
+    }
+    fields.pkce = v.pkce;
+  }
 
   // One secret, but it goes through readSecret() unchanged: the sentinel rule,
   // the "empty means untouched" rule and the explicit-null escape hatch are all
