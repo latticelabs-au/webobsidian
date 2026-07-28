@@ -866,6 +866,460 @@ function LiveSyncSettings({ s, reload }: { s: any; reload: () => void }) {
           }}
         />
       </div>
+      <SetupUriPanel backend={backend} append={append} reload={reload} />
+    </div>
+  );
+}
+
+/**
+ * Render a QR module matrix as ONE SVG `<path>`.
+ *
+ * The server sends rows of '0'/'1' rather than an image or markup, so nothing
+ * here injects HTML and there is no `dangerouslySetInnerHTML` anywhere in this
+ * feature. The path `d` attribute is a data string React sets as a property, not
+ * markup it parses, which is the property that makes this safe by construction
+ * rather than by escaping.
+ *
+ * Horizontal runs are merged into single `M h v h z` sub-paths instead of
+ * emitting a rect per module: a version-20 symbol is ~1500 dark modules, and
+ * 1500 DOM nodes inside a settings panel is a visible scroll jank for no benefit.
+ *
+ * `shape-rendering: crispEdges` matters. Without it the browser antialiases the
+ * module boundaries, and a QR with soft edges is measurably harder for a phone
+ * camera to binarise at an angle.
+ */
+function QrMatrix({ rows, size }: { rows: string[]; size: number }) {
+  // One module of quiet zone is not enough; the specification requires four, and
+  // scanners genuinely fail without it against a busy background.
+  const QUIET = 4;
+  const total = size + QUIET * 2;
+
+  let d = '';
+  for (let r = 0; r < rows.length; r += 1) {
+    const row = rows[r];
+    let c = 0;
+    while (c < row.length) {
+      if (row[c] !== '1') {
+        c += 1;
+        continue;
+      }
+      const start = c;
+      while (c < row.length && row[c] === '1') c += 1;
+      d += `M${start + QUIET} ${r + QUIET}h${c - start}v1h-${c - start}z`;
+    }
+  }
+
+  return (
+    <svg
+      viewBox={`0 0 ${total} ${total}`}
+      width={264}
+      height={264}
+      shapeRendering="crispEdges"
+      role="img"
+      aria-label="Setup URI QR code"
+      style={{ display: 'block', borderRadius: 6 }}
+    >
+      {/* An explicit white background, not a transparent one. A transparent QR
+          over a dark theme inverts the contrast and stops scanning entirely. */}
+      <rect width={total} height={total} fill="#ffffff" />
+      <path d={d} fill="#000000" />
+    </svg>
+  );
+}
+
+/**
+ * Pair another device: issue a Setup URI, or adopt one from an existing device.
+ *
+ * ---------------------------------------------------------------------------
+ * WHAT THIS IS FOR
+ *
+ * A Setup URI is how Self-hosted LiveSync configures device N+1 without anyone
+ * retyping a CouchDB URL, a username, a password and two passphrases. The QR
+ * below encodes that URI, so a phone running the real Obsidian plugin joins by
+ * pointing its camera at this panel.
+ *
+ * ---------------------------------------------------------------------------
+ * WHY THE QR HERE IS NOT THE PLUGIN'S OWN QR FORMAT
+ *
+ * The plugin has two transports. `?settings=` is ENCRYPTED under a passphrase.
+ * `?settingsQR=` is NOT encrypted at all -- its codec is synchronous and takes no
+ * passphrase, which is proof rather than inference, since every crypto path in
+ * that stack is promise-only WebCrypto. A `settingsQR` payload therefore shows
+ * the CouchDB password and the vault's encryption passphrase in the clear, and
+ * upstream's multi-part variant parks them in a third-party origin's
+ * localStorage.
+ *
+ * A QR code is just a transport for a string, and the plugin's protocol handler
+ * accepts the ENCRYPTED `?settings=` URI from any source including a camera
+ * scan. So this renders that one instead: same convenience, same plugin
+ * compatibility, without putting credentials on a screen in readable form.
+ *
+ * ---------------------------------------------------------------------------
+ * WHY THE INTERACTION IS SHAPED THE WAY IT IS
+ *
+ * The URI is fetched in two steps and is retrievable exactly ONCE, within a
+ * short window. It is never a route, never a query parameter, never an image
+ * URL, and never written anywhere: it exists only in this component's state,
+ * and `reset()` drops it on unmount, on tab change and on demand. The password
+ * is asked for again because a session cookie proves only that someone holds it.
+ */
+function SetupUriPanel({
+  backend,
+  append,
+  reload,
+}: {
+  backend: 'none' | 'git' | 'livesync';
+  append: (lines: string[]) => void;
+  reload: () => void;
+}) {
+  type Mode = 'idle' | 'issue' | 'import';
+  const [mode, setMode] = useState<Mode>('idle');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+
+  // Issue side.
+  const [ownerPassword, setOwnerPassword] = useState('');
+  const [uriPassphrase, setUriPassphrase] = useState('');
+  const [issued, setIssued] = useState<{
+    uri: string;
+    qr: { size: number; version: number; rows: string[] } | null;
+  } | null>(null);
+  const [revealed, setRevealed] = useState(false);
+
+  // Import side.
+  const [pastedUri, setPastedUri] = useState('');
+  const [pastedPassphrase, setPastedPassphrase] = useState('');
+  const [preview, setPreview] = useState<Awaited<
+    ReturnType<typeof api.liveSyncDecodeSetupUri>
+  > | null>(null);
+  const [confirmHost, setConfirmHost] = useState('');
+
+  /**
+   * Drop every secret this component is holding.
+   *
+   * Called on unmount and whenever the panel is closed or switched. The URI is a
+   * complete credential bundle, so leaving it in state for the lifetime of the
+   * page would undo the point of the server's short single-use window.
+   */
+  const reset = () => {
+    setOwnerPassword('');
+    setUriPassphrase('');
+    setIssued(null);
+    setRevealed(false);
+    setPastedUri('');
+    setPastedPassphrase('');
+    setPreview(null);
+    setConfirmHost('');
+    setError('');
+  };
+  useEffect(() => reset, []);
+
+  const close = () => {
+    reset();
+    setMode('idle');
+  };
+
+  const issue = async () => {
+    setBusy(true);
+    setError('');
+    try {
+      // Two calls, deliberately. The mint verifies the password and builds the
+      // URI; the retrieve is the one-shot exchange. Splitting them means the
+      // credential bundle is never in a response that anything replayed,
+      // prefetched or cached the first time round.
+      const { handle } = await api.liveSyncMintSetupUri(ownerPassword, uriPassphrase);
+      setIssued(await api.liveSyncRetrieveSetupUri(handle));
+      // The password is not needed again and must not sit in a form field.
+      setOwnerPassword('');
+      append(['Setup URI issued. It is shown once and is not stored anywhere.']);
+    } catch (e) {
+      setError(apiErrorMessage(e, 'Could not issue a Setup URI'));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const decode = async () => {
+    setBusy(true);
+    setError('');
+    try {
+      setPreview(await api.liveSyncDecodeSetupUri(pastedUri.trim(), pastedPassphrase));
+    } catch (e) {
+      setPreview(null);
+      setError(apiErrorMessage(e, 'Could not read that Setup URI'));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const apply = async () => {
+    if (!preview) return;
+    setBusy(true);
+    setError('');
+    try {
+      await api.liveSyncApplySetupUri(preview.handle, ownerPassword, confirmHost.trim());
+      append(['LiveSync settings replaced from a Setup URI.']);
+      close();
+      reload();
+    } catch (e) {
+      setError(apiErrorMessage(e, 'Could not apply that Setup URI'));
+      // The handle is single use, so a failed apply cannot be retried against
+      // the same preview. Saying so beats a button that silently 404s.
+      setPreview(null);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const box = {
+    marginTop: 12,
+    padding: 12,
+    border: '1px solid var(--bg-modifier-border, #444)',
+    borderRadius: 6,
+  } as const;
+  const muted = { fontSize: 12, color: 'var(--text-muted)' } as const;
+
+  return (
+    <div style={box}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+        <strong style={{ fontSize: 13 }}>Pair another device</strong>
+        {mode !== 'idle' && (
+          <button className="btn secondary" style={{ padding: '2px 8px' }} onClick={close}>
+            Close
+          </button>
+        )}
+      </div>
+
+      {mode === 'idle' && (
+        <>
+          <div style={{ ...muted, marginTop: 6 }}>
+            A Setup URI configures Obsidian on another device without retyping anything. Scan the QR
+            with a phone, or paste a URI from a device that is already set up.
+          </div>
+          <div style={{ display: 'flex', gap: 8, marginTop: 10, flexWrap: 'wrap' }}>
+            <button
+              className="btn"
+              disabled={backend !== 'livesync'}
+              title={
+                backend === 'livesync'
+                  ? undefined
+                  : 'Select and save the LiveSync backend before issuing a Setup URI.'
+              }
+              onClick={() => {
+                reset();
+                setMode('issue');
+              }}
+            >
+              Show a Setup URI / QR
+            </button>
+            <button
+              className="btn secondary"
+              onClick={() => {
+                reset();
+                setMode('import');
+              }}
+            >
+              Use a Setup URI
+            </button>
+          </div>
+        </>
+      )}
+
+      {mode === 'issue' && !issued && (
+        <>
+          <div style={{ ...muted, marginTop: 6 }}>
+            The URI is encrypted with a passphrase you choose here. It protects the URI only, so make
+            it different from your vault passphrase, and send it to the other device by a{' '}
+            <strong>different channel</strong> than the URI itself.
+          </div>
+          <Row name="Your account password">
+            <input
+              type="password"
+              autoComplete="current-password"
+              value={ownerPassword}
+              onChange={(e) => setOwnerPassword(e.target.value)}
+              placeholder="confirms it is you"
+            />
+          </Row>
+          <Row name="Setup URI passphrase">
+            <input
+              type="password"
+              autoComplete="new-password"
+              value={uriPassphrase}
+              onChange={(e) => setUriPassphrase(e.target.value)}
+              placeholder="at least 12 characters"
+            />
+          </Row>
+          <button
+            className="btn"
+            style={{ marginTop: 8 }}
+            disabled={busy || !ownerPassword || uriPassphrase.length < 12}
+            onClick={issue}
+          >
+            {busy ? 'Working...' : 'Issue Setup URI'}
+          </button>
+        </>
+      )}
+
+      {mode === 'issue' && issued && (
+        <>
+          <div style={{ ...muted, marginTop: 6 }}>
+            Shown once. Closing this panel discards it; issue another if you need it again.
+          </div>
+          {issued.qr ? (
+            <div style={{ marginTop: 10 }}>
+              <QrMatrix rows={issued.qr.rows} size={issued.qr.size} />
+              <div style={{ ...muted, marginTop: 6 }}>
+                In Obsidian on the other device: install Self-hosted LiveSync, then scan this. You
+                will be asked for the passphrase you just chose.
+              </div>
+            </div>
+          ) : (
+            <div style={{ ...muted, marginTop: 10 }}>
+              This configuration is too large to render as a scannable QR code. Copy the URI instead.
+            </div>
+          )}
+          <div style={{ display: 'flex', gap: 8, marginTop: 10, flexWrap: 'wrap' }}>
+            <button
+              className="btn secondary"
+              onClick={() => {
+                // Offered, but not the default path: an OS clipboard keeps its
+                // contents long after this panel is closed. A camera scan never
+                // touches it, which is why the QR is presented first.
+                void navigator.clipboard?.writeText(issued.uri);
+                append(['Setup URI copied to the clipboard. Clear it when you are done.']);
+              }}
+            >
+              Copy URI
+            </button>
+            <button className="btn secondary" onClick={() => setRevealed((v) => !v)}>
+              {revealed ? 'Hide URI' : 'Show URI'}
+            </button>
+          </div>
+          {/* Revealed only on an explicit click, and re-hidden on blur. The URI
+              is a credential bundle, so it should not be sitting selectable on a
+              screen during a call or a screen share by default. */}
+          {revealed && (
+            <textarea
+              readOnly
+              value={issued.uri}
+              onBlur={() => setRevealed(false)}
+              style={{
+                width: '100%', height: 90, marginTop: 8, boxSizing: 'border-box',
+                background: 'var(--bg-primary)', color: 'var(--text-normal)',
+                border: '1px solid var(--bg-modifier-border, #444)', borderRadius: 6, padding: 8,
+                fontFamily: 'var(--font-monospace, monospace)', fontSize: 11, wordBreak: 'break-all',
+              }}
+            />
+          )}
+        </>
+      )}
+
+      {mode === 'import' && !preview && (
+        <>
+          <div style={{ ...muted, marginTop: 6 }}>
+            Paste a Setup URI from a device that is already configured. Nothing is saved until you
+            review it on the next screen.
+          </div>
+          <textarea
+            value={pastedUri}
+            onChange={(e) => setPastedUri(e.target.value)}
+            placeholder="obsidian://setuplivesync?settings=..."
+            style={{
+              width: '100%', height: 80, marginTop: 8, boxSizing: 'border-box',
+              background: 'var(--bg-primary)', color: 'var(--text-normal)',
+              border: '1px solid var(--bg-modifier-border, #444)', borderRadius: 6, padding: 8,
+              fontFamily: 'var(--font-monospace, monospace)', fontSize: 11, wordBreak: 'break-all',
+            }}
+          />
+          <Row name="Setup URI passphrase">
+            <input
+              type="password"
+              autoComplete="off"
+              value={pastedPassphrase}
+              onChange={(e) => setPastedPassphrase(e.target.value)}
+            />
+          </Row>
+          <button
+            className="btn"
+            style={{ marginTop: 8 }}
+            disabled={busy || !pastedUri.trim() || !pastedPassphrase}
+            onClick={decode}
+          >
+            {busy ? 'Reading...' : 'Review'}
+          </button>
+        </>
+      )}
+
+      {mode === 'import' && preview && (
+        <>
+          {/* Warnings first and unmissable. A changed CouchDB host is the repoint
+              attack and a changed passphrase makes existing documents
+              unreadable, so neither may be a row in a table the operator
+              scrolls past. */}
+          {preview.warnings.map((w, i) => (
+            <div
+              key={i}
+              style={{
+                marginTop: 8, padding: 8, borderRadius: 6, fontSize: 12,
+                background: 'var(--background-modifier-error, rgba(200,60,60,0.12))',
+                border: '1px solid rgba(200,60,60,0.4)',
+              }}
+            >
+              {w}
+            </div>
+          ))}
+          <div style={{ ...muted, marginTop: 10 }}>This Setup URI configures:</div>
+          <div style={{ fontSize: 12, marginTop: 4, lineHeight: 1.7 }}>
+            <div>Server: <code>{preview.preview.uri}</code></div>
+            <div>Database: <code>{preview.preview.database}</code></div>
+            <div>Username: <code>{preview.preview.username}</code></div>
+            <div>
+              Password: <code>{preview.preview.password || 'not set'}</code> · End-to-end encryption:{' '}
+              <code>{preview.preview.passphrase ? 'on' : 'off'}</code>
+            </div>
+            <div>
+              Mode:{' '}
+              <code>
+                {preview.preview.liveMode ? 'live' : `every ${preview.preview.intervalSec}s`}
+              </code>
+            </div>
+          </div>
+          <div style={{ ...muted, marginTop: 8 }}>
+            Only the LiveSync settings change. Your vault path, account and other settings are not
+            touched, and the sync backend is not switched for you.
+          </div>
+          {preview.requiresHostConfirmation && (
+            <Row name="Type the new server host">
+              <input
+                value={confirmHost}
+                onChange={(e) => setConfirmHost(e.target.value)}
+                placeholder="confirms you read the change above"
+              />
+            </Row>
+          )}
+          <Row name="Your account password">
+            <input
+              type="password"
+              autoComplete="current-password"
+              value={ownerPassword}
+              onChange={(e) => setOwnerPassword(e.target.value)}
+            />
+          </Row>
+          <button
+            className="btn"
+            style={{ marginTop: 8 }}
+            disabled={busy || !ownerPassword || (preview.requiresHostConfirmation && !confirmHost.trim())}
+            onClick={apply}
+          >
+            {busy ? 'Applying...' : 'Apply these settings'}
+          </button>
+        </>
+      )}
+
+      {error && (
+        <div style={{ marginTop: 8, fontSize: 12, color: 'var(--text-error, #e05252)' }}>{error}</div>
+      )}
     </div>
   );
 }

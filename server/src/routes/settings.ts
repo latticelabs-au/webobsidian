@@ -594,7 +594,18 @@ function requireLiveSyncString(value: unknown, field: string): string {
  * empty path segment. The failure is a 404 that looks nothing like its cause.
  * The schema normalises identically, so both doors store one string.
  */
-function requireCouchUri(value: string): string {
+/*
+ * EXPORTED so the Setup URI import path (routes/livesync-setup.ts) validates
+ * through this exact function rather than a parallel copy.
+ *
+ * That matters more in the import direction than it does here. A settings PUT
+ * carries a value the operator typed; a Setup URI carries a value an ATTACKER
+ * may have chosen, since a URI is a string a user can be talked into pasting.
+ * Two doors onto one setting with two validators between them is the recurring
+ * failure this codebase already names, and it is exactly how a `file:///etc` or
+ * `couchdb://` URL would reach the engine through the newer door.
+ */
+export function requireCouchUri(value: string): string {
   const bad = (why: string) => httpError(400, `livesync.uri ${why}`);
   const raw = value.trim();
   if (!raw) return '';
@@ -631,7 +642,15 @@ function requireCouchUri(value: string): string {
  * sentence naming the field instead of a CouchDB 400 surfacing several layers
  * away from the setting that caused it.
  */
-function requireDatabaseName(value: unknown): string {
+/*
+ * EXPORTED for the same reason as requireCouchUri above, and this one is the
+ * sharper of the two in the import direction. Its own note explains that the
+ * engine builds `url + "/" + database` with no encoding step, so a decoded
+ * `../_users` points the replicator at CouchDB's credential database. Through a
+ * settings PUT that string is the operator's own typo; through a Setup URI it is
+ * attacker-controlled.
+ */
+export function requireDatabaseName(value: unknown): string {
   const bad = (why: string) => httpError(400, `livesync.database ${why}`);
   if (typeof value !== 'string') throw bad('must be a string');
   const raw = value.trim();

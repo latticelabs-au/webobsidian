@@ -56,6 +56,7 @@ import * as livesync from '../services/livesync.js';
 import type { LiveSyncStatus } from '../services/livesync.js';
 import type { PeerHealth } from '../services/livesync/health.js';
 import { createPeerLogger } from '../services/livesync/types.js';
+import { livesyncSetupRouter } from './livesync-setup.js';
 
 const log = createPeerLogger('health');
 
@@ -665,6 +666,22 @@ export function livesyncHealthHandler(_req: Request, res: Response): void {
 
 export const livesyncRouter = Router();
 livesyncRouter.use(requireAuth);
+
+/*
+ * Setup URI issuance and import, mounted here rather than defined here.
+ *
+ * Mounted on THIS router specifically so it inherits the `requireAuth` above and
+ * nothing else: it must not land on `settingsRouter` (which is the redaction
+ * boundary, and whose contract is that secrets never leave) and it must never
+ * land on `agentRouter`, because an API key is a long-lived bearer token held by
+ * a script with no human present, so the owner-password re-authentication those
+ * routes require is unimplementable for it.
+ *
+ * Its routes carry their own cache-control and rate-limiting middleware; see the
+ * note in that file about why the ordering is per-route rather than applied
+ * here.
+ */
+livesyncRouter.use(livesyncSetupRouter);
 
 /**
  * Render a thrown value for a client.

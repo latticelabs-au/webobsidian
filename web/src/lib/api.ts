@@ -906,6 +906,82 @@ export const api = {
     req<Partial<LiveSyncStatus>>('/api/livesync/disconnect', { method: 'POST' }),
   liveSyncSync: () => req<{ ok: boolean; log: string[] }>('/api/livesync/sync', { method: 'POST' }),
 
+  // livesync Setup URI: pairing device N+1
+  //
+  // Every call here is a POST, including the two that only read. That is not a
+  // style choice. A GET would put the handle (and, for decode, the passphrase)
+  // into `req.url`, and therefore into the reverse proxy's access log, the
+  // `Referer` of the next navigation and the browser's history. A GET is also
+  // what a prefetcher, a link scanner or "open in new tab" replays, and both
+  // retrieval endpoints are SINGLE USE, so a replay does not merely leak: it
+  // consumes the operator's handle and the pairing silently fails.
+  //
+  // Nothing here may be cached, bookmarked, or turned into a URL. The minted URI
+  // exists only as a POST response body held in this component's state.
+
+  /**
+   * Step 1 of issuing: verify the owner password, build the URI, and get back a
+   * short-lived handle. The URI itself is deliberately NOT in this response.
+   */
+  liveSyncMintSetupUri: (currentPassword: string, uriPassphrase: string) =>
+    req<{ handle: string; expiresAt: number }>('/api/livesync/setup-uri', {
+      method: 'POST',
+      body: JSON.stringify({ currentPassword, uriPassphrase }),
+    }),
+
+  /**
+   * Step 2 of issuing: exchange the handle for the URI and its QR matrix, ONCE.
+   * A second call with the same handle answers 404, as does an expired one.
+   *
+   * `qr` is a module matrix (rows of '0'/'1'), not an image and not markup, so
+   * the component renders it as SVG geometry it builds itself. There is no image
+   * endpoint on purpose: an image URL would be cacheable, prefetchable and
+   * "save image as"-able into a synced photo library.
+   */
+  liveSyncRetrieveSetupUri: (handle: string) =>
+    req<{ uri: string; qr: { size: number; version: number; rows: string[] } | null }>(
+      '/api/livesync/setup-uri/retrieve',
+      { method: 'POST', body: JSON.stringify({ handle }) },
+    ),
+
+  /**
+   * Import step 1: decrypt a pasted URI and preview it. Writes nothing.
+   *
+   * The preview's secrets arrive masked, exactly as `GET /api/settings` masks
+   * them. `warnings` is prose meant to be shown verbatim: it is where a change
+   * of CouchDB host or of encryption passphrase is stated in plain language.
+   */
+  liveSyncDecodeSetupUri: (uri: string, passphrase: string) =>
+    req<{
+      handle: string;
+      expiresAt: number;
+      requiresHostConfirmation: boolean;
+      warnings: string[];
+      preview: {
+        uri: string;
+        database: string;
+        username: string;
+        password: string;
+        passphrase: string;
+        obfuscatePassphrase: string;
+        liveMode: boolean;
+        intervalSec: number;
+      };
+    }>('/api/livesync/setup-uri/decode', {
+      method: 'POST',
+      body: JSON.stringify({ uri, passphrase }),
+    }),
+
+  /**
+   * Import step 2: commit a previewed URI. Requires the owner password again,
+   * and -- when the CouchDB host is changing -- the new host typed back exactly.
+   */
+  liveSyncApplySetupUri: (handle: string, currentPassword: string, confirmHost?: string) =>
+    req<{ ok: boolean; settings: any }>('/api/livesync/setup-uri/apply', {
+      method: 'POST',
+      body: JSON.stringify({ handle, currentPassword, confirmHost }),
+    }),
+
   // api keys
   listKeys: () => req<{ keys: any[] }>('/api/keys/'),
   createKey: (name: string, scopes: string[]) =>

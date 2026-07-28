@@ -4,7 +4,7 @@
 > Convention: `[ ]` not started · `[~]` in progress · `[x]` done.
 > Update this file **every time** an item changes state.
 
-Last updated: 2026-07-27 (Phase 28: native OIDC single sign-on, FR-15 / PRD 1.6. Server-side authorization-code + S256 PKCE flow, a nested `idp` session claim, a subject/group allowlist that fails closed, and `data/oidc-users.json`. Code complete and unverified: neither the typecheck/build gate nor a live login has been run for this pass)
+Last updated: 2026-07-28 (Phase 29: Setup URI + QR pairing for the LiveSync backend. Format-compatible with the real Self-hosted LiveSync plugin in both directions, proven by known-answer tests against real octagonal-wheels ciphertext and by round-tripping through the vendored `decryptString` dispatcher. Gate run and green: typecheck (server+web+desktop) and 602/602 server tests)
 
 ---
 
@@ -569,6 +569,64 @@ modules yet, and no live authorization-code round trip against a real IdP has be
       next attempt without a restart.
 
 ### Progress log
+- 2026-07-28 (LiveSync Setup URI and QR pairing, the "join device N+1" quality-of-life feature):
+  a phone running the REAL Obsidian plugin can now join a vault this server syncs by scanning a QR, and this
+  server can be configured from a URI an existing device produced. **Format compatibility was the whole point**,
+  so nothing about the wire format was guessed. The codec upstream uses
+  (`@vrtmrz/livesync-commonlib/compat/API/processSetting`) is absent from our pinned engine (8ed9bcd), and
+  re-vendoring a newer commonlib to obtain a pure function over a settings object was rejected as swapping the
+  sync engine out from under a subsystem that had just been stabilised. Importing `octagonal-wheels` directly was
+  also rejected: it is a dependency of the vendored package, not of the server, and is only present through
+  hoisting, which is the same undeclared-dependency trap `peer-couchdb.ts` already documents at `decodeEntryData`.
+  So the `%$` HKDF envelope (PBKDF2 310k -> HKDF-SHA256 -> AES-256-GCM, layout
+  `pbkdf2Salt[32] | iv[12] | hkdfSalt[32] | ct||tag`) plus the legacy `%` and `[` readers were reimplemented on
+  `node:crypto`, and **pinned by known-answer tests carrying ciphertext produced by the real
+  `octagonal-wheels@0.1.51`**. A decoder that cannot read a URI the real plugin produced is the failure that makes
+  this feature pointless, so that assertion was written before anything else. Note one upstream doc comment is
+  WRONG about the field order (it claims IV, HKDF salt, PBKDF2 salt); the code and the vectors agree with each
+  other and not with it.
+  **The QR encodes the ENCRYPTED `?settings=` URI, never the plugin's `?settingsQR=` payload.** That second
+  transport is not encrypted at all -- its codec is synchronous and takes no passphrase, which is proof rather
+  than inference given every crypto path there is promise-only WebCrypto -- so it would put the CouchDB password
+  and the vault passphrase on screen in the clear, and its multi-part mode parks them in a third-party origin's
+  localStorage. A QR is only a transport for a string, and the plugin's protocol handler accepts the encrypted
+  URI from a camera scan too, so this gets the convenience with none of the disclosure and stays fully compatible.
+  The QR encoder is hand-written (byte mode, level M) rather than a dependency, because `web/` has no test runner
+  and a QR that scans to garbage is a silent failure: it lives in `server/src/lib/qr.ts` and is verified three
+  ways that do not share assumptions -- published Reed-Solomon vectors ("HELLO WORLD" at 1-Q and 1-M) and
+  generator polynomials, a geometric cross-check that counts free modules against the published codeword table
+  for 18 versions, and an independent decoder in the tests. That geometry check earned its keep immediately: it
+  caught a real off-by-one writing format-information copy 2 over the dark module, which round-tripped perfectly
+  because readers use copy 1.
+  **Issuance is treated as a credential issuance, not a settings read.** The plugin renders into an Electron
+  process the user owns; we are internet-facing behind a proxy, and `requireAuth` proves only that somebody holds
+  a cookie. So: owner-password re-authentication with its OWN failure limiter (sharing `loginFailureLimit` would
+  let wrong passwords here lock the owner out of the instance, since that bucket is global and checked first), a
+  mandatory caller-supplied 12+ character passphrase the server never generates and never returns, a two-step
+  120-second single-use handle held only in memory, `no-store` set AHEAD of the rate limiter on every branch, and
+  an audit line that records when and from where and nothing else. The payload is a fresh minimal object, never
+  the settings tree: `git.token`, `oidc.clientSecret` and `auth.jwtSecret` live there, and `includeInternal` is
+  this host's filesystem layout. `E2EEAlgorithm`/`chunkSplitterVersion` are deliberately NOT emitted, because
+  this server adopts both from the remote milestone document rather than pinning them, so publishing a guess
+  would hand the joining device a tweak that disagrees with the cluster it is about to join.
+  **Import is the more dangerous direction** and is two-phase: decode previews with secrets masked and writes
+  nothing, apply requires the password again plus the new CouchDB host typed back verbatim when it changes. Every
+  decode failure answers ONE identical 400 so the endpoint cannot be a decryption oracle, the URI is length-capped
+  before any key derivation (the legacy branch runs two PBKDF2 passes, so otherwise the caller picks our work
+  factor), and the write reads a FIXED ALLOWLIST of eight fields rather than merging the decoded object.
+  `requireCouchUri`/`requireDatabaseName` were exported from `routes/settings.ts` and reused rather than copied,
+  because `../_users` as a database name points the replicator at CouchDB's credential database and here that
+  string is attacker-controlled. `sync.backend` and `includeInternal` are not importable.
+  One shape mismatch is worth recording: the plugin has NO separate obfuscation passphrase (`usePathObfuscation`
+  is a boolean keyed off `passphrase`) while we store an independent string. Where the two differ the encoder
+  REFUSES rather than emitting `true`, because emitting it would make both devices write `f:<hash>` ids for the
+  same path under different hashes -- every file silently becoming two divergent documents, i.e. vault corruption
+  presenting as "sync seems to work".
+  Verified: `npm run typecheck` (server + web) clean, `npm --workspace desktop run typecheck` clean,
+  `npm --workspace server run test` 602/602 across 15 files (baseline was 504/12; +98, no regressions), and
+  bidirectional interop confirmed out-of-band by round-tripping a URI we produced through the vendored
+  `decryptString` and one it produced back through ours. NOT verified: a live scan by a real phone, and a real
+  Obsidian plugin consuming the URI end to end.
 - 2026-07-27 (FR-15, PRD 1.6: native OIDC single sign-on, server side, on branch `feat/oidc-sso`):
   a second door onto the existing owner account, opened by an external OpenID Connect identity provider. The
   design constraint that shaped everything is the one in the PRD's own rationale: a reverse-proxy forward-auth
