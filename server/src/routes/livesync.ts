@@ -246,11 +246,15 @@ function classifyDetail(s: LiveSyncStatus): string | null {
    * attached, and remote changes are still not reaching the vault: an operator
    * told only "peers not syncing" would go and check CouchDB, which is fine.
    *
-   * `inbound.state` is already a fixed vocabulary ('undecodable', 'degraded',
-   * 'unapplied', 'undelivered', 'unobservable'; see services/livesync/progress.ts),
-   * so it can be published here without breaking this endpoint's rule against
-   * free-form text. `inbound.detail` is NOT published: it carries counts today and
-   * would be the natural place for someone to later append the underlying error.
+   * `inbound.state` is already a fixed vocabulary ('undecodable', 'unproven',
+   * 'degraded', 'unapplied', 'unwritable', 'behind', 'undelivered',
+   * 'unobservable'; see services/livesync/progress.ts), so it can be published
+   * here without breaking this endpoint's rule against free-form text.
+   * `inbound.detail` is NOT published: it carries counts today and would be the
+   * natural place for someone to later append the underlying error, and since
+   * 'unproven' it also names a passphrase as one of two readings, which is
+   * appropriate in an authenticated status payload and not on an unauthenticated
+   * health endpoint.
    */
   if (s.inbound?.stalled) return `inbound stalled: ${s.inbound.state}`;
   if (!s.healthy) return 'peers not syncing';

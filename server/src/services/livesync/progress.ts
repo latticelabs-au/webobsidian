@@ -188,6 +188,56 @@ export const WRITE_GRACE_MS = 60_000;
  */
 export const HELD_GRACE_MS = 60_000;
 
+/**
+ * How many DISTINCT remote documents must fail to decrypt, with no foreign
+ * decode behind them, before the peer is stopped as fatally misconfigured.
+ *
+ * WHY THERE IS A QUANTITY HERE AT ALL. The fatal predicate used to be
+ * "undecodable > 0 and nothing has ever decoded", and that bar was sound only
+ * for as long as the receipt on the other side of the `and` was cheap to earn.
+ * It was: any decode granted it, and a peer can always decrypt what it
+ * encrypted itself, so every peer that had ever pushed anything held one. When
+ * the receipt was correctly narrowed to documents this peer did NOT write (see
+ * `noteForeignDecode`), a whole class of legitimate peer stopped holding it, and
+ * the bar of one turned into "one bad document from a stranger is a broken
+ * configuration". Measured: a peer with a CORRECT passphrase, whose only inbound
+ * traffic so far had been its own echoes, received one stranger's document that
+ * failed to decrypt and went `undecodable`, `fatal`, permanently 503, with the
+ * push direction stopped and its next local write never reaching CouchDB. Four
+ * documents had decrypted on it. Narrowing the receipt without raising this bar
+ * traded one silent failure for one loud and wrong one.
+ *
+ * WHY THE FIX IS A QUANTITY AND NOT A DIFFERENT KIND OF EVIDENCE. A key is a
+ * property of a CLIENT, not of a document, and clients write in bulk. So the
+ * observed distribution of "documents I cannot read" is mechanically bimodal:
+ * zero, one or two (an accident, a half-failed write, a document restored from
+ * an older key), or the entire cluster. Almost nothing sits in between. A wrong
+ * passphrase does not fail on one document; it fails on everything anybody else
+ * ever wrote. That is the shape the bar is drawn against, and it is why the
+ * choice is insensitive anywhere in roughly [2, 12] and only has to be defended
+ * against 1 and against "large".
+ *
+ * WHY 3 AND NOT 2. One is excluded by the measurement above. Two is excluded by
+ * mechanism rather than by margin: a single client's half-completed bulk write,
+ * or a pair of documents restored from a backup taken under an older passphrase,
+ * produces two genuinely bad documents without anything being wrong with this
+ * peer's configuration. Three requires three independent document-level
+ * coincidences on a peer that has never once read a stranger's document, against
+ * one configuration-level explanation, which is where the parsimonious reading
+ * flips. Above roughly five the bar starts failing to protect small real vaults,
+ * which is the harm the fatal verdict exists to prevent.
+ *
+ * NOT OPERATOR-CONFIGURABLE, for the same reason the grace windows are not: it
+ * is overridable from `InboundProgressOptions` so a test does not have to build
+ * a twelve-document fixture to drive a boundary, and from nowhere else.
+ *
+ * WHAT IT IS NOT. It is not a bound on how much damage a wrong passphrase can
+ * do, and it does not pretend to be: `verdict()` states the case it deliberately
+ * lets through (a wrong passphrase against a cluster holding fewer than three
+ * foreign documents) and why that is the cheaper end of an unavoidable trade.
+ */
+export const UNDECODABLE_QUORUM = 3;
+
 /** What the inbound direction is doing, as a fixed vocabulary. */
 export type InboundState =
     /** Nothing outstanding and nothing pending on the remote. Genuinely idle. */
@@ -195,14 +245,32 @@ export type InboundState =
     /** Work outstanding, and progressing inside its window. */
     | 'flowing'
     /**
-     * Documents arrived at the feed and NOTHING has ever decoded. Decryption is
-     * broken outright, which no amount of retrying changes.
+     * Documents arrived at the feed, NO DOCUMENT WRITTEN BY ANOTHER CLIENT has
+     * ever decoded, and enough distinct documents have failed that a run of bad
+     * documents is no longer the parsimonious reading. Decryption is broken
+     * outright, which no amount of retrying changes.
+     *
+     * "Nothing has ever decoded" would be the shorter sentence and it is false:
+     * `counts.decoded` can be arbitrarily large in this state, because a peer can
+     * always decrypt its OWN pushes echoing back off the feed, whatever passphrase
+     * it used. Only `counts.foreignDecoded` is evidence about the configuration.
      */
     | 'undecodable'
     /**
-     * Some documents failed to decode while others succeeded. Real loss, but not
-     * a broken configuration: see `verdict()` for why the difference decides
-     * whether this peer stops or keeps running.
+     * Documents failed to decode, no document written by another client has
+     * decoded yet, and TOO FEW have failed to tell the two apart.
+     *
+     * Not a softened `degraded`, but its own condition: `degraded` means
+     * decryption is demonstrably working and one document is bad, and this peer
+     * has no standing to make that claim. Loud (`stalled`) and deliberately not
+     * `fatal`: see `verdict()` for why the tie is broken towards innocence and
+     * what that costs.
+     */
+    | 'unproven'
+    /**
+     * Some documents failed to decode while documents written by ANOTHER CLIENT
+     * succeeded. Real loss, but not a broken configuration: see `verdict()` for
+     * why the difference decides whether this peer stops or keeps running.
      */
     | 'degraded'
     /** Documents decoded and never settled: the apply path is wedged. */
@@ -248,8 +316,37 @@ export interface InboundCounts {
     received: number;
     /** Note-typed changes the raw feed emitted. These owe a decode receipt. */
     delivered: number;
-    /** Changes that reached the engine's interest predicate, i.e. decrypted. */
+    /**
+     * Changes that reached the engine's interest predicate, i.e. decrypted.
+     *
+     * PROVES NOTHING ABOUT THE CONFIGURATION, and reading it as though it did is
+     * the mistake this pair of fields exists to make impossible. A peer can always
+     * decrypt what it encrypted itself, and its own pushes echo back down the feed
+     * within milliseconds of every write, so this number counts a wrong
+     * passphrase's own output as readily as a right one's.
+     */
     decoded: number;
+    /**
+     * Of those, the ones written by ANOTHER CLIENT. The number that is evidence
+     * about the configuration rather than about a document.
+     *
+     * DIFFERENT LIFETIME FROM EVERY OTHER COUNT HERE, deliberately: the rest are
+     * per run and are zeroed by `reset()`, and this one is not, for the same
+     * reason `everDecoded` is not (`adoptPriorDecodeEvidence()` argues it at
+     * length). It counts what THIS ledger instance has observed; evidence adopted
+     * from an earlier process arrives as a flag rather than a number, because
+     * nothing persisted the number, so `foreignDecoded === 0` alongside a
+     * `degraded` verdict means "the proof came from disk" and not "there is no
+     * proof".
+     *
+     * Published rather than kept private because the fatal verdict's message is
+     * about it, and an operator holding `{ decoded: 4, foreignDecoded: 0 }` can
+     * see at once why four successful decryptions did not clear the alarm. The
+     * shape `{ decoded: 4, undecodable: 1, detail: '...none has ever decrypted' }`
+     * was printable before this field existed, and reads as a bug in the ledger
+     * rather than as the true statement it is.
+     */
+    foreignDecoded: number;
     /** Decoded changes this peer deliberately ignored (prefixed or out of baseDir). */
     skipped: number;
     /** Decoded changes written to the vault, with the checkpoint advanced. */
@@ -271,9 +368,12 @@ export interface InboundVerdict extends InboundCounts {
     /**
      * Waiting cannot fix this, and neither can restarting.
      *
-     * Only `undecodable`, i.e. only when NOTHING has ever decoded. See
-     * `verdict()`: this flag stops the peer outright, so the evidence behind it
-     * has to be evidence of a broken configuration rather than of a bad document.
+     * Only `undecodable`, i.e. only when NO DOCUMENT WRITTEN BY ANOTHER CLIENT
+     * has ever decoded AND at least `UNDECODABLE_QUORUM` distinct documents have
+     * failed to. See `verdict()`: this flag stops the peer outright, so the
+     * evidence behind it has to be evidence of a broken CONFIGURATION rather than
+     * of a bad document, and each half of the conjunction rules out one of the two
+     * ways that reading has been wrong in production.
      */
     fatal: boolean;
     /**
@@ -310,8 +410,30 @@ export interface InboundVerdict extends InboundCounts {
     restartFutile: boolean;
     /** How long the reported condition has persisted. 0 when not stalled. */
     stalledMs: number;
-    /** Documents lost between the feed and decryption. */
+    /**
+     * Documents lost between the feed and decryption, as DELIVERY EVENTS.
+     *
+     * Carries magnitude, not identity, and cannot be used as the fatal
+     * predicate's quantity: an undecodable document never reaches the apply
+     * callback, so it never advances the checkpoint, so every feed re-arm (the
+     * engine's own ten-second retry, or the watchdog's every five seconds)
+     * redelivers it and this number climbs 1, 2, 3 on one bad document and one
+     * CouchDB hiccup. `undecodableDistinct` is what the verdict turns on.
+     */
     undecodable: number;
+    /**
+     * Distinct documents that failed to decrypt, counted by CouchDB `_id`, across
+     * this run AND every earlier run under the same configuration fingerprint.
+     *
+     * The quantity the fatal verdict is actually made on, published so that an
+     * operator handed a "this peer has stopped" verdict can see the number behind
+     * it rather than infer it. SATURATES AT `UNDECODABLE_QUORUM`: it is a decision
+     * variable and not a census, and capping it is what keeps the set that backs
+     * it to three strings on a peer that cannot read a hundred thousand documents.
+     * So it reads as "at least this many", and every message worded from it says
+     * so.
+     */
+    undecodableDistinct: number;
     /** Documents lost between decryption and the vault. */
     unapplied: number;
     /**
@@ -335,6 +457,12 @@ export interface InboundProgressOptions {
     probeGraceMs?: number;
     writeGraceMs?: number;
     heldGraceMs?: number;
+    /**
+     * Override `UNDECODABLE_QUORUM`. Tests only, and for the same reason the
+     * grace windows are overridable: driving a boundary should not require a
+     * twelve-document fixture.
+     */
+    undecodableQuorum?: number;
 }
 
 /**
@@ -417,6 +545,38 @@ class PendingClock {
         this.dropOldest();
     }
 
+    /**
+     * Every document whose OLDEST outstanding copy started waiting before `before`.
+     *
+     * The identity half of what `oldest()` answers as a timestamp, and the only
+     * reader that cares which documents rather than how long. `InboundProgress`
+     * uses it to turn "these are still owed a decode, and have been for longer
+     * than the grace window" into a set of document ids that survives this clock:
+     * an entry here is removed by a settle (including the `dropOldest()` fallback)
+     * and the whole map is cleared by `reset()`, so a judgement that has to be
+     * made across runs cannot be re-derived from it later.
+     *
+     * KEYED, SO REDELIVERY OF ONE DOCUMENT IS ONE ANSWER. The same id arriving
+     * again appends a second stamp under the same key rather than making a new
+     * one, which is exactly the property the fatal verdict needs: an undecodable
+     * document is redelivered by every feed re-arm, forever, because it never
+     * advances the checkpoint.
+     *
+     * The `UNNAMED` bucket contributes at most one entry however many unnamed
+     * documents it holds, which under-counts. That is the same direction this
+     * class degrades in everywhere else, and the right one: under-counting delays
+     * a fatal verdict, and over-counting manufactures one.
+     */
+    expiredKeys(before: number): string[] {
+        const out: string[] = [];
+        for (const [k, stamps] of this.waiting) {
+            const head = stamps[0];
+            if (head === undefined) continue;
+            if (head < before) out.push(k);
+        }
+        return out;
+    }
+
     /** When the oldest outstanding document started waiting, or undefined if none is. */
     oldest(): number | undefined {
         let oldest: number | undefined;
@@ -465,6 +625,7 @@ export class InboundProgress {
     private readonly probeGraceMs: number;
     private readonly writeGraceMs: number;
     private readonly heldGraceMs: number;
+    private readonly undecodableQuorum: number;
 
     private received = 0;
     private delivered = 0;
@@ -538,15 +699,75 @@ export class InboundProgress {
 
     /**
      * Decryption has demonstrably worked, at some point, for this configuration
-     * against this remote. See `adoptPriorDecodeEvidence()` and `verdict()`.
+     * against this remote, ON A DOCUMENT THIS PEER DID NOT WRITE. See
+     * `noteForeignDecode()`, `adoptPriorDecodeEvidence()` and `verdict()`.
+     *
+     * That last qualifier is the whole load-bearing part of the sentence and was
+     * missing from the code for a while: without it the flag was satisfiable by a
+     * peer's own echo, which a wrong passphrase produces just as readily as a
+     * right one. `noteDecoded()` records what that cost.
      *
      * NOT CLEARED BY `reset()`, and that is the entire point of the field: the
      * fatal verdict below is the one judgement in this module that must be made
      * on evidence which outlives a run, because the thing it stops the peer over
      * (a wrong end-to-end passphrase) is a fact about the configuration rather
      * than about this connection.
+     *
+     * SPLIT INTO A COUNT AND A FLAG so the count can be published (see
+     * `InboundCounts.foreignDecoded`). They are not the same fact: the count is
+     * what this ledger has watched happen, and the flag is what an earlier
+     * process wrote down and this one adopted. Nothing persisted a number, so
+     * inventing one for the adopted case would be a fabricated measurement in a
+     * field an operator is being asked to reason from.
      */
-    private everDecoded = false;
+    private foreignDecoded = 0;
+    private adoptedDecode = false;
+
+    private get everDecoded(): boolean {
+        return this.foreignDecoded > 0 || this.adoptedDecode;
+    }
+
+    /**
+     * Distinct documents that were delivered, owed a decode, and never produced
+     * one inside the grace window. Capped at `undecodableQuorum`.
+     *
+     * WHY THIS EXISTS SEPARATELY FROM `awaitingDecode`, which already holds the
+     * same documents. Two reasons, and both are the difference between a detector
+     * that fires on the right evidence and one that fires on an artefact:
+     *
+     *  - `delivered - decoded` counts DELIVERY EVENTS, and an undecodable
+     *    document is redelivered indefinitely, because it never reaches the apply
+     *    callback and therefore never advances the checkpoint. Every feed re-arm
+     *    replays it. A threshold on that count would reach 3 on ONE bad document
+     *    after two re-arms, i.e. after one CouchDB hiccup, which is the regression
+     *    this whole change removes, reintroduced on a delay and therefore harder
+     *    to see. Keying by document id is mandatory, not a refinement.
+     *  - `awaitingDecode` is cleared by `reset()` and drained by `settle()`'s
+     *    documented `dropOldest()` fallback, so it cannot carry a judgement that
+     *    has to hold across runs. This is the durable projection of it.
+     *
+     * NOT CLEARED BY `reset()`, for the reason `everDecoded` is not, plus one
+     * that is specific to it and is a real measured loss rather than a symmetry
+     * argument. A wrong-passphrase peer that also pushes a local note has that
+     * note's echo decode, apply, and ADVANCE THE CHECKPOINT PAST the foreign
+     * backlog (the apply callback advances it whatever the dispatch returned). One
+     * restart later the backlog sits behind the checkpoint and is never delivered
+     * again, so a per-run set would measure zero and the fault would become
+     * invisible for good. Persisting this is what stops a peer's own echo from
+     * erasing the evidence against it; `CouchDBPeer` keys the persisted copy by
+     * the same configuration fingerprint as the decode receipt.
+     */
+    private readonly undecodableIds = new Set<string>();
+
+    /**
+     * Ids added to the set above since the owner last took them away to persist.
+     *
+     * A queue rather than a "dirty" flag so the owner writes down exactly what is
+     * new, and survives `reset()` for the same reason the set does: the peer
+     * drains this on the watchdog tick, and a stop between an addition and the
+     * next tick must not lose the record.
+     */
+    private pendingUndecodablePersist: string[] = [];
 
     constructor(opts: InboundProgressOptions = {}) {
         this.decodeGraceMs = opts.decodeGraceMs ?? DECODE_GRACE_MS;
@@ -555,6 +776,7 @@ export class InboundProgress {
         this.probeGraceMs = opts.probeGraceMs ?? PROBE_GRACE_MS;
         this.writeGraceMs = opts.writeGraceMs ?? WRITE_GRACE_MS;
         this.heldGraceMs = opts.heldGraceMs ?? HELD_GRACE_MS;
+        this.undecodableQuorum = Math.max(1, opts.undecodableQuorum ?? UNDECODABLE_QUORUM);
     }
 
     // --- recording -------------------------------------------------------------
@@ -605,15 +827,61 @@ export class InboundProgress {
      * by any other document, which is the distinction `PendingClock` exists to
      * make.
      *
-     * It is also the only thing in this module that may set `everDecoded`, and
-     * that is deliberate: the flag suppresses the fatal verdict, so it has to
-     * mean "a document actually decrypted" and nothing weaker.
+     * IT DELIBERATELY DOES NOT SET `everDecoded`, AND THAT SEPARATION IS A BUG
+     * FIX RATHER THAN A TIDY-UP. It used to, on the argument that the flag
+     * suppresses the fatal verdict so it must mean "a document actually
+     * decrypted" and nothing weaker. The argument was right and the code was
+     * strictly weaker than it claimed, because A PEER CAN ALWAYS DECRYPT WHAT IT
+     * ENCRYPTED ITSELF. Its own pushed document echoes back down the changes feed
+     * within milliseconds of every write, decrypts perfectly, and lands here, so
+     * a WRONG passphrase satisfied the receipt using nothing but its own output.
+     *
+     * Measured: a fresh install with a mistyped passphrase and one unsynced local
+     * note pushed that note, took its echo as proof, persisted the wrong
+     * passphrase's fingerprint, and from then on could never reach the branch
+     * below. It settled at `degraded` forever, served 503 with a message about a
+     * bad document rather than a bad passphrase, and kept publishing chunks no
+     * other client in the cluster could read. Somebody setting up a new device
+     * and mistyping the passphrase is the most likely way this fault is ever met,
+     * and it defeated the one detector written for it.
+     *
+     * So the evidence half has its own entry point, `noteForeignDecode()`, which
+     * a caller may only reach for a document it did not write.
      */
     noteDecoded(key?: string): void {
         this.decoded += 1;
-        this.everDecoded = true;
         this.awaitingDecode.settle(key);
         this.awaitingApply.add(key, Date.now());
+    }
+
+    /**
+     * A change THIS PEER DID NOT WRITE survived decryption.
+     *
+     * The only route to `everDecoded` within a run, and therefore the only thing
+     * that can suppress the fatal "nothing has ever decrypted" verdict on the
+     * strength of what this run has seen. Split out of `noteDecoded()` for the
+     * reason written out there: decrypting a document is evidence about the
+     * document, and only decrypting SOMEBODY ELSE'S document is evidence about
+     * the configuration.
+     *
+     * This module cannot check that claim, and deliberately does not try. Nothing
+     * here knows what the peer has pushed. `CouchDBPeer.noteForeignDecode()` is
+     * the sole caller and carries the argument for how provenance is decided,
+     * where in the inbound path that can honestly be done, and what the remaining
+     * false negatives cost.
+     *
+     * Argument-free and one-way, exactly like `adoptPriorDecodeEvidence()`: there
+     * is nothing to key it on, since the flag is a statement about the
+     * configuration rather than about any one document, and nothing may use it to
+     * clear the flag.
+     *
+     * Counted rather than flagged so `counts.foreignDecoded` can be published
+     * beside `counts.decoded`. The pair is what makes the fatal verdict's message
+     * legible: `{ decoded: 4, foreignDecoded: 0 }` says in two numbers what a
+     * paragraph of detail text otherwise has to argue.
+     */
+    noteForeignDecode(): void {
+        this.foreignDecoded += 1;
     }
 
     /** A decoded change this peer deliberately ignored. Counts as settled. */
@@ -750,9 +1018,113 @@ export class InboundProgress {
      * which is the entire point of the check). This method only accepts it, and
      * it is deliberately one-way and argument-free so that nothing can use it to
      * clear the flag or to set it on anything other than a real decode.
+     *
+     * THE FIRST SENTENCE OF THAT JUSTIFICATION HAS TO BE READ EXACTLY. The fatal
+     * verdict's claim was once "not one document has decrypted", and that is now
+     * reachable-false: `counts.decoded` may be large in a fatal verdict, because a
+     * peer decrypts its own echoes under any passphrase at all. What outlives the
+     * run, and what this method adopts, is the narrower fact that a document
+     * written by ANOTHER CLIENT decrypted. See `noteForeignDecode()`.
      */
     adoptPriorDecodeEvidence(): void {
-        this.everDecoded = true;
+        this.adoptedDecode = true;
+    }
+
+    /**
+     * Adopt the distinct documents that failed to decrypt under this exact
+     * configuration in earlier runs.
+     *
+     * The counterpart of `adoptPriorDecodeEvidence()` on the other side of the
+     * conjunction, and it exists for a sharper reason than symmetry: without it a
+     * wrong-passphrase peer erases the evidence against itself with its own echo.
+     * The sequence is written out on `undecodableIds`, and its end state is a peer
+     * that reports `idle` forever while publishing chunks nobody can read.
+     *
+     * Additive and one-way, and capped at the quorum on the way in so that a
+     * hand-edited or corrupted state file cannot make a peer fatal on adoption
+     * alone: the verdict still requires live undecodable traffic (`undecodable > 0`
+     * past the decode grace window) before the count is ever consulted.
+     *
+     * The CALLER owns which fingerprint these belong to, exactly as it does for
+     * the decode receipt: failures under an old passphrase are evidence about that
+     * passphrase and none at all about this one.
+     */
+    adoptPriorUndecodable(ids: readonly string[]): void {
+        for (const id of ids) {
+            if (this.undecodableIds.size >= this.undecodableQuorum) return;
+            this.undecodableIds.add(id);
+        }
+    }
+
+    /**
+     * Take the newly-observed undecodable document ids away, for the owner to
+     * write down.
+     *
+     * DRAINING, RATHER THAN A GETTER PLUS A FLAG, so that "what is new" is
+     * answered once and cannot be answered twice: the owner persists on a
+     * five-second watchdog tick and the alternative shapes either re-write the
+     * whole set every tick or need a second piece of state saying how much of it
+     * was already written.
+     *
+     * Nothing here calls it. `verdict()` does the observing, this hands the result
+     * out, and `CouchDBPeer` decides where it goes; the ledger stays a counter
+     * with a clock that does no I/O and knows nothing about a peer.
+     */
+    drainPersistableUndecodable(): string[] {
+        if (this.pendingUndecodablePersist.length === 0) return [];
+        const out = this.pendingUndecodablePersist;
+        this.pendingUndecodablePersist = [];
+        return out;
+    }
+
+    /**
+     * Move every document that has now been owed a decode for longer than the
+     * grace window into the durable set.
+     *
+     * CALLED FROM `verdict()`, which makes `verdict()` the one reader in this
+     * module that also records, and that placement is deliberate rather than
+     * convenient. The alternative was an explicit `sweepUndecodable()` that the
+     * watchdog calls just before it judges, which reads better and fails worse:
+     * forgetting the call disables the fatal detector entirely and silently, and
+     * "a detector that is quietly not running" is the exact shape of fault this
+     * whole subsystem exists to remove. Wiring the observation to the judgement
+     * means the two cannot come apart. The remaining wiring (persistence) can
+     * only cost DURABILITY if it is dropped, not detection.
+     *
+     * Safe to call as often as callers like: it is idempotent (a `Set`, keyed by
+     * document id), monotone (nothing removes an entry), and short-circuits the
+     * moment the quorum is reached, so the common case is one integer comparison.
+     * It also adds no asymptotic cost even when it does walk: `oldest()` already
+     * walks the same map on every single `verdict()` call.
+     *
+     * GATED ON `undecodable > 0`, WHICH IS THE SAME FIRST CONJUNCT THE DECODE
+     * BRANCH USES, AND FOR A SHARPER REASON THAN CONSISTENCY. The clock and the
+     * counter can disagree in exactly one direction: `noteDecoded()` called while
+     * the clock is empty removes nothing (a document decoded before
+     * `instrumentFeed()` attached, which `startWatch` makes reachable by arming
+     * the feed before instrumenting it), so from then on `decoded` can exceed
+     * `delivered`, the subtraction clamps to zero, and the clock nonetheless holds
+     * whatever arrives next. Sweeping through that would write down a document as
+     * a decryption failure on a peer whose ledger says nothing has failed at all.
+     *
+     * Worse, `PendingClock` promises to degrade to plain FIFO rather than to a
+     * false alarm: an unmatched settle drops the OLDEST entry of any key, so in
+     * that desynchronised state the entry left standing can belong to a document
+     * that decoded perfectly well. Recording it here would promote a deliberate
+     * FIFO approximation into persistent, fingerprinted evidence for stopping the
+     * peer. With this gate the walk can never return more entries than the counter
+     * says are missing, because the only way the clock's population exceeds
+     * `delivered - decoded` is the clamped case this refuses to enter.
+     */
+    private sweepUndecodable(now: number, undecodable: number): void {
+        if (undecodable <= 0) return;
+        if (this.undecodableIds.size >= this.undecodableQuorum) return;
+        for (const key of this.awaitingDecode.expiredKeys(now - this.decodeGraceMs)) {
+            if (this.undecodableIds.size >= this.undecodableQuorum) return;
+            if (this.undecodableIds.has(key)) continue;
+            this.undecodableIds.add(key);
+            this.pendingUndecodablePersist.push(key);
+        }
     }
 
     /**
@@ -816,10 +1188,21 @@ export class InboundProgress {
      * Forget everything about this run. Called when a peer stops, so a fresh run
      * starts clean.
      *
-     * `everDecoded` is the one thing that survives, for the reason
-     * `adoptPriorDecodeEvidence()` gives at length: it is the fact that stops a
-     * restart from re-reading a partial decryption failure as a total one and
-     * killing the peer over a passphrase that works.
+     * TWO THINGS SURVIVE, AND THEY ARE THE TWO HALVES OF THE FATAL PREDICATE.
+     * That is not a coincidence: the fatal verdict is the one judgement in this
+     * module that is about the CONFIGURATION rather than about this connection, so
+     * neither side of it may be re-derived from a single run's traffic.
+     *
+     *  - the foreign decode evidence (`foreignDecoded`, `adoptedDecode`), for the
+     *    reason `adoptPriorDecodeEvidence()` gives at length: it is the fact that
+     *    stops a restart from re-reading a partial decryption failure as a total
+     *    one and killing the peer over a passphrase that works.
+     *  - `undecodableIds` and its pending-persist queue, for the mirror-image
+     *    reason written out on the field: a restart otherwise erases the evidence
+     *    AGAINST a wrong passphrase, because the peer's own echo can carry the
+     *    checkpoint past the documents it could not read.
+     *
+     * Dropping either one re-opens a measured failure, in opposite directions.
      */
     reset(): void {
         this.received = 0;
@@ -850,6 +1233,7 @@ export class InboundProgress {
             received: this.received,
             delivered: this.delivered,
             decoded: this.decoded,
+            foreignDecoded: this.foreignDecoded,
             skipped: this.skipped,
             applied: this.applied,
             failed: this.failed,
@@ -878,7 +1262,17 @@ export class InboundProgress {
         const undecodable = this.undecodableCount();
         const unapplied = this.unappliedCount();
         const now = Date.now();
-        const base = { ...counts, undecodable, unapplied, checkpointHeld: this.checkpointHeldSince !== undefined };
+        // Before anything is read, because the decode branch below turns on the
+        // result and because tying the observation to the judgement is what stops
+        // a mis-wiring from disabling the detector. See `sweepUndecodable()`.
+        this.sweepUndecodable(now, undecodable);
+        const base = {
+            ...counts,
+            undecodable,
+            undecodableDistinct: this.undecodableIds.size,
+            unapplied,
+            checkpointHeld: this.checkpointHeldSince !== undefined,
+        };
 
         if (!this.observable) {
             return {
@@ -898,61 +1292,141 @@ export class InboundProgress {
         const decodeSince = this.awaitingDecode.oldest();
         if (undecodable > 0 && decodeSince !== undefined && now - decodeSince > this.decodeGraceMs) {
             const stalledMs = now - decodeSince;
+            const distinct = this.undecodableIds.size;
             /*
-             * TWO VERY DIFFERENT FAULTS WEAR THE SAME SYMPTOM, and the ledger is
-             * the only thing that can tell them apart. Both look like "documents
-             * arrived and did not decode"; what separates them is whether
-             * ANYTHING has ever decoded.
+             * THREE VERY DIFFERENT FAULTS WEAR THE SAME SYMPTOM, and the ledger is
+             * the only thing that can tell them apart. All three look like
+             * "documents arrived and did not decode". What separates them is two
+             * facts, and BOTH are needed: whether a document written by another
+             * client has ever decoded, and how many distinct documents have failed.
              *
-             *  - nothing has EVER decoded: not one document has decrypted with
-             *    this passphrase against this database, on this run or any
-             *    earlier one. That is what a wrong end-to-end passphrase
-             *    produces, and nothing on the connect path can catch it first:
-             *    the reachability probe is a plain GET, and the milestone is a
+             *  - NO FOREIGN DECODE, AND ENOUGH DISTINCT FAILURES. Not one document
+             *    this peer did not write has decrypted, on this run or any earlier
+             *    one, and at least `UNDECODABLE_QUORUM` distinct documents have
+             *    failed to. That is what a wrong end-to-end passphrase produces,
+             *    and nothing on the connect path can catch it first: the
+             *    reachability probe is a plain GET, and the milestone is a
              *    `_local/` document, which `transform-pouch` refuses to transform
              *    at all. So a wrong passphrase connects cleanly and then decrypts
-             *    nothing. Retrying cannot help, and continuing is actively
-             *    harmful (the push direction would keep writing chunks under a
-             *    key no other client shares), so it is FATAL.
-             *  - something HAS decoded: the passphrase is demonstrably correct,
-             *    because documents have decrypted with it. Some specific document
-             *    did not, which is real loss and must be reported, but it is not a
-             *    broken configuration. Treating it as fatal stopped the peer, took
-             *    the PUSH direction down with it (`requireReady` throws once
-             *    `fatalReason` is set), blocked `restartWorthy` forever (a fatal
-             *    peer reports its backend down by design) and told the operator to
-             *    change a passphrase that was correct. One bad document out of
-             *    five hundred good ones needed a human to clear it.
+             *    nothing anybody else wrote. Retrying cannot help, and continuing
+             *    is actively harmful (the push direction would keep writing chunks
+             *    under a key no other client shares), so it is FATAL.
+             *  - NO FOREIGN DECODE, TOO FEW FAILURES: `unproven`. Loud, and not
+             *    fatal. See below.
+             *  - A FOREIGN DECODE HAS HAPPENED: `degraded`. The passphrase is
+             *    demonstrably correct, because a document written by somebody else
+             *    decrypted with it. Some specific document did not, which is real
+             *    loss and must be reported, but it is not a broken configuration.
+             *    Treating it as fatal stopped the peer, took the PUSH direction
+             *    down with it (`requireReady` throws once `fatalReason` is set),
+             *    blocked `restartWorthy` forever (a fatal peer reports its backend
+             *    down by design) and told the operator to change a passphrase that
+             *    was correct. One bad document out of five hundred good ones
+             *    needed a human to clear it.
              *
-             * `everDecoded` RATHER THAN `counts.decoded === 0` IS THE WHOLE POINT
-             * OF THIS BRANCH, and using the counter was a bug with a two-minute
-             * fuse rather than a wording problem: the counter is per-run, the
-             * checkpoint is not, and a restart therefore replays only the
-             * documents past the checkpoint. In the case above that is exactly one
-             * document, the bad one, so the restarted peer measures
-             * `decoded === 0` and escalates the same partial failure to fatal
-             * with the passphrase message attached. `adoptPriorDecodeEvidence()`
-             * documents the sequence in full.
+             * EACH HALF OF THE CONJUNCTION RULES OUT ONE MEASURED FAILURE, and
+             * neither half is redundant. The revisions are worth naming, because
+             * every one of them was arrived at by fixing the previous one:
              *
-             * So `degraded` is stalled but not fatal: it keeps the condition out
-             * of `ok` (a lost document is not "fine") and leaves the push
-             * direction running. It is `restartFutile`, because the restart it
-             * used to earn replays the same undecryptable document from the same
-             * checkpoint and reproduces the same verdict, at the price of a full
-             * offline vault scan every cooldown, forever.
+             *  1. `counts.decoded === 0`. Per-run, while the checkpoint is not, so
+             *     a restart that replays only the one bad document past the
+             *     checkpoint measures zero and escalates a partial failure to
+             *     fatal about ninety seconds later. `adoptPriorDecodeEvidence()`
+             *     documents that sequence in full.
+             *  2. `!everDecoded` with the receipt granted by ANY decode. A peer can
+             *     always decrypt what it encrypted itself, so a fresh install with
+             *     a mistyped passphrase took its own echo as proof, persisted the
+             *     wrong passphrase's fingerprint, and could never reach this branch
+             *     again. `noteDecoded()` records that one.
+             *  3. `!everDecoded` with the receipt correctly narrowed to FOREIGN
+             *     documents, and this bar still at one. That is where the distinct
+             *     count comes from: with the receipt made expensive to earn, a bar
+             *     of one means a peer whose only inbound traffic so far has been
+             *     its own echoes is stopped by the FIRST stranger's document that
+             *     fails. Measured on a peer whose passphrase was correct and which
+             *     had decrypted four documents.
              *
-             * Both messages are worded from the evidence. The fatal one may name
-             * the likely cause because "nothing has ever decrypted" IS that
-             * cause's signature; the degraded one may not, because the same
-             * wording sent operators to change a correct passphrase.
+             * WHY THE QUANTITY IS DISTINCT DOCUMENTS AND NOT `undecodable`. An
+             * undecodable document never advances the checkpoint, so every feed
+             * re-arm redelivers it and the raw count climbs on one bad document
+             * plus one CouchDB hiccup. A cumulative threshold would therefore
+             * reintroduce revision 3's regression on a delay, which is strictly
+             * worse than leaving it in place because it looks fixed. See
+             * `undecodableIds`.
+             *
+             * `unproven` IS ITS OWN CONDITION RATHER THAN A SOFTENED `degraded`,
+             * and the distinction is the whole reason `degraded`'s message is
+             * allowed to be reassuring: `degraded` asserts that decryption is
+             * working here, and a peer with no foreign receipt has no standing to
+             * assert it. Both are `stalled` (a document really is missing from the
+             * vault) and both are `restartFutile` (a restart replays the same
+             * undecryptable document from the same checkpoint). The difference is
+             * `fatal`, which is what stops the peer, and that is exactly the axis
+             * the regression was on: the complaint was never "it reported
+             * unhealthy", it was "it stopped, disconnected, and swallowed the next
+             * local write".
+             *
+             * WHAT `unproven` DELIBERATELY LETS THROUGH, stated rather than hidden:
+             * a WRONG passphrase against a cluster holding fewer than
+             * `UNDECODABLE_QUORUM` foreign documents settles here, reports
+             * unhealthy forever, and keeps publishing chunks nobody else can read.
+             * That is the price of removing the regression and it cannot be
+             * avoided, because a peer with no foreign receipt and one failing
+             * foreign document is information-theoretically ambiguous: no local
+             * evidence separates "the only stranger's document here is corrupt"
+             * from "my passphrase is wrong and there is only one stranger's
+             * document here". Requiring that a correct peer keep pushing forces the
+             * tie to be broken towards innocence. It is bounded three ways: the
+             * cluster is nearly empty, so the damage is nearly nil; the next
+             * distinct foreign failure resolves it in whichever direction is true,
+             * with no restart, because `escalateInboundFatal()` re-reads this every
+             * five seconds; and the count is persisted, so the peer's own echo
+             * carrying the checkpoint past the backlog no longer erases it.
+             *
+             * THE MESSAGES ARE WORDED FROM THE EVIDENCE, and which of them may name
+             * a passphrase follows from what each one actually knows.
+             *
+             *  - The FATAL one may name it, because the CONJUNCTION is that cause's
+             *    signature. Neither half is on its own, and an earlier revision's
+             *    justification ("'nothing has ever decrypted' IS that signature")
+             *    is now reachable-false twice over: `counts.decoded` can be large
+             *    here, and one foreign failure is not a signature of anything. It
+             *    must name BOTH candidates, this server's passphrase and the
+             *    writing client's, because no local evidence separates them: a
+             *    correct peer that meets a wrong-keyed client's bulk push before
+             *    any correctly-keyed foreign document lands in this branch, and
+             *    feed order is by sequence and not ours to choose.
+             *  - The `unproven` one may raise a passphrase as ONE OF TWO readings,
+             *    and must be worded that way. Silence would be worse: this is the
+             *    state in which an operator who has just mistyped a passphrase most
+             *    needs the word in front of them.
+             *  - The `degraded` one may NOT name one, unchanged, because that
+             *    wording sent operators to change a passphrase five hundred
+             *    documents had just decrypted with.
              */
-            if (!this.everDecoded) {
+            if (!this.everDecoded && distinct >= this.undecodableQuorum) {
                 return {
                     ...base,
                     state: 'undecodable',
-                    detail: `${undecodable} remote change(s) could not be decrypted, and none has ever decrypted`,
+                    detail:
+                        `${undecodable} remote change(s) could not be decrypted, across ${distinct} or more ` +
+                        'distinct document(s), and no document written by another client has ever decrypted',
                     stalled: true,
                     fatal: true,
+                    restartFutile: true,
+                    stalledMs,
+                };
+            }
+            if (!this.everDecoded) {
+                return {
+                    ...base,
+                    state: 'unproven',
+                    detail:
+                        `${undecodable} of ${counts.delivered} delivered change(s) could not be decrypted and no ` +
+                        'document written by another client has decrypted yet, so this peer cannot yet tell a ' +
+                        'wrong end-to-end passphrase here from documents written with a different one',
+                    stalled: true,
+                    fatal: false,
                     restartFutile: true,
                     stalledMs,
                 };

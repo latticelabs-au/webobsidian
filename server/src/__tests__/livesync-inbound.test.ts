@@ -50,6 +50,7 @@ import {
     DELIVER_GRACE_MS,
     HELD_GRACE_MS,
     PROBE_GRACE_MS,
+    UNDECODABLE_QUORUM,
     WRITE_GRACE_MS,
     type InboundProgressOptions,
 } from '../services/livesync/progress.js';
@@ -86,10 +87,21 @@ describe('InboundProgress', () => {
      * different sequences, which is the same thing CouchDB does.
      */
     const note = (p: InboundProgress, seq: string) => p.noteFeedChange(seq, true, `doc-${seq}`);
-    /** Every step of one healthy document, keyed consistently. */
+    /**
+     * Every step of one healthy document, keyed consistently.
+     *
+     * `noteForeignDecode` is part of the sequence because a document that flows
+     * all the way to the vault is, in production, always one this peer did not
+     * write: `CouchDBPeer.onRemoteChange` recognises its own echo through the
+     * suppressor and returns before dispatching, so an echo is a `noteSkipped`
+     * and never a `noteApplied`. A helper that decoded without taking the
+     * foreign receipt would model a case that cannot happen and would leave every
+     * test built on it asserting against the wrong ledger state.
+     */
     const flowOne = (p: InboundProgress, seq: string) => {
         note(p, seq);
         p.noteDecoded(`doc-${seq}`);
+        p.noteForeignDecode();
         p.noteApplied(`doc-${seq}`);
     };
 
@@ -124,24 +136,33 @@ describe('InboundProgress', () => {
         expect(p.verdict().stalled).toBe(false);
     });
 
-    it('MECHANISM 1: delivered and NOTHING ever decoded is fatal, because a passphrase does not fix itself', () => {
+    it('MECHANISM 1: delivered, nothing FOREIGN ever decoded, and enough distinct failures is fatal', () => {
         // This is the state a wrong end-to-end passphrase produces: the feed hands
-        // over a document, `transform-pouch` rejects while decrypting it, and the
-        // engine's listener is never called. Fatal rather than retryable, matching
-        // how mergeRemoteTweaks already treats the three settings it refuses.
+        // over documents, `transform-pouch` rejects while decrypting each of them,
+        // and the engine's listener is never called. Fatal rather than retryable,
+        // matching how mergeRemoteTweaks already treats the three settings it
+        // refuses.
         //
-        // `decoded === 0` is the whole of the evidence for that reading, and the
-        // test below ('FINDING 3') is its other half: the same symptom with even
-        // one successful decode behind it is a different fault entirely.
+        // THREE DOCUMENTS RATHER THAN ONE, and that is the evidence rather than
+        // the fixture being generous. A key is a property of a client and clients
+        // write in bulk, so a wrong passphrase fails on everything anybody else
+        // wrote; one failure is a bad document at least as often as it is a bad
+        // key. The two neighbouring tests are the other halves of the split: any
+        // foreign decode behind it is `degraded`, and too few failures is
+        // `unproven`.
         const p = fast();
         note(p, '1');
+        note(p, '2');
+        note(p, '3');
         vi.advanceTimersByTime(101);
         const v = p.verdict();
         expect(v.state).toBe('undecodable');
         expect(v.stalled).toBe(true);
         expect(v.fatal).toBe(true);
-        expect(v.undecodable).toBe(1);
+        expect(v.undecodable).toBe(3);
+        expect(v.undecodableDistinct).toBe(3);
         expect(v.decoded).toBe(0);
+        expect(v.foreignDecoded).toBe(0);
         expect(v.detail).toContain('decrypted');
     });
 
@@ -205,11 +226,13 @@ describe('InboundProgress', () => {
         const p = fast();
         note(p, '1');
         p.noteDecoded();
+        // A document from another client, which is what makes the classification
+        // the PARTIAL one rather than the fatal one. The point of this case is
+        // the ORDER, and it is unchanged by either split.
+        p.noteForeignDecode();
         note(p, '2'); // this one never decodes
         p.setRemotePending(true);
         vi.advanceTimersByTime(1_000);
-        // `decoded` is 1, so the classification is the partial one; the point of
-        // this case is the ORDER, which is unchanged by that split.
         expect(p.verdict().state).toBe('degraded');
     });
 
@@ -676,9 +699,12 @@ describe('InboundProgress', () => {
         // The control. A genuinely new peer pointed at a remote with a wrong
         // passphrase decodes nothing and has nothing behind it, and that must
         // still stop the peer: continuing would publish chunks encrypted with a
-        // key no other client shares.
+        // key no other client shares. A wrong passphrase fails on the whole
+        // cluster, so reaching the quorum costs it nothing.
         const p = fast();
         note(p, '1');
+        note(p, '2');
+        note(p, '3');
         vi.advanceTimersByTime(101);
         expect(p.verdict().state).toBe('undecodable');
         expect(p.verdict().fatal).toBe(true);
@@ -696,6 +722,275 @@ describe('InboundProgress', () => {
         vi.advanceTimersByTime(101);
         expect(p.verdict().fatal).toBe(false);
         expect(p.verdict().state).toBe('degraded');
+    });
+
+    // -----------------------------------------------------------------------
+    // D5: the fatal bar is a QUANTITY of foreign evidence, not one document
+    //
+    // Narrowing the decode receipt to documents this peer did not write (D4) was
+    // correct and it made the receipt expensive to earn. The bar on the other
+    // side of the `and` was still one, so a whole class of legitimate peer
+    // became stoppable by a single stranger's bad document. These are the two
+    // halves of the conjunction, driven separately.
+    // -----------------------------------------------------------------------
+
+    /**
+     * One document this peer pushed, coming back down the feed.
+     *
+     * It decodes, because this peer encrypted it, and the suppressor recognises
+     * it so `onRemoteChange` returns false and the peer records a SKIP. What it
+     * never does is grant the foreign receipt, which is the whole of D4. Modelled
+     * here rather than asserted through the peer so the ledger's own bar can be
+     * driven without a feed harness.
+     */
+    const echoOne = (p: InboundProgress, seq: string) => {
+        note(p, seq);
+        p.noteDecoded(`doc-${seq}`);
+        p.noteSkipped(`doc-${seq}`);
+    };
+
+    it('D5 CASE 2: a peer whose only decodes are its OWN echoes is not stopped by one bad stranger', () => {
+        /*
+         * REGRESSION GUARD FOR THE MEASURED REGRESSION, at the ledger.
+         *
+         * The peer's passphrase is CORRECT. Its inbound traffic so far has been
+         * nothing but its own pushes echoing back, so it holds no foreign receipt,
+         * correctly: an echo decrypts under any passphrase at all and proves
+         * nothing. Then one document from a stranger fails to decrypt.
+         *
+         * With the bar at one, that single document was enough: `undecodable`,
+         * `fatal`, permanent 503, `connected` false, the push direction stopped
+         * through `requireReady`, and the next local write never reached CouchDB.
+         * On a peer that had decrypted four documents and whose configuration was
+         * fine.
+         *
+         * Drop the `distinct >= quorum` term from `verdict()` and this test's
+         * `fatal` assertion fails, which is the regression exactly.
+         */
+        const p = fast();
+        for (let i = 0; i < 4; i += 1) echoOne(p, `echo${i}`);
+        note(p, 'stranger'); // one foreign document that does not decrypt
+        vi.advanceTimersByTime(101);
+
+        const v = p.verdict();
+        expect(v.fatal).toBe(false);
+        expect(v.state).toBe('unproven');
+        // Still not "fine", and deliberately so: a document really is missing from
+        // the vault. The regression was never that it reported unhealthy.
+        expect(v.stalled).toBe(true);
+        expect(v.restartFutile).toBe(true);
+        // The pair of numbers that makes the verdict legible instead of
+        // contradictory. Four decrypted; none of the four is evidence.
+        expect(v.decoded).toBe(4);
+        expect(v.foreignDecoded).toBe(0);
+        expect(v.undecodableDistinct).toBe(1);
+        // It names the passphrase as one of two readings, which `degraded` may not
+        // and `undecodable` asserts outright. This is the state an operator who
+        // has just mistyped a passphrase is most likely to be looking at.
+        expect(v.detail).toContain('passphrase');
+        expect(v.detail).toContain('another');
+    });
+
+    it('D5 CASE 1: the same peer with a WRONG passphrase still stops, because a key fails on everything', () => {
+        // The control, and the reason the quorum costs the headline case nothing.
+        // A key is a property of a client and clients write in bulk, so a wrong
+        // passphrase does not fail on one document: it fails on the whole cluster.
+        const p = fast();
+        for (let i = 0; i < 4; i += 1) echoOne(p, `echo${i}`);
+        for (let i = 0; i < 12; i += 1) note(p, `stranger${i}`);
+        vi.advanceTimersByTime(101);
+
+        const v = p.verdict();
+        expect(v.state).toBe('undecodable');
+        expect(v.fatal).toBe(true);
+        expect(v.decoded).toBe(4);
+        expect(v.foreignDecoded).toBe(0);
+        // Saturating, by design: this is a decision variable and not a census, and
+        // capping it is what bounds the set behind it to three strings on a peer
+        // that cannot read a hundred thousand documents. Every message worded from
+        // it says "or more".
+        expect(v.undecodableDistinct).toBe(UNDECODABLE_QUORUM);
+        expect(v.detail).toContain('or more');
+    });
+
+    it('D5: one bad document redelivered forever is still ONE document, and never becomes fatal', () => {
+        /*
+         * THE REASON THE QUANTITY IS DISTINCT DOCUMENTS AND NOT `undecodable`.
+         *
+         * An undecodable document never reaches the apply callback, so it never
+         * advances the checkpoint, so every feed re-arm resumes at or before it and
+         * hands it back. The engine re-arms ten seconds after an error and the
+         * watchdog re-arms every five, so `delivered - decoded` climbs 1, 2, 3 on
+         * ONE bad document and one CouchDB hiccup.
+         *
+         * A threshold on that count would therefore reintroduce CASE 2's regression
+         * on a delay, which is strictly worse than leaving it in place because it
+         * looks fixed. Key the quantity on `undecodable` instead of on the distinct
+         * set and this test goes fatal on the third redelivery.
+         */
+        const p = fast();
+        for (let i = 0; i < 4; i += 1) echoOne(p, `echo${i}`);
+        for (let i = 0; i < 20; i += 1) {
+            // The same CouchDB `_id`, because it is the same document.
+            p.noteFeedChange(String(i), true, 'doc-stranger');
+            vi.advanceTimersByTime(101);
+            const v = p.verdict();
+            expect(v.fatal).toBe(false);
+            expect(v.state).toBe('unproven');
+            expect(v.undecodableDistinct).toBe(1);
+        }
+        // The raw count is what a naive threshold would have read.
+        expect(p.verdict().undecodable).toBe(20);
+    });
+
+    it('D5: the boundary is exactly the quorum, and the document below it is not fatal', () => {
+        // Stated as a pair so a change to `UNDECODABLE_QUORUM` has to move both
+        // assertions deliberately rather than one of them by accident.
+        const p = fast();
+        for (let i = 0; i < UNDECODABLE_QUORUM - 1; i += 1) note(p, `stranger${i}`);
+        vi.advanceTimersByTime(101);
+        expect(p.verdict().undecodableDistinct).toBe(UNDECODABLE_QUORUM - 1);
+        expect(p.verdict().state).toBe('unproven');
+        expect(p.verdict().fatal).toBe(false);
+
+        note(p, 'one-more');
+        vi.advanceTimersByTime(101);
+        expect(p.verdict().undecodableDistinct).toBe(UNDECODABLE_QUORUM);
+        expect(p.verdict().state).toBe('undecodable');
+        expect(p.verdict().fatal).toBe(true);
+    });
+
+    it('D5: a foreign decode arriving below the quorum demotes the verdict and settles it there', () => {
+        // The receipt short-circuits the count entirely, and must: one document
+        // written by somebody else decrypting is proof that the passphrase works,
+        // whatever else has failed. `degraded` may then use its reassuring wording.
+        const p = fast();
+        for (let i = 0; i < UNDECODABLE_QUORUM - 1; i += 1) note(p, `stranger${i}`);
+        vi.advanceTimersByTime(101);
+        expect(p.verdict().state).toBe('unproven');
+
+        p.noteForeignDecode();
+        expect(p.verdict().state).toBe('degraded');
+        expect(p.verdict().fatal).toBe(false);
+        expect(p.verdict().detail).not.toContain('passphrase');
+
+        // ...and no quantity of further failures brings the fatal verdict back.
+        for (let i = 0; i < 20; i += 1) note(p, `later${i}`);
+        vi.advanceTimersByTime(101);
+        expect(p.verdict().state).toBe('degraded');
+        expect(p.verdict().fatal).toBe(false);
+    });
+
+    it('D5: the failure count survives reset(), because the peer\'s own echo can erase it otherwise', () => {
+        /*
+         * THE MIRROR OF F2, on the other side of the conjunction, and it guards a
+         * real loss rather than a symmetry.
+         *
+         * A wrong-passphrase peer that also pushes a local note has that note's
+         * echo decode, apply, and carry the CHECKPOINT past the foreign backlog it
+         * could not read (the apply callback advances it whatever the dispatch
+         * returned). One restart later the backlog is behind the checkpoint and is
+         * never delivered again, so a per-run count measures zero and the fault
+         * becomes invisible for good: `idle`, healthy, publishing chunks nobody can
+         * read, forever.
+         *
+         * Clear `undecodableIds` in `reset()` and the last two assertions fail.
+         */
+        const p = fast();
+        for (let i = 0; i < UNDECODABLE_QUORUM - 1; i += 1) note(p, `stranger${i}`);
+        vi.advanceTimersByTime(101);
+        expect(p.verdict().undecodableDistinct).toBe(UNDECODABLE_QUORUM - 1);
+
+        p.reset();
+        expect(p.verdict().undecodableDistinct).toBe(UNDECODABLE_QUORUM - 1);
+
+        // The next run delivers exactly one new bad document, and that is enough.
+        note(p, 'one-more-next-run');
+        vi.advanceTimersByTime(101);
+        expect(p.verdict().state).toBe('undecodable');
+        expect(p.verdict().fatal).toBe(true);
+    });
+
+    it('D5: adopted failures reach the quorum, and adoption alone can never be fatal', () => {
+        // How a restarted peer inherits the count from disk. The second half is the
+        // safety property: a hand-edited or corrupted state file hands over three
+        // ids and the peer stays `idle`, because the branch is only entered once
+        // LIVE traffic has failed past the decode window. Evidence about the past
+        // may raise the bar's other side; it may not manufacture a symptom.
+        const p = fast();
+        p.adoptPriorUndecodable(['a', 'b', 'c']);
+        vi.advanceTimersByTime(10_000);
+        expect(p.verdict().state).toBe('idle');
+        expect(p.verdict().fatal).toBe(false);
+
+        note(p, 'live');
+        vi.advanceTimersByTime(101);
+        expect(p.verdict().state).toBe('undecodable');
+        expect(p.verdict().fatal).toBe(true);
+    });
+
+    it('D5: what the ledger observes is handed out exactly once, for the owner to write down', () => {
+        // The drain contract. The peer persists on a five-second watchdog tick, so
+        // "what is new" has to be answerable without re-writing the whole set every
+        // tick, and it must not be answerable twice.
+        const p = fast();
+        note(p, 'a');
+        note(p, 'b');
+        vi.advanceTimersByTime(101);
+        p.verdict(); // the observation happens here, not in the drain
+        expect(p.drainPersistableUndecodable().sort()).toEqual(['doc-a', 'doc-b']);
+        expect(p.drainPersistableUndecodable()).toEqual([]);
+
+        // Redelivery of the same documents adds nothing to write down.
+        note(p, 'a');
+        vi.advanceTimersByTime(101);
+        p.verdict();
+        expect(p.drainPersistableUndecodable()).toEqual([]);
+    });
+
+    it('D5: a decode that outran its own delivery is not read as a decryption failure', () => {
+        /*
+         * BOTH CONJUNCTS ON THE BRANCH GUARD ARE LOAD-BEARING, which a revert of
+         * `undecodable > 0` alone did not previously demonstrate.
+         *
+         * `CouchDBPeer.startWatch` calls `man.beginWatch()` and only then
+         * `instrumentFeed()`, so a document handed over in that window reaches the
+         * interest predicate without ever having been counted as delivered. From
+         * then on `decoded` can exceed `delivered`, `undecodableCount()` clamps the
+         * difference to zero, and the decode CLOCK does not clamp with it: the next
+         * document genuinely in flight leaves `decodeSince` set while the count says
+         * nothing is missing.
+         *
+         * Drop `undecodable > 0` from the guard and this peer reports `unproven`
+         * with a detail reading "0 of 1 delivered change(s) could not be decrypted",
+         * i.e. a decryption verdict against a peer that has not failed to decrypt
+         * anything at all. On a peer with no foreign receipt, three of those in a
+         * row would be fatal.
+         */
+        const p = fast();
+        p.noteDecoded('decoded-before-we-were-counting');
+        note(p, 'genuinely-in-flight');
+        vi.advanceTimersByTime(101);
+
+        const v = p.verdict();
+        expect(v.undecodable).toBe(0);
+        expect(v.state).toBe('flowing');
+        expect(v.fatal).toBe(false);
+        expect(v.undecodableDistinct).toBe(0);
+    });
+
+    it('D5: documents the feed did not name count as one, which delays a verdict rather than inventing one', () => {
+        // `PendingClock`'s unnamed bucket collapses to a single entry however many
+        // documents it holds, so a feed that stopped supplying ids would under
+        // count. That is the direction this whole module degrades in: under
+        // counting delays a fatal verdict, over-counting manufactures one against a
+        // configuration that works.
+        const p = fast();
+        for (let i = 0; i < 10; i += 1) p.noteFeedChange(String(i), true);
+        vi.advanceTimersByTime(101);
+        expect(p.verdict().undecodable).toBe(10);
+        expect(p.verdict().undecodableDistinct).toBe(1);
+        expect(p.verdict().fatal).toBe(false);
     });
 
     // -----------------------------------------------------------------------
@@ -1048,6 +1343,7 @@ interface PeerInternals {
     man: unknown;
     connected: boolean;
     startWatch(): void;
+    startWatchdog(): void;
     escalateInboundFatal(): void;
     probeRemotePending(): Promise<boolean | undefined>;
     tickPendingProbe(): void;
@@ -1078,6 +1374,25 @@ function couchConf(overrides: Partial<LiveSyncCouchDBConf> = {}): LiveSyncCouchD
         obfuscatePassphrase: undefined,
         ...overrides,
     };
+}
+
+/**
+ * The fingerprint a peer built from this configuration records decode evidence
+ * under.
+ *
+ * Computed from the same four fields `CouchDBPeer`'s constructor uses, so a test
+ * can read the PERSISTED evidence rather than infer it from a verdict. Both are
+ * worth asserting and they are not the same claim: the verdict is what an
+ * operator sees now, the record is what a restarted peer adopts.
+ */
+function evidenceKey(overrides: Partial<LiveSyncCouchDBConf> = {}): string {
+    const conf = couchConf(overrides);
+    return LiveSyncStateStore.decodeEvidenceKey({
+        url: conf.url,
+        database: conf.database,
+        passphrase: conf.passphrase,
+        obfuscatePassphrase: conf.obfuscatePassphrase,
+    });
 }
 
 /** A remote metadata document as it sits in CouchDB. */
@@ -1231,15 +1546,20 @@ describe('CouchDBPeer inbound wiring', () => {
             outgoing: () => Promise.reject(new Error('Decryption with HKDF failed.')),
         });
 
+        // Three documents, because the fatal verdict now needs three distinct
+        // failures as well as no foreign decode. A wrong passphrase supplies them
+        // by construction: it fails on everything anybody else ever wrote.
         man.emitChange({ seq: '1', doc: remoteDoc('secret.md') });
+        man.emitChange({ seq: '2', doc: remoteDoc('secret-2.md') });
+        man.emitChange({ seq: '3', doc: remoteDoc('secret-3.md') });
         await flush();
 
         // The engine's listener never ran, so nothing was dispatched, and the
         // only trace the engine's own plumbing left is a discarded rejection...
         expect(dispatched).toEqual([]);
-        expect(man.discarded).toHaveLength(1);
+        expect(man.discarded).toHaveLength(3);
         // ...and yet the loss is visible, which is the entire fix.
-        expect(peer.inbound().delivered).toBe(1);
+        expect(peer.inbound().delivered).toBe(3);
         expect(peer.inbound().decoded).toBe(0);
 
         // The feed is still attached and would still claim to be watching. Before
@@ -1933,7 +2253,13 @@ describe('CouchDBPeer inbound wiring', () => {
             { outgoing: () => Promise.reject(new Error('Decryption with HKDF failed.')) },
             { state, conf: { passphrase: 'the wrong one' } },
         );
+        // The changed passphrase also discards the FAILURE record, not just the
+        // decode receipt, so this peer starts counting from zero and has to reach
+        // the quorum on its own. That is the point of fingerprinting both halves:
+        // failures under the old passphrase are evidence about the old passphrase.
         wrong.man.emitChange({ seq: '2', doc: remoteDoc('note.md') });
+        wrong.man.emitChange({ seq: '3', doc: remoteDoc('note-2.md') });
+        wrong.man.emitChange({ seq: '4', doc: remoteDoc('note-3.md') });
         await flush();
         vi.advanceTimersByTime(1_001);
         expect(wrong.peer.inbound().state).toBe('undecodable');
@@ -1953,6 +2279,8 @@ describe('CouchDBPeer inbound wiring', () => {
         expect(state.getSince()).toBe(''); // nothing has ever been consumed
 
         man.emitChange({ seq: '1', doc: remoteDoc('note.md') });
+        man.emitChange({ seq: '2', doc: remoteDoc('note-2.md') });
+        man.emitChange({ seq: '3', doc: remoteDoc('note-3.md') });
         await flush();
         vi.advanceTimersByTime(1_001);
         expect(peer.inbound().fatal).toBe(true);
@@ -2038,6 +2366,522 @@ describe('CouchDBPeer inbound wiring', () => {
         man.emitChange({ seq: '1', doc: remoteDoc('note.md') });
         await flush();
         expect(dispatched).toEqual([]);
+    });
+
+    // -----------------------------------------------------------------------
+    // D4: the decode receipt is evidence about the CONFIGURATION, and a peer
+    // can always decrypt what it encrypted itself
+    // -----------------------------------------------------------------------
+
+    it('D4: a fresh peer with a WRONG passphrase is still fatal after pushing one local note', async () => {
+        /*
+         * REGRESSION GUARD FOR THE DEFECT THIS SECTION EXISTS FOR, driven as the
+         * scenario that actually produces it: somebody setting up a new device
+         * and mistyping the passphrase.
+         *
+         * The receipt used to be taken in the interest predicate, which is
+         * reached by any document that decrypts at all. A peer can always decrypt
+         * what it encrypted itself, so ONE local push echoing back off the feed
+         * satisfied it. Measured: `everDecoded` set, the wrong passphrase's
+         * fingerprint persisted to disk, and from then on the fatal branch in
+         * `progress.verdict()` (which requires `!everDecoded`) could never fire
+         * again, on this run or any later one. The peer settled at `degraded`
+         * forever, served 503 with a message describing a bad document rather
+         * than a bad passphrase, and kept pushing chunks no other client in the
+         * cluster could read.
+         *
+         * `outgoing` below is precisely what a wrong passphrase does: our own
+         * document decrypts, everybody else's does not.
+         *
+         * Move the receipt back into the interest predicate and the last four
+         * assertions fail: the state is `degraded`, `fatal` is false,
+         * `getFatalReason()` is undefined, and the fingerprint is on disk.
+         */
+        const ours = 'the one unsynced note on this brand new device';
+        const wrong = { passphrase: 'hunter2-with-a-typo' };
+        const { peer, man, internals, state } = makePeer(
+            {
+                outgoing: (doc) =>
+                    doc.path === 'local.md'
+                        ? Promise.resolve(doc)
+                        : Promise.reject(new Error('Decryption with HKDF failed.')),
+                getByMeta: (doc) => Promise.resolve({ ...doc, data: [ours] }),
+            },
+            { conf: wrong },
+        );
+        expect(state.hasDecodedWith(evidenceKey(wrong))).toBe(false); // nothing behind it
+
+        // The offline scan finds the one unsynced note and pushes it.
+        await expect(
+            peer.put('local.md', { ctime: 1, mtime: 1, size: ours.length, data: [ours] }),
+        ).resolves.toBe(true);
+
+        // ...and here it comes straight back down the feed, as it always does. It
+        // decrypts, because we encrypted it. That is the whole trap.
+        man.emitChange({ seq: '1', doc: remoteDoc('local.md') });
+        await flush();
+        expect(peer.inbound().decoded).toBe(1);
+        expect(dispatched).toEqual([]); // recognised as our own, correctly
+
+        // The documents already on the cluster, written by clients that used the
+        // RIGHT passphrase. Twelve, as in the measured run: a wrong passphrase
+        // fails on the whole cluster rather than on one document, which is exactly
+        // why the quorum costs this case nothing.
+        for (let i = 0; i < 12; i += 1) {
+            man.emitChange({ seq: String(i + 2), doc: remoteDoc(`somebody-else-${i}.md`) });
+        }
+        await flush();
+        vi.advanceTimersByTime(1_001);
+
+        const v = peer.inbound();
+        expect(v.state).toBe('undecodable');
+        expect(v.fatal).toBe(true);
+        // The contradiction that used to be printable, now resolved in the data
+        // rather than only in the prose: one change decrypted here, and it was
+        // this peer's own, so the count that is evidence stays zero.
+        expect(v.decoded).toBe(1);
+        expect(v.foreignDecoded).toBe(0);
+        internals.escalateInboundFatal();
+        await flush();
+        expect(peer.getFatalReason()).toContain('passphrase');
+        // And it says which count it decided on, and does not claim the one
+        // successful decryption never happened.
+        expect(peer.getFatalReason()).toContain('another client');
+        expect(peer.getFatalReason()).toContain("this peer's own writes");
+        // And nothing was written down as a DECODE, so a restart cannot adopt
+        // evidence this run never earned...
+        expect(state.hasDecodedWith(evidenceKey(wrong))).toBe(false);
+        // ...while what it did earn, the failures, is written down, so a restart
+        // reaches the same verdict without waiting for a redelivery its own
+        // checkpoint may already have passed.
+        expect(state.getUndecodableWith(evidenceKey(wrong))).toHaveLength(3);
+    });
+
+    it('D4: a peer that only RECEIVES still earns the receipt, on the first document it sees', async () => {
+        /*
+         * THE FALSE-POSITIVE GUARD, and the reason the fix cannot simply be "stop
+         * taking the receipt on the inbound path". A read-only replica pushes
+         * nothing, so every document it ever sees is somebody else's, and it must
+         * be able to establish that its passphrase works. Without that, the first
+         * undecryptable document anywhere in the cluster would stop it and blame
+         * a passphrase that had been decrypting all day.
+         *
+         * `EchoSuppressor`'s ordering is what makes this hold rather than a
+         * special case for it: `hasSeen` is a pure query and `remember` runs
+         * after the dispatch, so a document's FIRST arrival is always a miss,
+         * whether or not this peer has ever written anything.
+         */
+        const right = { passphrase: 'the right one' };
+        const { peer, man, state } = makePeer(
+            {
+                outgoing: (doc) =>
+                    doc.path === 'unreadable.md'
+                        ? Promise.reject(new Error('Decryption with HKDF failed.'))
+                        : Promise.resolve(doc),
+            },
+            { conf: right },
+        );
+
+        man.emitChange({ seq: '1', doc: remoteDoc('from-another-client.md') });
+        await flush();
+        expect(dispatched).toEqual(['put from-another-client.md']);
+        expect(man.puts).toEqual([]); // it has never pushed anything, ever
+        expect(state.hasDecodedWith(evidenceKey(right))).toBe(true);
+
+        // ...so one document that will not decrypt is a lost document rather than
+        // a broken configuration, and the peer stays up.
+        man.emitChange({ seq: '2', doc: remoteDoc('unreadable.md') });
+        await flush();
+        vi.advanceTimersByTime(1_001);
+        const v = peer.inbound();
+        expect(v.state).toBe('degraded');
+        expect(v.fatal).toBe(false);
+        expect(v.detail).not.toContain('passphrase');
+    });
+
+    it('D4: the echo suppressor still suppresses, and still lets a real change through', async () => {
+        /*
+         * THE INVARIANT GUARD. The receipt now hangs off the suppressor's
+         * verdict, so the change must not have moved that verdict. The contract
+         * `EchoSuppressor` states is two-sided: a write that WAS passed on must
+         * never come back as a new change, and a write that was never
+         * successfully passed on must always be retried. The first half is
+         * asserted here at the feed; the second is 'D1: a CouchDB write that
+         * threw is genuinely re-attempted' above, which still passes untouched.
+         *
+         * The last two assertions are the ones that catch an over-eager fix.
+         * Suppressing by PATH alone, which is the obvious way to make "is this
+         * ours?" cheap, would swallow every later revision of a file this peer
+         * once pushed: the vault would silently stop receiving edits to exactly
+         * the files it edits most, and the evidence would never be earned either.
+         */
+        let body = 'the bytes we pushed';
+        const { peer, man, state } = makePeer({
+            getByMeta: (doc) => Promise.resolve({ ...doc, data: [body] }),
+        });
+
+        await expect(
+            peer.put('note.md', { ctime: 1, mtime: 1, size: body.length, data: [body] }),
+        ).resolves.toBe(true);
+        man.emitChange({ seq: '1', doc: remoteDoc('note.md') });
+        await flush();
+        expect(dispatched).toEqual([]);
+        expect(state.hasDecodedWith(evidenceKey())).toBe(false);
+
+        // Another client edits the same file. Same path, different content, and
+        // nothing about it is an echo of anything.
+        body = 'what somebody else wrote over it';
+        man.emitChange({ seq: '2', doc: remoteDoc('note.md') });
+        await flush();
+        expect(dispatched).toEqual(['put note.md']);
+        expect(state.hasDecodedWith(evidenceKey())).toBe(true);
+    });
+
+    it('D4: an unwritable vault cannot turn the next bad document into a passphrase verdict', async () => {
+        /*
+         * THE ORDERING ASSERTION, and the reason the receipt is taken BEFORE the
+         * dispatch while `remember` is recorded after it. The two sit either side
+         * of one call, so the symmetry is inviting and it is wrong: `remember` is
+         * a CLAIM about an operation and must wait for the operation to succeed
+         * (state.ts records the data loss that claiming early caused), while the
+         * receipt is an OBSERVATION about something that already happened, since
+         * the document decrypted before `onRemoteChange` was ever called and no
+         * later failure can un-decrypt it.
+         *
+         * Taking it on the success path instead would let a vault that cannot be
+         * written to (a full disk, a volume remounted read-only) withhold the
+         * evidence, and the next undecryptable document would then escalate
+         * `unwritable`, which is transient and non-fatal, into the passphrase
+         * verdict, which stops the peer, takes the push direction down with it
+         * and needs a human. Two independent faults must not compound into a
+         * third diagnosis that is wrong about both.
+         *
+         * Move `noteForeignDecode()` below the dispatch in `onRemoteChange` and
+         * the last three assertions fail.
+         */
+        const { peer, man, state } = makePeer(
+            {
+                outgoing: (doc) =>
+                    doc.path === 'unreadable.md'
+                        ? Promise.reject(new Error('Decryption with HKDF failed.'))
+                        : Promise.resolve(doc),
+            },
+            { dispatch: () => Promise.reject(new Error('ENOSPC: no space left on device')) },
+        );
+
+        man.emitChange({ seq: '1', doc: remoteDoc('from-another-client.md') });
+        await flush();
+        expect(peer.inbound().failed).toBe(1); // it decrypted; the vault refused it
+        expect(state.hasDecodedWith(evidenceKey())).toBe(true);
+
+        man.emitChange({ seq: '2', doc: remoteDoc('unreadable.md') });
+        await flush();
+        vi.advanceTimersByTime(1_001);
+        expect(peer.inbound().state).toBe('degraded');
+        expect(peer.inbound().fatal).toBe(false);
+    });
+
+    // -----------------------------------------------------------------------
+    // D5: the fatal bar is a QUANTITY of foreign evidence, wired end to end
+    //
+    // The five cases the design was written against, driven through the feed
+    // rather than through the ledger, because the regression they guard was
+    // reachable only once D4 had correctly narrowed the receipt: the ledger
+    // change and the peer change are only wrong TOGETHER.
+    // -----------------------------------------------------------------------
+
+    /** Deterministic bytes per path, so a push and its echo hash equal. */
+    const bodyFor = (p: string) => `the contents of ${p}`;
+
+    it('D5 CASE 2: a CORRECT peer with only its own echoes behind it survives one bad stranger', async () => {
+        /*
+         * REGRESSION GUARD FOR THE MEASURED REGRESSION, wired.
+         *
+         * Measured before the quorum: `{ state: 'undecodable', fatal: true,
+         * decoded: 4, undecodable: 1 }`, permanent 503, `connected` false, the push
+         * direction stopped, and the peer's next local write never reaching
+         * CouchDB. On a peer whose passphrase was correct.
+         *
+         * The four decodes are its own pushes echoing back, which is why it holds
+         * no foreign receipt: that is D4 working, not D4 failing. What was missing
+         * was any bar on the other side of the conjunction.
+         *
+         * Drop the `distinct >= quorum` term and the four assertions after the
+         * verdict block fail: the peer is fatal, disconnected, and refuses the
+         * final put with LiveSyncFatalError.
+         */
+        const { peer, man, internals, state } = makePeer({
+            outgoing: (doc) =>
+                doc.path === 'unreadable.md'
+                    ? Promise.reject(new Error('Decryption with HKDF failed.'))
+                    : Promise.resolve(doc),
+            getByMeta: (doc) => Promise.resolve({ ...doc, data: [bodyFor(String(doc.path))] }),
+        });
+        vi.stubGlobal('fetch', () => Promise.resolve({ ok: true, json: () => Promise.resolve({}) }));
+        // Earn "was healthy once", so the restart machinery is reachable at all and
+        // the assertions at the end are about this verdict rather than about a peer
+        // that was never up.
+        expect((await peer.probeHealth()).ok).toBe(true);
+
+        // Four local notes pushed, each echoing straight back off the feed.
+        for (let i = 0; i < 4; i += 1) {
+            const p = `mine-${i}.md`;
+            const body = bodyFor(p);
+            await expect(peer.put(p, { ctime: 1, mtime: 1, size: body.length, data: [body] })).resolves.toBe(true);
+            man.emitChange({ seq: String(i), doc: remoteDoc(p) });
+        }
+        await flush();
+        expect(peer.inbound().decoded).toBe(4);
+        expect(dispatched).toEqual([]); // all four recognised as our own, correctly
+        expect(state.hasDecodedWith(evidenceKey())).toBe(false); // and none is evidence
+
+        // One document from another client, which happens not to decrypt.
+        man.emitChange({ seq: '9', doc: remoteDoc('unreadable.md') });
+        await flush();
+        vi.advanceTimersByTime(1_001);
+
+        const v = peer.inbound();
+        expect(v.state).toBe('unproven');
+        expect(v.fatal).toBe(false);
+        expect(v.decoded).toBe(4);
+        expect(v.foreignDecoded).toBe(0);
+        expect(v.undecodableDistinct).toBe(1);
+        // Loud, deliberately: a document really is missing from the vault, so the
+        // peer keeps costing itself its ok signal and answering 503.
+        expect(v.stalled).toBe(true);
+        expect(peer.snapshot().ok).toBe(false);
+
+        // The watchdog's escalation reads this verdict and does nothing.
+        internals.escalateInboundFatal();
+        await flush();
+        expect(peer.getFatalReason()).toBeUndefined();
+
+        // `backendUp` stays TRUE, which is the field that used to go false and take
+        // the recovery path with it: a fatal peer reports its backend down by
+        // design, so `restartWorthy` could never become true again and nothing
+        // would ever have restarted this peer.
+        const health = await peer.probeHealth();
+        expect(health.ok).toBe(false);
+        expect(health.backendUp).toBe(true);
+        expect(health.restartFutile).toBe(true);
+
+        // ...so the next local write still reaches CouchDB, which is the sentence
+        // the whole change is about.
+        const body = bodyFor('after.md');
+        await expect(peer.put('after.md', { ctime: 2, mtime: 2, size: body.length, data: [body] })).resolves.toBe(
+            true,
+        );
+        expect(man.puts).toContain('after.md');
+    });
+
+    it('D5 CASE 4: the first peer into an empty cluster is never punished for having read nothing', async () => {
+        /*
+         * The reason `everDecoded === false` must never be a problem on its own.
+         *
+         * A brand new peer against an empty database has no foreign receipt and
+         * cannot get one, because there is nothing to receive. It pushes its vault,
+         * every document echoes back, and none of the echoes is evidence. The
+         * decode branch is never ENTERED, because it requires a document that
+         * failed, so the peer is `idle` and healthy throughout.
+         */
+        const { peer, man, state } = makePeer({
+            getByMeta: (doc) => Promise.resolve({ ...doc, data: [bodyFor(String(doc.path))] }),
+        });
+
+        for (let i = 0; i < 30; i += 1) {
+            const p = `note-${i}.md`;
+            const body = bodyFor(p);
+            await expect(peer.put(p, { ctime: 1, mtime: 1, size: body.length, data: [body] })).resolves.toBe(true);
+            man.emitChange({ seq: String(i), doc: remoteDoc(p) });
+        }
+        await flush(60);
+        vi.advanceTimersByTime(10_000);
+
+        const v = peer.inbound();
+        expect(v.state).toBe('idle');
+        expect(v.stalled).toBe(false);
+        expect(v.fatal).toBe(false);
+        expect(v.undecodable).toBe(0);
+        expect(v.foreignDecoded).toBe(0); // it has genuinely proven nothing...
+        expect(peer.snapshot().ok).toBe(true); // ...and that costs it nothing
+        expect(state.hasDecodedWith(evidenceKey())).toBe(false);
+    });
+
+    it('D5 CASE 5: two peers sharing one wrong passphrase read each other, and neither stops', async () => {
+        /*
+         * NOT A HOLE, AND WORTH ASSERTING SO IT IS NOT "FIXED" LATER. "Wrong" is
+         * only ever defined relative to other clients, and an encryption key has no
+         * external referent a process can check. Two peers that can read each
+         * other's documents are a working cluster with an unusual passphrase, and
+         * each is genuinely foreign to the other: the suppressor has never seen the
+         * other's bytes at that path, so the receipt is granted for the right
+         * reason rather than by accident.
+         *
+         * The interesting sub-case is the one asserted at the end: a correctly
+         * keyed client's documents then fail on this peer, which is real loss and
+         * is reported as `degraded` rather than as a broken configuration, because
+         * this peer's passphrase demonstrably decrypts something somebody else
+         * wrote. That is the design working as specified.
+         */
+        const shared = { passphrase: 'the same typo on both devices' };
+        const { peer, man, internals, state } = makePeer(
+            {
+                outgoing: (doc) =>
+                    String(doc.path).startsWith('real-client-')
+                        ? Promise.reject(new Error('Decryption with HKDF failed.'))
+                        : Promise.resolve(doc),
+            },
+            { conf: shared },
+        );
+
+        // The other device, which shares this one's passphrase, writes a note.
+        man.emitChange({ seq: '1', doc: remoteDoc('from-the-other-device.md') });
+        await flush();
+        expect(dispatched).toEqual(['put from-the-other-device.md']);
+        expect(peer.inbound().foreignDecoded).toBe(1);
+        expect(state.hasDecodedWith(evidenceKey(shared))).toBe(true);
+
+        // And now the rest of the cluster, which does not.
+        for (let i = 0; i < 12; i += 1) man.emitChange({ seq: String(i + 2), doc: remoteDoc(`real-client-${i}.md`) });
+        await flush();
+        vi.advanceTimersByTime(1_001);
+
+        const v = peer.inbound();
+        expect(v.state).toBe('degraded');
+        expect(v.fatal).toBe(false);
+        expect(v.detail).not.toContain('passphrase');
+        internals.escalateInboundFatal();
+        await flush();
+        expect(peer.getFatalReason()).toBeUndefined();
+    });
+
+    it('D5: the failure count survives the restart that the peer\'s own echo would otherwise erase', async () => {
+        /*
+         * THE CROSS-RUN GUARANTEE, wired, and the reason the count is persisted
+         * rather than rebuilt from a replay.
+         *
+         * The peer cannot read two documents. It also pushes a local note, whose
+         * echo decodes, APPLIES, and carries the checkpoint past both of them (the
+         * apply callback advances `since` from the change's own sequence whatever
+         * the dispatch returned). A restart therefore resumes past the backlog and
+         * is handed none of it back. Without the persisted count the fresh run
+         * measures zero distinct failures and can never reach the quorum, however
+         * many more documents fail later, so the peer reports its way to `idle` and
+         * keeps publishing.
+         *
+         * Revert `undecodableWith` in state.ts, or the adoption in `startWatch`,
+         * and the final two assertions fail: the restarted peer is `unproven`.
+         */
+        const wrong = { passphrase: 'hunter2-with-a-typo' };
+        const readable = 'mine.md';
+        const opts = {
+            outgoing: (doc: Record<string, unknown>) =>
+                doc.path === readable
+                    ? Promise.resolve(doc)
+                    : Promise.reject(new Error('Decryption with HKDF failed.')),
+            getByMeta: (doc: Record<string, unknown>) =>
+                Promise.resolve({ ...doc, data: [bodyFor(String(doc.path))] }),
+        };
+        const state = makeState();
+        const first = makePeer(opts, { state, conf: wrong });
+
+        first.man.emitChange({ seq: '1', doc: remoteDoc('stranger-a.md') });
+        first.man.emitChange({ seq: '2', doc: remoteDoc('stranger-b.md') });
+        await flush();
+        vi.advanceTimersByTime(1_001);
+        expect(first.peer.inbound().state).toBe('unproven');
+        expect(first.peer.inbound().fatal).toBe(false);
+
+        // The watchdog's tick, which is where the record is written down.
+        first.internals.escalateInboundFatal();
+        await flush();
+        expect(state.getUndecodableWith(evidenceKey(wrong))).toHaveLength(2);
+
+        // The local note whose echo carries the checkpoint past the backlog.
+        const body = bodyFor(readable);
+        await expect(
+            first.peer.put(readable, { ctime: 1, mtime: 1, size: body.length, data: [body] }),
+        ).resolves.toBe(true);
+        first.man.emitChange({ seq: '3', doc: remoteDoc(readable) });
+        await flush();
+        expect(state.getSince()).toBe('3'); // past both unreadable documents, for good
+
+        // The restart. A fresh peer over the same persisted state, resuming from a
+        // checkpoint that will never deliver stranger-a or stranger-b again.
+        const second = makePeer(opts, { state, conf: wrong });
+        second.man.emitChange({ seq: '4', doc: remoteDoc('stranger-c.md') });
+        await flush();
+        vi.advanceTimersByTime(1_001);
+
+        // One new failure in this run, and two inherited, is the quorum.
+        expect(second.peer.inbound().undecodableDistinct).toBe(UNDECODABLE_QUORUM);
+        expect(second.peer.inbound().state).toBe('undecodable');
+        expect(second.peer.inbound().fatal).toBe(true);
+    });
+
+    it('D5: failures recorded under one passphrase are not held against the next one', async () => {
+        /*
+         * THE OTHER SIDE OF PERSISTENCE, and the reason the record carries its own
+         * fingerprint. An operator who corrects a typo must not be stopped by the
+         * failures the typo caused: those are evidence about the old passphrase and
+         * none at all about the new one. Same rule as `hasDecodedWith`, in the
+         * opposite direction.
+         */
+        const typo = { passphrase: 'hunter2-with-a-typo' };
+        const fixed = { passphrase: 'hunter2' };
+        const failEverything = { outgoing: () => Promise.reject(new Error('Decryption with HKDF failed.')) };
+        const state = makeState();
+
+        const before = makePeer(failEverything, { state, conf: typo });
+        before.man.emitChange({ seq: '1', doc: remoteDoc('a.md') });
+        before.man.emitChange({ seq: '2', doc: remoteDoc('b.md') });
+        await flush();
+        vi.advanceTimersByTime(1_001);
+        before.internals.escalateInboundFatal();
+        await flush();
+        expect(state.getUndecodableWith(evidenceKey(typo))).toHaveLength(2);
+        expect(state.getUndecodableWith(evidenceKey(fixed))).toEqual([]);
+
+        // The corrected passphrase reads none of that back, so its first bad
+        // document is its first bad document.
+        const after = makePeer(failEverything, { state, conf: fixed });
+        after.man.emitChange({ seq: '3', doc: remoteDoc('c.md') });
+        await flush();
+        vi.advanceTimersByTime(1_001);
+        expect(after.peer.inbound().undecodableDistinct).toBe(1);
+        expect(after.peer.inbound().fatal).toBe(false);
+    });
+
+    it('D5: the real watchdog reaches the verdict on its own, without a test touching the ledger', async () => {
+        /*
+         * THE WIRING ASSERTION. The observation that feeds the quorum is taken
+         * inside `verdict()` precisely so that it cannot be forgotten at a call
+         * site, and this is the test that says so: nothing below reaches into
+         * `progress`, and the only thing driven is the timer the peer schedules for
+         * itself.
+         *
+         * A shape that swept from the watchdog instead would pass every ledger test
+         * in this file and still ship a detector that never ran.
+         */
+        vi.stubGlobal('fetch', () => Promise.resolve({ ok: true, json: () => Promise.resolve({ results: [] }) }));
+        const { peer, man, internals, state } = makePeer({
+            outgoing: () => Promise.reject(new Error('Decryption with HKDF failed.')),
+        });
+        internals.startWatchdog();
+
+        for (let i = 0; i < 5; i += 1) man.emitChange({ seq: String(i), doc: remoteDoc(`note-${i}.md`) });
+        await flush();
+        expect(peer.getFatalReason()).toBeUndefined();
+
+        // Past the decode window, then one watchdog tick.
+        vi.advanceTimersByTime(1_001);
+        await vi.advanceTimersByTimeAsync(5_000);
+        await flush();
+
+        expect(peer.getFatalReason()).toContain('passphrase');
+        expect(peer.getFatalReason()).toContain('another client');
+        // And it wrote down what it decided on, on its way out.
+        expect(state.getUndecodableWith(evidenceKey())).toHaveLength(UNDECODABLE_QUORUM);
     });
 
     // -----------------------------------------------------------------------
@@ -2335,11 +3179,16 @@ describe('the wedge reaches the restart machinery, and a fatal config does not',
         const { peer, man, internals } = makePeer();
         expect((await peer.probeHealth()).ok).toBe(true);
 
-        // Force the TOTAL-decode-failure state directly: a delivered note that
-        // never decodes, with nothing having decoded before it. That is what
-        // `fatal` now requires, and driving it through the ledger keeps this test
-        // about the restart verdict rather than about the feed harness.
-        internals.progress.noteFeedChange('2', true);
+        // Force the TOTAL-decode-failure state directly: three DISTINCT delivered
+        // notes that never decode, with no foreign decode before them. That
+        // conjunction is what `fatal` now requires, and driving it through the
+        // ledger keeps this test about the restart verdict rather than about the
+        // feed harness. The keys have to differ: an undecodable document is
+        // redelivered forever by every feed re-arm, so the verdict counts distinct
+        // documents rather than delivery events.
+        internals.progress.noteFeedChange('2', true, 'doc-a');
+        internals.progress.noteFeedChange('3', true, 'doc-b');
+        internals.progress.noteFeedChange('4', true, 'doc-c');
         vi.advanceTimersByTime(1_001);
         internals.escalateInboundFatal();
         await flush();

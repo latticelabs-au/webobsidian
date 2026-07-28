@@ -1425,8 +1425,18 @@ export class CouchDBPeer {
          * that failed to adopt its own history reads the first undecryptable
          * document as proof of a wrong passphrase, stops itself, and blocks the
          * push direction. See `InboundProgress.adoptPriorDecodeEvidence`.
+         *
+         * BOTH HALVES OF THE VERDICT'S EVIDENCE ARE ADOPTED HERE, and forgetting
+         * either one is silent and expensive in opposite directions. Without the
+         * decode receipt a working peer stops itself over one bad document; without
+         * the failure count a wrong-passphrase peer that has pushed anything at all
+         * has already carried its checkpoint past the documents it could not read,
+         * so the fresh run measures nothing, reports `idle`, and keeps publishing.
+         * See `InboundProgress.adoptPriorUndecodable` and
+         * `LiveSyncStateStore.getUndecodableWith`.
          */
         if (this.state.hasDecodedWith(this.decodeEvidenceKey)) this.progress.adoptPriorDecodeEvidence();
+        this.progress.adoptPriorUndecodable(this.state.getUndecodableWith(this.decodeEvidenceKey));
         man.beginWatch(
             async (entry: ReadyEntry, seq?: string | number) => {
                 const key = changeKey(undefined, entry?._id);
@@ -1556,8 +1566,11 @@ export class CouchDBPeer {
             },
             (doc: MetaEntry) => {
                 /*
-                 * The interest predicate doubles as the DECODE receipt, and that
-                 * is the only place such a receipt can be taken.
+                 * The interest predicate doubles as the PER-DOCUMENT decode
+                 * receipt, and that is the only place such a receipt can be
+                 * taken. Read the third paragraph before concluding that it is
+                 * where the CONFIGURATION's receipt belongs too: those are two
+                 * facts with two lifetimes, and fusing them was a defect.
                  *
                  * The engine calls this from inside its `change` listener, which
                  * runs after `transform-pouch` has awaited `outgoing(doc)`. So
@@ -1566,24 +1579,45 @@ export class CouchDBPeer {
                  * proof it did not. Nothing downstream can distinguish the two,
                  * because a rejected `outgoing` never calls the engine's listener
                  * at all (mechanism 1 in progress.ts).
+                 *
+                 * WHAT IS NO LONGER TAKEN HERE IS THE EVIDENCE THAT OUTLIVES THE
+                 * RUN, and moving it out is a bug fix. `noteDecoded` counts this
+                 * document and settles its clocks, which is a statement ABOUT THE
+                 * DOCUMENT and is true of anything that reaches this line.
+                 * `everDecoded` and the persisted fingerprint are a statement
+                 * ABOUT THE CONFIGURATION, and this line cannot honestly make it:
+                 * a peer can always decrypt what it encrypted itself, so its own
+                 * push echoing back down the feed arrives here under a wrong
+                 * passphrase exactly as it does under a right one. See
+                 * `InboundProgress.noteDecoded` for what that cost.
+                 *
+                 * Nor could the check be added here. Telling an echo from a
+                 * foreign document needs the document's CONTENT, and a `MetaEntry`
+                 * does not carry any: `children` are chunk ids, and the engine
+                 * resolves them (`getByMeta`) only after this predicate has
+                 * returned true. So the receipt is taken one step further down, in
+                 * `onRemoteChange`, where the echo suppressor has already had to
+                 * answer the identical question for the write path.
                  */
                 const key = changeKey(undefined, doc?._id);
                 this.progress.noteDecoded(key);
-                /*
-                 * The same proof, written down where it survives this process.
-                 *
-                 * This is the ONLY caller, and it is on the proof itself rather
-                 * than on anything that merely correlates with it, because the
-                 * record suppresses the fatal "nothing decrypts" verdict. Cheap
-                 * enough to do per document: the store compares a string and only
-                 * marks itself dirty when the value actually changes, so this is
-                 * one write per configuration rather than one per change.
-                 */
-                this.state.markDecodedWith(this.decodeEvidenceKey);
                 const interested = this.isInterested(doc, baseDir);
                 // A deliberate refusal is a terminal outcome, not a loss. Without
                 // this the ledger would treat every `i:` document on the remote as
                 // a document we failed to write, and report a healthy peer wedged.
+                //
+                // A refusal yields no decode evidence either, and that is a
+                // choice rather than an oversight. Such a document is nearly
+                // always foreign, since `toRemotePath` only ever produces paths
+                // under `baseDir` and `isInterested` only ever refuses prefixed
+                // ids and paths outside it. "Nearly always" is the problem: an
+                // operator who changes `baseDir` turns this peer's OWN earlier
+                // pushes into documents it refuses, which would hand a wrong
+                // passphrase the same free proof by a slightly longer route.
+                // Nothing here maps a refused path to a vault path, so nothing
+                // here can ask the suppressor about it, and a receipt taken on
+                // "it is probably not ours" is precisely what this fix removes.
+                // `noteForeignDecode` states what erring this way costs.
                 if (!interested) this.progress.noteSkipped(key);
                 return interested;
             },
@@ -1733,6 +1767,23 @@ export class CouchDBPeer {
 
         if (entry.deleted || entry._deleted) {
             if (this.echo.hasSeen(vaultPath, false)) return false;
+            /*
+             * A deletion is evidence on the same terms as any other document, and
+             * that is worth checking rather than assuming, because a receipt taken
+             * on a document with nothing in it to decrypt would be no receipt at
+             * all.
+             *
+             * The engine's soft delete (`EntryManager.deleteDBEntry`) fetches the
+             * document, sets `deleted` and `mtime`, and puts it back: the type and
+             * the whole `children` list survive, so it reaches the interest
+             * predicate through `isNoteEntry` and passes through `outgoing` like
+             * any note, and it reaches HERE only once `getByMeta` has resolved its
+             * chunks. A hard tombstone (`deleteMetadataOfDeletedFiles`, or a
+             * rev-scoped delete) loses its body and therefore its `type`, so
+             * `isNoteEntry` drops it before the predicate and it can never get
+             * this far.
+             */
+            this.noteForeignDecode();
             this.log(`${vaultPath} delete detected`, 'debug');
             const applied = await this.deps.dispatch(vaultPath, false);
             this.echo.remember(vaultPath, false);
@@ -1747,6 +1798,7 @@ export class CouchDBPeer {
             data: decodeEntryData(entry),
         };
         if (this.echo.hasSeen(vaultPath, data)) return false;
+        this.noteForeignDecode();
         this.log(`${vaultPath} change detected`, 'debug');
         const applied = await this.deps.dispatch(vaultPath, data);
         /*
@@ -1778,6 +1830,91 @@ export class CouchDBPeer {
     }
 
     /**
+     * Record that a document THIS PEER DID NOT WRITE has decrypted.
+     *
+     * The only route to `everDecoded` and to the persisted fingerprint, and the
+     * reason both exist: `InboundProgress.verdict()` calls a total decode failure
+     * FATAL on the reading that "not one document has ever decrypted" is the
+     * signature of a wrong end-to-end passphrase. A peer can always decrypt what
+     * it encrypted itself, so a receipt taken on ANY decode let a wrong passphrase
+     * prove itself right with its own echo, and the one detector for the most
+     * likely way this fault is met could never fire. `InboundProgress.noteDecoded`
+     * records the measured sequence.
+     *
+     * PROVENANCE IS DECIDED BY THE ECHO SUPPRESSOR, WHICH ALREADY KNOWS. Both
+     * callers sit immediately after a `hasSeen()` MISS, i.e. at the point where
+     * the peer has just established that these bytes did not recently pass
+     * through this path in either direction. One question, asked once, answering
+     * two: whether to write the document to the vault, and whether it says
+     * anything about the configuration.
+     *
+     * IT IS ALSO STRICTLY BETTER PROOF THAN THE INTEREST PREDICATE COULD TAKE,
+     * which is a second reason to prefer this position over adding a check up
+     * there. The predicate runs after `outgoing(doc)`, which for a note entry
+     * decrypts the obfuscated path and Eden but not the chunks, since those live
+     * in separate `leaf` documents. Reaching this method means `getByMeta` has
+     * also resolved and decrypted every chunk, so the receipt covers the key
+     * material the push direction is about to write with, not just the metadata.
+     *
+     * ORDERING, WHICH IS THE OPPOSITE OF `remember()`'s AND DELIBERATELY SO. Both
+     * sit either side of the same dispatch, so the symmetry is inviting and it is
+     * wrong. `remember()` is a CLAIM about an operation, so it waits until the
+     * operation has actually succeeded; its own comment in state.ts records the
+     * data loss that claiming early caused. This is an OBSERVATION about
+     * something that has already happened: the document decrypted before it ever
+     * reached this method, and no later failure can un-decrypt it. So it is taken
+     * BEFORE the dispatch and stands even when the dispatch throws.
+     *
+     * Deferring it to the success path would have a specific and bad consequence.
+     * A vault that cannot be written to (a full disk, a volume remounted
+     * read-only, a uid change) fails every dispatch, so it would withhold the
+     * evidence, and the next undecryptable document would escalate `unwritable`,
+     * a transient non-fatal condition, into the passphrase verdict, which stops
+     * the peer, takes the push direction down with it and needs a human. Two
+     * independent faults must not compound into a third diagnosis that is wrong
+     * about both.
+     *
+     * WHAT THIS COSTS, STATED RATHER THAN HIDDEN. The suppressor keys on path and
+     * content hash, so a GENUINELY FOREIGN document whose content is byte
+     * identical to one this peer recently pushed to the same path reads as an
+     * echo and yields no evidence. A CouchDB revision carries no provenance, so
+     * there is nothing cheaper that could tell those two apart, and the direction
+     * to err in is not symmetric: over-claiming provenance IS the defect being
+     * fixed. The residual is narrow, and inert in nearly every shape it takes:
+     *
+     *  - the flag is only ever CONSULTED once a document has failed to decrypt,
+     *    since the fatal branch requires `undecodable > 0`. A cluster whose
+     *    documents all decrypt never reads it at all.
+     *  - the first divergent edit anywhere in the cluster produces a foreign
+     *    document with content this peer never pushed, which grants the receipt.
+     *    The gap closes itself on the next real edit.
+     *  - a peer that only ever RECEIVES still earns it on the first document it
+     *    sees. `hasSeen()` is a pure query and `remember()` runs after the
+     *    dispatch, so a document's first arrival is always a miss. A read-only
+     *    replica is therefore fully served, and a peer that receives nothing is
+     *    not, which is the point.
+     *
+     * What survives all three is a cluster in which every document this peer ever
+     * receives is content-identical to one it pushed AND some other client is
+     * writing documents it cannot decrypt. That reports `undecodable` and names
+     * the passphrase at a peer whose passphrase is right: loud, wrong, and
+     * clearable by a human. The fault it replaces published unreadable chunks
+     * into a shared vault silently and forever.
+     */
+    private noteForeignDecode(): void {
+        this.progress.noteForeignDecode();
+        /*
+         * The same proof, written down where it survives this process, because
+         * the fatal verdict must be made on evidence that outlives a run: see
+         * `InboundProgress.adoptPriorDecodeEvidence`, and `startWatch` for where
+         * it is read back. Cheap enough to do per document: the store compares a
+         * string and only marks itself dirty when the value actually changes, so
+         * this is one write per configuration rather than one per change.
+         */
+        this.state.markDecodedWith(this.decodeEvidenceKey);
+    }
+
+    /**
      * FIX 10: supervise the changes feed and re-arm it when it stops.
      *
      * The engine reconnects itself ten seconds after an `error`, but its
@@ -1803,8 +1940,28 @@ export class CouchDBPeer {
             // is counting until this runs.
             this.instrumentFeed();
             this.escalateInboundFatal();
+            /*
+             * RE-READ THE MANIPULATOR, because the line above can stop this peer
+             * inside this very tick.
+             *
+             * `escalateInboundFatal()` calls `stop()` on a fatal verdict, and
+             * `stop()` clears `man` and this interval SYNCHRONOUSLY, before its
+             * first await. The narrowing at the top of this callback survives the
+             * intervening call in the type system and not at runtime, so reading
+             * `this.man.watching` below threw a TypeError out of a timer callback
+             * on precisely the tick that diagnosed a wrong passphrase. The process
+             * survives it (index.ts installs an `uncaughtException` handler), which
+             * is what kept it invisible: the fatal reason is set and logged before
+             * the throw, so the diagnosis still reached the operator and only the
+             * rest of the tick was lost.
+             *
+             * A local binding rather than a second `this.man` check, so nothing
+             * further down can be re-invalidated by another call the same way.
+             */
+            const man = this.man;
+            if (this.stopping || !man) return;
             this.tickPendingProbe();
-            if (this.man.watching) {
+            if (man.watching) {
                 /*
                  * Recovery, and the second half of KICKOFF section 8's last
                  * acceptance criterion ("dropped mid-session ... then recovering
@@ -1854,11 +2011,13 @@ export class CouchDBPeer {
      * Stopping leaves every local edit's baseline unadvanced, so nothing is lost
      * and a corrected passphrase replays all of it.
      *
-     * TOTAL IS THE LOAD-BEARING WORD, AND IT IS WHY THE PREDICATE LIVES IN THE
-     * LEDGER RATHER THAN HERE. `verdict.fatal` is true only when NOTHING has ever
-     * decoded, on this run OR any earlier one, for this passphrase against this
-     * database (`InboundProgress.verdict()` argues the split at length). Two
-     * revisions got that wrong in turn, and both took a human to clear:
+     * TOTAL AND SUFFICIENT ARE THE LOAD-BEARING WORDS, AND THEY ARE WHY THE
+     * PREDICATE LIVES IN THE LEDGER RATHER THAN HERE. `verdict.fatal` is true only
+     * when NO DOCUMENT WRITTEN BY ANOTHER CLIENT has ever decoded, on this run OR
+     * any earlier one, for this passphrase against this database, AND at least
+     * `UNDECODABLE_QUORUM` distinct documents have failed to
+     * (`InboundProgress.verdict()` argues the whole conjunction at length). Three
+     * revisions got it wrong in turn, and every one of them took a human to clear:
      *
      *  - escalating on ANY undecodable document meant one bad document among five
      *    hundred good ones stopped the peer, took the push direction with it via
@@ -1872,25 +2031,79 @@ export class CouchDBPeer {
      *    the remote has exactly one document to hand back: the bad one. So the
      *    fresh run measured `decoded === 0` and escalated the identical partial
      *    failure to fatal, with the identical wrong message, about ninety seconds
-     *    later.
+     *    later;
+     *  - escalating on ONE undecodable document once the decode receipt had been
+     *    correctly narrowed to FOREIGN documents. Narrowing the receipt was right
+     *    and it made the receipt expensive to earn, so the bar on the other side of
+     *    the `and` stopped being a formality: a peer whose only inbound traffic had
+     *    been its own echoes was stopped by the first stranger's document that
+     *    failed. Measured on a peer whose passphrase was correct and which had
+     *    decrypted four documents. That is where the distinct-document quorum comes
+     *    from.
      *
-     * The message may name the likely cause here, and only here, because "nothing
-     * has ever decrypted" is that cause's signature rather than a guess: nothing
-     * on the connect path decrypts anything (the reachability probe is a plain
-     * GET, and the milestone is a `_local/` document, which `transform-pouch`
-     * refuses to transform), so a wrong passphrase connects cleanly and then
-     * decrypts nothing at all. The partial case gets a message worded from the
-     * evidence instead, and does not come through this function.
+     * The message may name a passphrase here, and only here, because the
+     * CONJUNCTION is that cause's signature rather than a guess: nothing on the
+     * connect path decrypts anything (the reachability probe is a plain GET, and
+     * the milestone is a `_local/` document, which `transform-pouch` refuses to
+     * transform), so a wrong passphrase connects cleanly and then fails on
+     * everything anybody else wrote. Neither half is a signature on its own, and
+     * the old justification ("'nothing has ever decrypted' is that cause's
+     * signature") is now reachable-false twice over: the peer's own echoes decrypt
+     * under any passphrase, so the successful-decode count can be large in this
+     * state, and one foreign failure is a bad document at least as often as it is a
+     * bad key.
+     *
+     * IT MUST NAME BOTH CANDIDATES, and that is not hedging. A correct-keyed peer
+     * that meets a wrong-keyed client's bulk push before any correctly-keyed
+     * foreign document arrives lands here with everything true and its own
+     * passphrase right; feed order is by sequence and is not ours to choose, so
+     * nothing local can prevent it. The quorum makes it rarer and never impossible.
+     * The partial and the unproven cases get messages worded from their own
+     * evidence and do not come through this function.
+     *
+     * IT ALSO PERSISTS THE EVIDENCE, which is a second duty in one function and is
+     * deliberate. The ledger observes a distinct failure while computing the very
+     * verdict read below, so taking the record from the same call is what
+     * guarantees that what gets written down is what the decision was made on.
+     * Reading the verdict here and persisting from some other tick would let the
+     * two drift apart across a stop.
      */
     private escalateInboundFatal(): void {
-        if (this.fatalReason) return;
         const verdict = this.progress.verdict();
+        /*
+         * Above the `fatalReason` guard, because this is exactly the run whose
+         * evidence must survive it: a peer that stops itself here is a peer whose
+         * next process has to reach the same verdict without waiting for the
+         * remote to redeliver documents its own checkpoint may already have passed.
+         * The store compares before it marks itself dirty and caps at the quorum,
+         * so this is a handful of writes over the life of a configuration rather
+         * than one per tick.
+         */
+        const fresh = this.progress.drainPersistableUndecodable();
+        if (fresh.length > 0) this.state.addUndecodableWith(this.decodeEvidenceKey, fresh);
+        if (this.fatalReason) return;
         if (!verdict.fatal) return;
+        /*
+         * The "what did decrypt" clause is present only when there is something to
+         * explain, and it is worth the branch. `{ decoded: 4, undecodable: 1,
+         * "nothing has ever decrypted" }` was a printable verdict before this
+         * change, and an operator who reads four successful decryptions beside an
+         * accusation about the passphrase concludes the instrument is broken and
+         * stops believing the rest of it. Saying which four, and why they prove
+         * nothing, is the difference between a diagnosis and a contradiction.
+         */
+        const echoes =
+            verdict.decoded > 0
+                ? ` The ${verdict.decoded} change(s) that did decrypt were this peer's own writes echoing ` +
+                  'back off the feed, or documents it refuses to host; neither is evidence about the ' +
+                  'passphrase, so neither is counted.'
+                : '';
         this.markFatal(
-            `${verdict.detail}. Nothing has ever decrypted with this passphrase against this database, ` +
-                'which is what a wrong end-to-end encryption passphrase looks like (or a remote written ' +
-                'with a different one). Retrying cannot help, and continuing would publish chunks no ' +
-                'other client can read, so the peer has stopped.',
+            `${verdict.detail}. At least ${verdict.undecodableDistinct} distinct document(s) written by ` +
+                'another client have failed to decrypt with this passphrase against this database, and not ' +
+                `one has ever succeeded.${echoes} Either this server's end-to-end encryption passphrase is ` +
+                'wrong, or the client that wrote those documents used a different one. Retrying cannot help, ' +
+                'and continuing would publish chunks no other client can read, so the peer has stopped.',
         );
         // Fire and forget: stop() is bounded, never throws, and the watchdog must
         // not become a place that awaits I/O.
