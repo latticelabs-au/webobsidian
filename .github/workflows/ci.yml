@@ -109,7 +109,12 @@ jobs:
               need 2 "zip (arm64, x64)" *.zip
               ;;
             Windows)
-              need 2 "exe (one NSIS installer for x64+arm64+ia32, one portable x64)" *.exe
+              # Four, not five. Because artifactName contains ${arch}, electron-builder
+              # writes one NSIS installer for x64+arm64+ia32 (-win.exe) plus one per
+              # arch (-win-x64/-win-arm64/-win-ia32.exe), and the x64 portable is also
+              # named -win-x64.exe, so it replaces the x64 NSIS installer. electron-builder
+              # 25 on main names them the same way; this checks the output as it stands.
+              need 4 "exe (NSIS x64+arm64+ia32, NSIS arm64, NSIS ia32, -win-x64 written by NSIS x64 then portable)" *.exe
               for d in win-unpacked win-arm64-unpacked win-ia32-unpacked; do
                 [ -d "$d" ] || { echo "::error::missing $d"; fail=1; }
               done
