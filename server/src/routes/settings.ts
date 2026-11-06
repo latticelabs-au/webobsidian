@@ -30,6 +30,14 @@ function httpError(status: number, message: string): Error & { status: number } 
   return Object.assign(new Error(message), { status });
 }
 
+/** 400 unless `value` is absent or a finite number. */
+function requireFiniteNumberIfPresent(value: unknown, field: string): void {
+  if (value === undefined) return;
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    throw httpError(400, `${field} must be a finite number`);
+  }
+}
+
 /** The subset of the settings tree this endpoint accepts. Everything arrives as
  *  unknown and is narrowed per field below; nothing is trusted by shape alone. */
 interface SettingsPatchBody {
@@ -120,6 +128,13 @@ settingsRouter.put(
         throw httpError(400, 'api.rateLimitPerMin must be a whole number of at least 1');
       }
     }
+    // These two have no bound beyond being a real number, but the schema heals
+    // anything else to the default (a non-finite value would otherwise fail the
+    // parse under zod 4, which refuses Infinity). Without this check a PUT of
+    // `1e999` or a string would answer 200 and quietly store the default, so it
+    // is a loud 400 here, the same split as the bound above.
+    requireFiniteNumberIfPresent(body.git?.intervalSec, 'git.intervalSec');
+    requireFiniteNumberIfPresent(body.search?.fuzzy, 'search.fuzzy');
     // The login throttle, validated before the lock exactly as the two bounds
     // above are, and for a sharper version of the same reason. A saved
     // `loginMaxAttempts` of 0 or less makes `hits.length >= max` true on the

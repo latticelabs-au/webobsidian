@@ -1070,7 +1070,15 @@ const SettingsBaseSchema = z.object({
       authorEmail: z.string().default('webobsidian@localhost'),
       autoSync: z.boolean().default(false),
       autoCommitOnSave: z.boolean().default(false),
-      intervalSec: z.number().default(300),
+      // `.catch()` for the usual reason (see `version`), and zod 4 made it
+      // urgent: its z.number() refuses Infinity, which zod 3 accepted, and
+      // JSON.parse reads a hand-typed `1e999` as Infinity. Without the catch that
+      // one literal (or any non-number) fails the whole parse and
+      // loadSettingsImpl rewrites the file from defaults. Every finite number is
+      // still accepted; autosync.ts clamps it with Math.max(intervalSec, 60).
+      // Over the API anything but a finite number is a 400 instead
+      // (routes/settings.ts), so this heal is for values that arrive from disk.
+      intervalSec: z.number().default(300).catch(300),
       lfsPatterns: z
         .array(z.string())
         .default(['*.png', '*.jpg', '*.jpeg', '*.gif', '*.pdf', '*.mp4', '*.mov', '*.zip']),
@@ -1116,7 +1124,8 @@ const SettingsBaseSchema = z.object({
   oidc: OidcBlockSchema.prefault({}),
   search: z
     .object({
-      fuzzy: z.number().default(0.2),
+      // `.catch()` for the same zod 4 reason as git.intervalSec above.
+      fuzzy: z.number().default(0.2).catch(0.2),
       prefix: z.boolean().default(true),
       indexFrontmatter: z.boolean().default(true),
     })
