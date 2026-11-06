@@ -69,6 +69,7 @@
       "deleteAppDataOnUninstall": false
     },
     "linux": {
+      "executableName": "webobsidiandesktop",
       "icon": "buildResources/icon.png",
       "category": "Utility",
       "maintainer": "xnohat <xnohat@gmail.com>",
