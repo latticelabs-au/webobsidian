@@ -17,15 +17,15 @@
     "dist:publish": "node scripts/build.mjs && electron-builder --publish always"
   },
   "devDependencies": {
-    "electron": "33.4.11",
-    "electron-builder": "^25.1.8",
+    "electron": "43.8.7",
+    "electron-builder": "^26.18.0",
     "esbuild": "^0.24.0"
   },
   "build": {
     "appId": "com.xnohat.webobsidian",
     "productName": "WebObsidian",
     "copyright": "Copyright © 2026 xnohat",
-    "electronVersion": "33.4.11",
+    "electronVersion": "43.8.7",
     "directories": {
       "output": "release",
       "buildResources": "buildResources"
@@ -69,6 +69,7 @@
       "deleteAppDataOnUninstall": false
     },
     "linux": {
+      "executableName": "webobsidiandesktop",
       "icon": "buildResources/icon.png",
       "category": "Utility",
       "maintainer": "xnohat <xnohat@gmail.com>",

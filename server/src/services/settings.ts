@@ -977,6 +977,13 @@ const AuthRateLimitSchema = z.object({
     };
   });
 
+/*
+ * Every object block below falls back with `.prefault({})`, not `.default({})`.
+ * Since zod 4, `.default(value)` returns `value` as-is without parsing it, so a
+ * missing block would come back as a bare `{}` with none of its nested defaults
+ * or heals applied. `.prefault({})` runs `{}` through the block's schema, which
+ * is what zod 3's `.default({})` did and what every comment in this file assumes.
+ */
 const SettingsBaseSchema = z.object({
   /**
    * Schema version of the file on disk. Two separate behaviours, and they need
@@ -1014,7 +1021,7 @@ const SettingsBaseSchema = z.object({
       // `.catch()` on the OBJECT, not only on the scalars inside it, and that
       // distinction is the difference between a healed field and a wiped vault.
       //
-      // `.default({})` fires on `undefined` and on nothing else. Every scalar
+      // `.prefault({})` fires on `undefined` and on nothing else. Every scalar
       // below it already heals, but a `rateLimit` that is null, a number, a
       // string or an array never reaches those scalars: the object parse fails,
       // the failure propagates to SettingsSchema.parse, and loadSettingsImpl
@@ -1030,14 +1037,14 @@ const SettingsBaseSchema = z.object({
       // instead of `"rateLimit": {"loginMaxAttempts": 10}`. So the recovery
       // instructions led to reintroducing the default-password bypass that
       // fix/default-password-bypass exists to close.
-      rateLimit: AuthRateLimitSchema.default({}).catch((ctx: { input: unknown }) => {
+      rateLimit: AuthRateLimitSchema.prefault({}).catch((ctx: { input: unknown }) => {
         console.warn(
           `[settings] refusing auth.rateLimit ${JSON.stringify(ctx.input)}; it must be an object, using the shipped limits instead`,
         );
         return AuthRateLimitSchema.parse({});
       }),
     })
-    .default({}),
+    .prefault({}),
   vault: z
     .object({
       path: vaultRootPath(),
@@ -1052,7 +1059,7 @@ const SettingsBaseSchema = z.object({
       deleteMode: z.enum(['trash', 'permanent']).default('trash'),
       attachmentDir: vaultRelativePath('attachments'),
     })
-    .default({}),
+    .prefault({}),
   git: z
     .object({
       enabled: z.boolean().default(false),
@@ -1063,12 +1070,20 @@ const SettingsBaseSchema = z.object({
       authorEmail: z.string().default('webobsidian@localhost'),
       autoSync: z.boolean().default(false),
       autoCommitOnSave: z.boolean().default(false),
-      intervalSec: z.number().default(300),
+      // `.catch()` for the usual reason (see `version`), and zod 4 made it
+      // urgent: its z.number() refuses Infinity, which zod 3 accepted, and
+      // JSON.parse reads a hand-typed `1e999` as Infinity. Without the catch that
+      // one literal (or any non-number) fails the whole parse and
+      // loadSettingsImpl rewrites the file from defaults. Every finite number is
+      // still accepted; autosync.ts clamps it with Math.max(intervalSec, 60).
+      // Over the API anything but a finite number is a 400 instead
+      // (routes/settings.ts), so this heal is for values that arrive from disk.
+      intervalSec: z.number().default(300).catch(300),
       lfsPatterns: z
         .array(z.string())
         .default(['*.png', '*.jpg', '*.jpeg', '*.gif', '*.pdf', '*.mp4', '*.mov', '*.zip']),
     })
-    .default({}),
+    .prefault({}),
   /**
    * Which backend owns this vault's synchronisation. ONE value, never a set.
    *
@@ -1104,16 +1119,17 @@ const SettingsBaseSchema = z.object({
     .object({
       backend: z.enum(['none', 'git', 'livesync']).default('none').catch('none'),
     })
-    .default({}),
-  livesync: LiveSyncBlockSchema.default({}),
-  oidc: OidcBlockSchema.default({}),
+    .prefault({}),
+  livesync: LiveSyncBlockSchema.prefault({}),
+  oidc: OidcBlockSchema.prefault({}),
   search: z
     .object({
-      fuzzy: z.number().default(0.2),
+      // `.catch()` for the same zod 4 reason as git.intervalSec above.
+      fuzzy: z.number().default(0.2).catch(0.2),
       prefix: z.boolean().default(true),
       indexFrontmatter: z.boolean().default(true),
     })
-    .default({}),
+    .prefault({}),
   api: z
     .object({
       keys: z.array(ApiKeySchema).default([]),
@@ -1129,19 +1145,19 @@ const SettingsBaseSchema = z.object({
       // not take the rest of the file down with it (see `version` above).
       rateLimitPerMin: z.number().int().min(1).default(120).catch(120),
     })
-    .default({}),
+    .prefault({}),
   ui: z
     .object({
       theme: z.enum(['obsidian-dark', 'obsidian-light']).default('obsidian-light'),
       defaultView: z.enum(['live', 'source', 'reading']).default('live'),
     })
-    .default({}),
+    .prefault({}),
   plugins: z
     .object({
       enabled: z.array(z.string()).default([]),
       installed: z.array(z.string()).default([]),
     })
-    .default({}),
+    .prefault({}),
 });
 
 type SettingsBase = z.infer<typeof SettingsBaseSchema>;

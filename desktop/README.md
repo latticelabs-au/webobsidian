@@ -11,7 +11,10 @@ the matching prebuilt Electron binary: no cross-compilation, no `node-gyp`.
 
 ## How it works
 
-- **First launch** prompts for a vault folder (default `~/Documents/WebObsidianVault`).
+- **First launch** prompts for a vault folder. Cancelling the picker uses
+  `~/Documents/WebObsidianVault`. Since Electron 43 the picker (here and in **Switch Vault…**)
+  opens in the Downloads folder, or the home folder if there is none, and the OS no longer
+  reopens the folder you used last.
 - App data (`settings.json`, search index) lives in Electron's per-user `userData` dir.
 - A random per-install password is generated, passed to the server as
   `WEBOBSIDIAN_PASSWORD`, and used to **auto-login**, no password prompt.
@@ -21,7 +24,8 @@ the matching prebuilt Electron binary: no cross-compilation, no `node-gyp`.
 
 ## Build locally
 
-From the **repo root** (builds web + server first, then the desktop app):
+Requires Node 22.12 or later (Electron 43's toolchain declares it). From the **repo root**
+(builds web + server first, then the desktop app):
 
 ```bash
 npm install
@@ -37,6 +41,11 @@ npm start            # launch with the already-built bundle
 npm run dist         # electron-builder → installers in desktop/release/
 npm run dist:dir     # fast unpacked build (no installer), for smoke testing
 ```
+
+Since Electron 42, `npm install` no longer downloads the Electron binary. The first `electron`
+run (`npm run desktop`, `npm run dev`, `npm start`) downloads it into `node_modules/electron`,
+so that first launch needs network access. electron-builder (`dist`, `dist:dir`) fetches its own
+copy for packaging, as before.
 
 > Note: this environment may export `ELECTRON_RUN_AS_NODE=1` globally (Electron then
 > behaves as plain Node and `require('electron')` returns a path). When launching
@@ -66,6 +75,20 @@ Artifacts:
 | macOS    | `.dmg`, `.zip`         | arm64, x64 |
 | Windows  | NSIS `.exe`, portable `.exe` | x64, arm64, ia32 |
 | Linux    | `.AppImage`, `.deb`    | x64, arm64 |
+
+Minimum OS: **macOS 12 (Monterey)**, because Electron 38 and later (the app ships Electron 43)
+no longer run on macOS 11, and Windows 10. Electron 43 is the last line that publishes Windows
+ia32 builds and is supported until January 2027; moving past it means dropping the ia32 NSIS
+target.
+
+On Linux the executable is `webobsidiandesktop` (`build.linux.executableName`). Without that
+setting electron-builder names it after the npm package, `@webobsidiandesktop`, and since
+electron-builder 26 an AppImage refuses a name containing `@`. The deb installs the same name
+as `/usr/bin/webobsidiandesktop`.
+
+CI ([`ci.yml`](../.github/workflows/ci.yml), the `package` job) runs this same packaging on
+macOS, Windows and Ubuntu for every pull request with `--publish never`, so a broken release
+target shows up before a tag is pushed.
 
 The apps are **not code-signed/notarized**, so users will see a Gatekeeper /
 SmartScreen warning on first launch (expected for a free self-hosted build).

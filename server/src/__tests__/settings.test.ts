@@ -155,12 +155,18 @@ interface Booted {
  *
  * `seed` is a partial settings.json. Anything absent is filled in by the schema,
  * including vault.path, which defaults to config.defaultVaultPath and therefore
- * to the VAULT_PATH that makeTmpDataDir() just set.
+ * to the VAULT_PATH that makeTmpDataDir() just set. A string seed is written to
+ * the file verbatim, for content JSON.stringify cannot produce (`1e999`, which
+ * JSON.parse reads back as Infinity).
  */
-async function boot(seed?: Record<string, unknown>): Promise<Booted> {
+async function boot(seed?: Record<string, unknown> | string): Promise<Booted> {
   resetSettingsCache();
   tmp = await makeTmpDataDir();
-  if (seed) await writeSettings(tmp.dataDir, seed);
+  if (typeof seed === 'string') {
+    await fs.writeFile(path.join(tmp.dataDir, 'settings.json'), seed, { mode: 0o600 });
+  } else if (seed) {
+    await writeSettings(tmp.dataDir, seed);
+  }
 
   const settings = await import('../services/settings.js');
   const { settingsRouter } = await import('../routes/settings.js');
@@ -950,6 +956,178 @@ describe('vault.path', () => {
 
     await put(reBooted, { vault: { path: outside } }).expect(403);
     expect((await readStoredFile()).vault.path).toBe(vaultDir);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 7. Numeric fields: one bad number heals that field, never the whole file
+// ---------------------------------------------------------------------------
+
+/**
+ * Every numeric leaf of the settings tree and the value it heals to.
+ *
+ * loadSettingsImpl answers ANY parse failure by rewriting settings.json from
+ * defaults(): jwtSecret regenerated, both password hashes cleared (so the default
+ * password works again), git.token and every API key dropped. So every numeric
+ * field has to heal on its own. zod 4 made this sharper than it was under zod 3:
+ * a bare z.number() now refuses Infinity, and JSON.parse reads a hand-typed
+ * `1e999` as Infinity.
+ *
+ * The first test below enumerates the numeric leaves of a fresh defaults file and
+ * compares them with this table, so a numeric field added later fails there until
+ * it is listed here, and listing it gives it every case below. `version` heals to
+ * the current version rather than its absent-key default of 1; the note on
+ * `version` in services/settings.ts says why.
+ */
+const NUMERIC_DEFAULTS: Record<string, number> = {
+  version: 2,
+  'auth.rateLimit.loginWindowSec': 900,
+  'auth.rateLimit.loginMaxAttempts': 10,
+  'auth.rateLimit.loginFailureWindowSec': 900,
+  'auth.rateLimit.loginFailureMaxAttempts': 25,
+  'git.intervalSec': 300,
+  'livesync.intervalSec': 30,
+  'search.fuzzy': 0.2,
+  'api.rateLimitPerMin': 120,
+};
+const NUMERIC_FIELDS = Object.keys(NUMERIC_DEFAULTS);
+
+/** Credentials a full reset would destroy, so their survival is the assertion. */
+const SURVIVING_CREDENTIALS = {
+  version: 2,
+  auth: {
+    jwtSecret: 'jwt-secret-that-must-survive',
+    userPasswordHash: 'user-password-hash-that-must-survive',
+    passwordHash: 'override-hash-that-must-survive',
+  },
+  git: { token: 'ghp_token_that_must_survive' },
+  api: {
+    keys: [
+      {
+        id: 'key-that-must-survive',
+        name: 'agent',
+        hash: 'api-key-hash-that-must-survive',
+        prefix: 'wok_survive',
+        scopes: ['read'],
+        createdAt: '2026-01-01T00:00:00.000Z',
+        lastUsed: null,
+      },
+    ],
+  },
+};
+
+function numericLeaves(value: unknown, prefix = ''): string[] {
+  if (typeof value === 'number') return [prefix];
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return [];
+  return Object.entries(value).flatMap(([k, v]) => numericLeaves(v, prefix ? `${prefix}.${k}` : k));
+}
+
+function readPath(obj: unknown, dotted: string): unknown {
+  return dotted.split('.').reduce<unknown>((o, k) => (o as Record<string, unknown>)?.[k], obj);
+}
+
+function writePath(obj: Record<string, unknown>, dotted: string, value: unknown): void {
+  const keys = dotted.split('.');
+  const last = keys.pop() as string;
+  let cur = obj;
+  for (const k of keys) {
+    if (!cur[k] || typeof cur[k] !== 'object') cur[k] = {};
+    cur = cur[k] as Record<string, unknown>;
+  }
+  cur[last] = value;
+}
+
+/** SURVIVING_CREDENTIALS with `field` set to the raw JSON literal `literal`. */
+function rawFileWith(field: string, literal: string): string {
+  const shape = JSON.parse(JSON.stringify(SURVIVING_CREDENTIALS)) as Record<string, unknown>;
+  writePath(shape, field, '__BAD_NUMBER__');
+  const text = JSON.stringify(shape, null, 2);
+  if (text.split('"__BAD_NUMBER__"').length !== 2) throw new Error('placeholder not unique');
+  return text.replace('"__BAD_NUMBER__"', literal);
+}
+
+function expectCredentialsIntact(s: unknown): void {
+  expect(readPath(s, 'auth.jwtSecret')).toBe('jwt-secret-that-must-survive');
+  expect(readPath(s, 'auth.userPasswordHash')).toBe('user-password-hash-that-must-survive');
+  expect(readPath(s, 'auth.passwordHash')).toBe('override-hash-that-must-survive');
+  expect(readPath(s, 'git.token')).toBe('ghp_token_that_must_survive');
+  expect(readPath(s, 'api.keys')).toEqual(SURVIVING_CREDENTIALS.api.keys);
+}
+
+describe('numeric settings fields', () => {
+  it('lists every numeric field of the schema, with its default', async () => {
+    const b = await boot();
+    const s = await b.settings.getSettings();
+    const found = Object.fromEntries(numericLeaves(s).map((p) => [p, readPath(s, p)]));
+    expect(found).toEqual(NUMERIC_DEFAULTS);
+  });
+
+  const nonFinite: Array<[string, string]> = [];
+  for (const field of NUMERIC_FIELDS) {
+    nonFinite.push([field, '1e999'], [field, '-1e999']);
+  }
+
+  it.each(nonFinite)(
+    'heals a hand-edited %s of %s to its default instead of resetting the file',
+    async (field, literal) => {
+      const raw = rawFileWith(field, literal);
+      // Guard the fixture itself: the literal really does parse to a non-finite number.
+      expect(Number.isFinite(readPath(JSON.parse(raw), field))).toBe(false);
+
+      const b = await boot(raw);
+      const loaded = await b.settings.getSettings();
+      expect(readPath(loaded, field)).toBe(NUMERIC_DEFAULTS[field]);
+      expectCredentialsIntact(loaded);
+      // Whether or not this load rewrote the file, no reset reached the disk.
+      expectCredentialsIntact(await readStoredFile());
+
+      // The next save succeeds and persists the healed value.
+      await get(b).expect(200);
+      await b.settings.updateSettings(() => {});
+      const stored = await readStoredFile();
+      expect(readPath(stored, field)).toBe(NUMERIC_DEFAULTS[field]);
+      expectCredentialsIntact(stored);
+    },
+  );
+
+  it.each(NUMERIC_FIELDS)('heals any non-number in %s rather than failing the parse', async (field) => {
+    const b = await boot(SURVIVING_CREDENTIALS);
+    for (const bad of ['300', '', null, true, [], {}, Number.NaN, Infinity, -Infinity]) {
+      // updateSettings runs the same SettingsSchema.parse as the load path. A
+      // throw here is exactly the failure that makes a load reset the file.
+      const updated = await b.settings.updateSettings((d) => {
+        writePath(d as unknown as Record<string, unknown>, field, bad);
+      });
+      expect(readPath(updated, field)).toBe(NUMERIC_DEFAULTS[field]);
+      expectCredentialsIntact(updated);
+    }
+    expectCredentialsIntact(await readStoredFile());
+  });
+
+  it.each([
+    ['git', 'intervalSec'],
+    ['search', 'fuzzy'],
+  ])('refuses a non-finite or non-number %s.%s over the API with a 400', async (block, key) => {
+    const b = await boot();
+    const before = readPath(await readStoredFile(), `${block}.${key}`);
+    for (const literal of ['1e999', '-1e999', '"300"', 'null', 'true']) {
+      const res = await request(b.app)
+        .put('/api/settings')
+        .set('Authorization', `Bearer ${b.token}`)
+        .set('Content-Type', 'application/json')
+        .send(`{"${block}":{"${key}":${literal}}}`)
+        .expect(400);
+      expect((res.body as ErrorBody).error).toContain(`${block}.${key}`);
+    }
+    expect(readPath(await readStoredFile(), `${block}.${key}`)).toBe(before);
+  });
+
+  it('still accepts any finite git.intervalSec and search.fuzzy over the API', async () => {
+    const b = await boot();
+    await put(b, { git: { intervalSec: 600 }, search: { fuzzy: 0.35 } }).expect(200);
+    const stored = await readStoredFile();
+    expect(stored.git.intervalSec).toBe(600);
+    expect(stored.search.fuzzy).toBe(0.35);
   });
 });
 

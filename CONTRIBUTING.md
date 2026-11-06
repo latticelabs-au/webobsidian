@@ -24,7 +24,8 @@ and design-driven: please read the few rules below before opening a PR.
 
 ## Development setup
 
-Requires **Node ≥ 20** and `git` (+ `git-lfs` if you use LFS).
+Requires **Node ≥ 22.12** and `git` (+ `git-lfs` if you use LFS). `npm install` at the root
+also installs the desktop workspace's Electron toolchain, which declares Node 22.12 or later.
 
 ```bash
 npm install
@@ -37,6 +38,32 @@ Before opening a PR:
 npm run typecheck    # must pass, CI runs this
 npm run build        # must succeed, CI runs this
 ```
+
+## Changing dependencies
+
+Use **npm 11.6 or later** to change `package-lock.json`. npm 10 (the version Node 22 ships) and
+npm 11 before 11.6 crash with `Cannot read properties of null (reading 'edgesOut')` whenever
+they have to resolve vitest 4.1's peer dependencies: a bare `npm update`, installing or
+upgrading `vitest` / `@vitest/coverage-v8`, or regenerating the lockfile from scratch (seen
+with 10.9.8, 10.9.10, 11.0.0, 11.3.0 and 11.5.2; 11.6.0 and later resolve it). vitest 4.1
+cannot be avoided: vitest 3.2.7 (the version before it) and 4.0.x carry critical advisories,
+and 4.1.12 is the first 4.1 release with no advisory at all. npm 10 still installs the
+committed lockfile (`npm ci`, `npm install`) and handles small edits such as adding an
+unrelated package, which is why CI and the Docker image keep the npm their Node version ships.
+
+You do not need to change your global npm:
+
+```bash
+npx -y npm@11 install --package-lock-only -w server -D vitest@^4.1.12   # or: npx -y npm@11 update --package-lock-only
+npm install    # then install with your usual npm
+```
+
+npm 10 marks the `@esbuild/*` platform entries `"peer": true` and npm 11 does not; both install
+the same tree. The committed lockfile uses the npm 10 form, so run that final `npm install` with
+the npm 10 that Node 22 ships before committing, and a plain `npm install` on Node 22 stays a
+no-op. `devEngines` in the root `package.json` records the npm requirement with
+`"onFail": "ignore"`: `"warn"` would print on every install in CI and in the Docker build, where
+npm 10 is fine.
 
 ## Pull requests
 
