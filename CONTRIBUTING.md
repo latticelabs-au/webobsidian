@@ -41,14 +41,15 @@ npm run build        # must succeed, CI runs this
 
 ## Changing dependencies
 
-Use **npm 11.6 or later** to change `package-lock.json`. npm 10 (the version Node 22 ships)
-and every npm before 11.6.0 crash with `Cannot read properties of null (reading 'edgesOut')`
-whenever they have to resolve vitest 4.1's peer dependencies: a bare `npm update`, installing
-or upgrading `vitest` / `@vitest/coverage-v8`, or regenerating the lockfile from scratch. vitest
-4.1.12 cannot be avoided: it is the first release clear of the critical advisories on vitest 3.x
-and 4.0.x. npm 10 still installs the committed lockfile (`npm ci`, `npm install`) and handles
-small edits such as adding an unrelated package, which is why CI and the Docker image keep the
-npm their Node version ships.
+Use **npm 11.6 or later** to change `package-lock.json`. npm 10 (the version Node 22 ships) and
+npm 11 before 11.6 crash with `Cannot read properties of null (reading 'edgesOut')` whenever
+they have to resolve vitest 4.1's peer dependencies: a bare `npm update`, installing or
+upgrading `vitest` / `@vitest/coverage-v8`, or regenerating the lockfile from scratch (seen
+with 10.9.8, 10.9.10, 11.0.0, 11.3.0 and 11.5.2; 11.6.0 and later resolve it). vitest 4.1
+cannot be avoided: vitest 3.2.7 (the version before it) and 4.0.x carry critical advisories,
+and 4.1.12 is the first 4.1 release with no advisory at all. npm 10 still installs the
+committed lockfile (`npm ci`, `npm install`) and handles small edits such as adding an
+unrelated package, which is why CI and the Docker image keep the npm their Node version ships.
 
 You do not need to change your global npm:
 
