@@ -11,7 +11,7 @@ CodeMirror editor, live preview, wikilinks, an interactive graph, full-text sear
 GitHub sync (incl. Git LFS), an API for AI agents, and community-plugin support.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Node](https://img.shields.io/badge/node-%3E%3D20-339933?logo=node.js&logoColor=white)](https://nodejs.org)
+[![Node](https://img.shields.io/badge/node-%3E%3D22.12-339933?logo=node.js&logoColor=white)](https://nodejs.org)
 [![TypeScript](https://img.shields.io/badge/TypeScript-3178C6?logo=typescript&logoColor=white)](https://www.typescriptlang.org)
 [![Docker](https://img.shields.io/badge/Docker-ready-2496ED?logo=docker&logoColor=white)](https://www.docker.com)
 
@@ -97,6 +97,9 @@ Prefer a native app? Grab an installer from the
 | macOS    | `.dmg` (or `.zip`): arm64 / x64 |
 | Windows  | NSIS installer `.exe` or portable `.exe`: x64 / arm64 / ia32 |
 | Linux    | `.AppImage` or `.deb`: x64 / arm64 |
+
+It needs **macOS 12 (Monterey) or later** on a Mac (the bundled Electron 43 no longer runs on
+macOS 11) and Windows 10 or later on a PC.
 
 The desktop app bundles the whole server, picks your vault folder on first launch, and
 **logs you in automatically**, no password to type, no Docker. Apps are currently
@@ -203,7 +206,8 @@ raise it to `8192` for very large vaults (e.g. 6k+ notes / multi-GB).
 
 ## 💻 Local development
 
-Requires **Node ≥ 20** and `git` (+ `git-lfs` if you use LFS).
+Requires **Node ≥ 22.12** and `git` (+ `git-lfs` if you use LFS). Changing
+`package-lock.json` needs npm 11.6 or later; see [CONTRIBUTING.md](CONTRIBUTING.md#changing-dependencies).
 
 ```bash
 npm install
@@ -365,7 +369,7 @@ webobsidian/
    (JSON config)   (.md+attach) (in-mem/disk) (git + LFS)   (.obsidian/plugins)
 ```
 
-**Tech stack:** Node 20+ · Express · TypeScript · React · Vite · CodeMirror 6 ·
+**Tech stack:** Node 22+ · Express · TypeScript · React · Vite · CodeMirror 6 ·
 unified/remark/rehype · MiniSearch (QMD) · simple-git + git-lfs · scrypt + JWT · Docker.
 
 See [PRD.md §2](PRD.md) for the full design.
