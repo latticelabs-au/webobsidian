@@ -16,7 +16,7 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
 
       - name: Install dependencies
@@ -43,7 +43,7 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
 
       - name: Install dependencies
@@ -51,6 +51,75 @@ jobs:
 
       - name: Test
         run: npm --workspace server run test
+
+  package:
+    # The release packaging path, on every PR, with publishing switched off.
+    # Same runners, install, build and electron-builder config (and therefore
+    # the same targets: macOS dmg+zip arm64/x64, Windows NSIS x64+arm64+ia32 and
+    # portable x64, Linux AppImage+deb x64/arm64) as release.yml, except that
+    # electron-builder runs with `--publish never`, no GH_TOKEN is passed and the
+    # job token is read-only, so nothing can be uploaded and no release is made.
+    name: Desktop packaging, no publish (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build web + server
+        run: npm run build
+
+      - name: Package desktop installers (no publish)
+        run: npm --workspace desktop run dist -- --publish never
+        env:
+          # As in release.yml: the apps are unsigned.
+          CSC_IDENTITY_AUTO_DISCOVERY: false
+
+      - name: Check every release target was produced
+        shell: bash
+        working-directory: desktop/release
+        run: |
+          shopt -s nullglob
+          ls -la
+          fail=0
+          need() {
+            local want=$1 label=$2
+            shift 2
+            if [ "$#" -ne "$want" ]; then
+              echo "::error::expected $want $label, found $#: $*"
+              fail=1
+            fi
+          }
+          case "$RUNNER_OS" in
+            macOS)
+              need 2 "dmg (arm64, x64)" *.dmg
+              need 2 "zip (arm64, x64)" *.zip
+              ;;
+            Windows)
+              need 2 "exe (one NSIS installer for x64+arm64+ia32, one portable x64)" *.exe
+              for d in win-unpacked win-arm64-unpacked win-ia32-unpacked; do
+                [ -d "$d" ] || { echo "::error::missing $d"; fail=1; }
+              done
+              ;;
+            Linux)
+              need 2 "AppImage (x64, arm64)" *.AppImage
+              need 2 "deb (x64, arm64)" *.deb
+              ;;
+          esac
+          exit $fail
 
   docker:
     name: Docker image builds
